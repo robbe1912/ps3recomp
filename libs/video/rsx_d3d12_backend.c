@@ -526,13 +526,19 @@ static HWND create_window(u32 width, u32 height, const char* title)
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-    return CreateWindowExA(
+    HWND hwnd = CreateWindowExA(
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (hwnd) {
+        ShowWindow(hwnd, SW_SHOW);
+        /* The first show can consume an inherited startup visibility setting. */
+        if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+    }
+    return hwnd;
 }
 
 /* ---------------------------------------------------------------------------
