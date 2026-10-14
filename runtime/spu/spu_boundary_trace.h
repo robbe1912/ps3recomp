@@ -66,7 +66,8 @@ typedef struct sb_context {
 } sb_context;
 static struct {
     int enabled,policy_only,full_reported;
-    unsigned capacity,ls_start,ls_length;
+    unsigned capacity,ls_start,ls_length,match_start,match_value;
+    int match_enabled;
     char directory[2048],pcs_text[1024];
     uint8_t selected[65536];
     sb_context contexts[SB_CONTEXTS];
@@ -95,6 +96,15 @@ static void sb_initialize(void){
        ||sb_state.ls_start>0x40000u-sb_state.ls_length
        ||(policy&&strcmp(policy,"0")&&strcmp(policy,"1"))){sb_error("invalid configuration; capture unavailable");goto done;}
     {
+        const char* where=getenv("SPU_BOUNDARY_MATCH_LS");
+        const char* value=getenv("SPU_BOUNDARY_MATCH_BE32");
+        if(where||value){
+            if(!sb_number(where,&sb_state.match_start)||sb_state.match_start>0x3fffcu
+               ||!sb_number(value,&sb_state.match_value)){sb_error("invalid LS word filter");goto done;}
+            sb_state.match_enabled=1;
+        }
+    }
+    {
         const char* p=pcs;
         while(*p){char* end;unsigned long pc;errno=0;pc=strtoul(p,&end,0);
             if(end==p||errno||pc>=0x40000u||(pc&3)||(*end&&*end!=',')){
@@ -119,8 +129,8 @@ static sb_context* sb_find_context(const void* owner){
             c->owner=owner;sb_mutex_init(&c->lock);found=c;
             n=snprintf(path,sizeof(path),"%s/boundary-%u-%u.bin",sb_state.directory,sb_pid(),i);
             if(n<0||n>=(int)sizeof(path)||!(c->file=sb_open(path))){c->failed=1;sb_error("exclusive trace file creation failed");break;}
-            n=snprintf(header,sizeof(header),"{\"format\":1,\"endian\":16909060,\"phase\":\"fetched-before-execution\",\"context\":%llu,\"capacity\":%u,\"record_size\":%u,\"gpr_offset\":%u,\"ls_offset\":%u,\"commit_offset\":%u,\"ls_start\":%u,\"ls_length\":%u,\"frequency\":%llu,\"pcs\":\"%s\"}",
-                (unsigned long long)(uintptr_t)owner,sb_state.capacity,(unsigned)sizeof(sb_record),
+            n=snprintf(header,sizeof(header),"{\"format\":1,\"endian\":16909060,\"phase\":\"fetched-before-execution\",\"context\":%llu,\"capacity\":%u,\"policy_only\":%d,\"match_enabled\":%d,\"match_start\":%u,\"match_value\":%u,\"record_size\":%u,\"gpr_offset\":%u,\"ls_offset\":%u,\"commit_offset\":%u,\"ls_start\":%u,\"ls_length\":%u,\"frequency\":%llu,\"pcs\":\"%s\"}",
+                (unsigned long long)(uintptr_t)owner,sb_state.capacity,sb_state.policy_only,sb_state.match_enabled,sb_state.match_start,sb_state.match_value,(unsigned)sizeof(sb_record),
                 (unsigned)offsetof(sb_record,gpr),(unsigned)offsetof(sb_record,ls),(unsigned)offsetof(sb_record,committed_sequence),
                 sb_state.ls_start,sb_state.ls_length,(unsigned long long)sb_frequency(),sb_state.pcs_text);
             if(n<0||n>=(int)sizeof(header)||fwrite(header,1,sizeof(header),c->file)!=sizeof(header)||fflush(c->file)){
@@ -160,6 +170,11 @@ static inline void spu_boundary_observe(const void* owner,uint32_t pc,uint32_t i
                                         const void* gpr,const uint8_t* ls,int policy){
     if(!SB_READY())sb_initialize();
     if(!sb_state.enabled||(sb_state.policy_only&&!policy)||pc>=0x40000u||(pc&3)||!sb_state.selected[pc>>2])return;
+    if(sb_state.match_enabled){
+        const uint8_t* p=ls+sb_state.match_start;
+        uint32_t word=((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+        if(word!=sb_state.match_value)return;
+    }
     sb_capture(owner,pc,instruction,gpr,ls,policy);
 }
 #endif

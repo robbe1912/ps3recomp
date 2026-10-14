@@ -40,20 +40,26 @@ def main():
         cmd=([env.get('MV_CLANG','clang-cl'),'/nologo','/TC' if language=='c' else '/TP','/O1','/I'+str(ROOT/'runtime/spu'),str(source),'/Fo'+str(out/(exe.stem+'.obj')),'/Fe'+str(exe)] if os.name=='nt' else [env.get('CC','cc') if language=='c' else env.get('CXX','c++'),'-x',language,'-std=c11' if language=='c' else '-std=c++17','-O1','-pthread','-I'+str(ROOT/'runtime/spu'),str(source),'-o',str(exe)])
         build=subprocess.run(cmd,capture_output=True,text=True);(out/(exe.stem+'-build.log')).write_text(build.stdout+build.stderr)
         assert build.returncode==0,build.stdout+build.stderr
-        for mode in ('disabled','normal','threads','invalid'):
+        for mode in ('disabled','normal','threads','invalid','mismatch','word'):
             dest=out/(exe.stem+'-'+mode);dest.mkdir()
             runenv=dict(env)
             if mode!='disabled':runenv.update(SPU_BOUNDARY_DIR=str(dest),SPU_BOUNDARY_PCS='0x100,' if mode=='invalid' else '0x100',SPU_BOUNDARY_CAPACITY='16',SPU_BOUNDARY_LS_START='0x100',SPU_BOUNDARY_LS_LENGTH='16',SPU_BOUNDARY_POLICY_ONLY='1')
+            if mode=='mismatch':runenv.update(SPU_BOUNDARY_MATCH_LS='0x100',SPU_BOUNDARY_MATCH_BE32='0xffffffff')
+            if mode=='word':runenv.update(SPU_BOUNDARY_MATCH_LS='0x100',SPU_BOUNDARY_MATCH_BE32='0x12000000')
             run=subprocess.run([str(exe),mode],env=runenv,capture_output=True,text=True,timeout=20)
             (dest/'run.log').write_text(run.stdout+run.stderr);assert run.returncode==0
             rings=list(dest.glob('boundary-*.bin'))
-            if mode in ('disabled','invalid'):
+            if mode in ('disabled','invalid','mismatch'):
                 assert not rings
                 assert ('ERROR' in run.stderr)==(mode=='invalid')
                 continue
             assert 'ERROR' not in run.stderr
             decoded=[read_ring(p) for p in rings];assert all(not d['invalid_slots'] and not d['gaps'] for d in decoded)
-            if mode=='threads':
+            if mode=='word':
+                assert len(decoded)==1 and len(decoded[0]['rows'])==1
+                assert struct.unpack_from('<I',decoded[0]['rows'][0]['gpr'])[0]==18
+                assert decoded[0]['header']['match_enabled']==1 and decoded[0]['header']['match_value']==0x12000000
+            elif mode=='threads':
                 assert len(decoded)==1 and [r['sequence'] for r in decoded[0]['rows']]==list(range(65,81))
                 assert all(1001<=struct.unpack_from('<I',r['gpr'])[0]<=1040 or 2001<=struct.unpack_from('<I',r['gpr'])[0]<=2040 for r in decoded[0]['rows'])
             else:

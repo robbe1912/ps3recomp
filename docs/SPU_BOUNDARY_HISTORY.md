@@ -12,6 +12,8 @@ For a private capture, create an empty output directory and set all of:
 - `SPU_BOUNDARY_LS_START` and `SPU_BOUNDARY_LS_LENGTH`: a valid LS range of 1
   through 4096 bytes. The entire 2048-byte register file is always copied.
 - Optionally `SPU_BOUNDARY_POLICY_ONLY=1` to restrict callbacks to policy mode.
+- Optionally supply both `SPU_BOUNDARY_MATCH_LS` and `SPU_BOUNDARY_MATCH_BE32`
+  to require a big-endian LS word value before allocating a context slot.
 
 Select independently admitted boundaries, particularly memory stores and their
 successors, rather than polling loops. The filter tests a bitmap. Only selected
