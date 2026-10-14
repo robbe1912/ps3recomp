@@ -1,0 +1,45 @@
+# SPU boundary history
+
+`spu_step` has an optional diagnostic callback immediately after instruction
+fetch, before decoding or execution. It never changes target registers, memory,
+control flow or completion. With `SPU_BOUNDARY_DIR` unset, it records nothing.
+
+For a private capture, create an empty output directory and set all of:
+
+- `SPU_BOUNDARY_DIR`: existing directory; files are created exclusively.
+- `SPU_BOUNDARY_PCS`: comma-separated aligned numeric LS instruction addresses.
+- `SPU_BOUNDARY_CAPACITY`: 16 through 1024 records per context.
+- `SPU_BOUNDARY_LS_START` and `SPU_BOUNDARY_LS_LENGTH`: a valid LS range of 1
+  through 4096 bytes. The entire 2048-byte register file is always copied.
+- Optionally `SPU_BOUNDARY_POLICY_ONLY=1` to restrict callbacks to policy mode.
+
+Select independently admitted boundaries, particularly memory stores and their
+successors, rather than polling loops. The filter tests a bitmap. Only selected
+boundaries acquire registry/context locks, copy snapshots and perform file I/O.
+There are at most 32 retained context slots; capture errors, including overflow,
+are visible on stderr. They invalidate completeness claims. Context addresses
+can be reused and do not by themselves identify a new job or submission.
+
+Each private `boundary-PID-SLOT.bin` has a 4096-byte JSON header and a circular
+array. A slot is invalidated before replacement and published with matching
+leading/trailing sequence numbers after its bytes have been written and the
+library buffers flushed. No per-fetch file opening or fingerprinting occurs.
+`python tools/read_spu_boundary.py PRIVATE_FILE` reports retained sequences,
+overwritten prefix length, gaps and incomplete slots; it exits 2 for gaps or
+incomplete slots. Retain the launch identity, exact runtime source/image hashes
+and configuration alongside these files. Their register/LS payloads can contain
+private original data and must stay outside version control.
+
+These are fetched, pre-execution observations. The LS copy is not an atomic
+snapshot against all other writers. A successor observation can help constrain
+an earlier store, but a missing observation does not prove an instruction never
+retired. Per-context sequences are observation order, not a cross-context global
+order. Instrumentation changes timing and provides no performance or game
+acceptance proof.
+
+`python tools/test_spu_boundary.py` checks the actual writer in C and C++, PC and
+policy filtering, wrapping with explicit overwrite count, concurrent callbacks
+and torn-record rejection. It also executes the actual interpreter's authored
+CPU self-test: removing only the callback leaves architectural results passing
+but loses the required trace; restoring it captures both sides of an LS store.
+No game files are required. On Windows use `MV_CLANG` or a configured `clang-cl`.

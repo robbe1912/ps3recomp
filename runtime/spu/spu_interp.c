@@ -7,6 +7,7 @@
  */
 #include "spu_interp.h"
 #include "spu_helpers.h"
+#include "spu_boundary_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -111,6 +112,7 @@ static int spu_step(spu_context* ctx) {
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
+    spu_boundary_observe(ctx, pc, insn, ctx->gpr, ctx->ls, ctx->policy_mode);
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = pc + 4;
 
