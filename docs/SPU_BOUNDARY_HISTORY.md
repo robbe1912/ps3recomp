@@ -36,8 +36,12 @@ These are fetched, pre-execution observations. The LS copy is not an atomic
 snapshot against all other writers. A successor observation can help constrain
 an earlier store, but a missing observation does not prove an instruction never
 retired. Per-context sequences are observation order, not a cross-context global
-order. Instrumentation changes timing and provides no performance or game
-acceptance proof.
+order. A context can be observed from multiple native threads: keep the TID
+when comparing a store with its immediate successor. Even a single-TID witness
+does not establish object lifetime, job identity or the absence of other writers.
+A later stopped LS read can match the page maps while differing elsewhere; do
+not promote a partial match to a full-state identity. Instrumentation changes
+timing and provides no performance or game acceptance proof.
 
 `python tools/test_spu_boundary.py` checks the actual writer in C and C++, PC and
 policy filtering, wrapping with explicit overwrite count, concurrent callbacks
@@ -45,3 +49,9 @@ and torn-record rejection. It also executes the actual interpreter's authored
 CPU self-test: removing only the callback leaves architectural results passing
 but loses the required trace; restoring it captures both sides of an LS store.
 No game files are required. On Windows use `MV_CLANG` or a configured `clang-cl`.
+
+Linux and Windows hosted workflows passed the implementation at exact commit
+`c6195945c40d9d708293090cbf0bb62221ff3919` (runs 38558780467 and 38558784069).
+Native diagnostic use exposed the importance of retaining overwrite counts,
+actual writer TIDs and an exact PE/PDB archive before relinking. These are
+capture-method findings, not a target-runtime correctness fix.
