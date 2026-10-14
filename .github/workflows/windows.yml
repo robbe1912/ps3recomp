@@ -175,6 +175,9 @@ jobs:
       - name: Packed XY16F render-target sampling (WARP)
         run: python tests/check_rsx_texture_alias.py
 
+      - name: Guest D3D12 sampler pixel regression (WARP)
+        run: python tests/check_rsx_sampler.py
+
       - name: Run condition semantics regressions
         run: |
           cmake -S tests/sync_stress -B build-sync -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
