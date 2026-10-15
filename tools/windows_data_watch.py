@@ -79,7 +79,13 @@ class DebugEvent(C.Structure):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--owner', type=Path, required=True)
-    ap.add_argument('--address', type=lambda v: int(v, 0), action='append', required=True)
+    watch_kind = ap.add_mutually_exclusive_group(required=True)
+    watch_kind.add_argument('--address', type=lambda v: int(v, 0), action='append')
+    watch_kind.add_argument('--follow-be32', type=lambda v: int(v, 0),
+                            help='Watch this BE32 pointer field, then base+pointer+offset fields')
+    ap.add_argument('--follow-base', type=lambda v: int(v, 0), default=0)
+    ap.add_argument('--follow-offset', type=lambda v: int(v, 0), action='append', default=[])
+    ap.add_argument('--follow-guard', help='ADDRESS:HEX bytes in the same eight-byte pointer carrier; wait until matched')
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--seconds', type=float, default=20)
     ap.add_argument('--events', type=int, default=256)
@@ -91,6 +97,27 @@ def main():
     args = ap.parse_args()
     if os.name != 'nt' or C.sizeof(C.c_void_p) != 8:
         raise SystemExit('Requires native 64-bit Windows Python')
+    follow = args.follow_be32 is not None
+    guard = None
+    if follow:
+        if args.follow_be32 <= 0 or args.follow_be32 % 4:
+            ap.error('Follow pointer must be positive and four-byte aligned')
+        if not 0 <= args.follow_base < (1 << 64):
+            ap.error('Invalid follow base')
+        if not 1 <= len(args.follow_offset) <= 3 or len(set(args.follow_offset)) != len(args.follow_offset):
+            ap.error('Supply one to three distinct follow offsets')
+        if any(not 0 <= off <= 0x100000 for off in args.follow_offset):
+            ap.error('Follow offsets must be within 0..1MiB')
+        args.address = [args.follow_be32 & ~7]
+        if args.follow_guard:
+            try:
+                addr, raw = args.follow_guard.split(':'); guard = (int(addr, 0), bytes.fromhex(raw))
+                if not 1 <= len(guard[1]) <= 8 or not (args.address[0] <= guard[0] < guard[0]+len(guard[1]) <= args.address[0]+8):
+                    raise ValueError()
+            except ValueError:
+                ap.error('Follow guard must be ADDRESS:HEX within the pointer carrier')
+    elif args.follow_offset or args.follow_base or args.follow_guard:
+        ap.error('Follow options require --follow-be32')
     if not 1 <= len(args.address) <= 4 or len(set(args.address)) != len(args.address):
         ap.error('Supply one to four distinct addresses')
     if any(a <= 0 or a % 8 for a in args.address):
@@ -127,6 +154,7 @@ def main():
     exit_thread = api('GetExitCodeThread', boolean, [handle, C.POINTER(u32)])
     wait_handle = api('WaitForSingleObject', u32, [handle, u32])
     read_mem = api('ReadProcessMemory', boolean, [handle, handle, handle, C.c_size_t, C.POINTER(C.c_size_t)])
+    query_mem = api('VirtualQueryEx', C.c_size_t, [handle, handle, handle, C.c_size_t])
     create_file = api('CreateFileW', handle, [C.c_wchar_p, u32, u32, handle, u32, u32, handle])
     image_name = api('QueryFullProcessImageNameW', boolean, [handle, u32, C.c_wchar_p, C.POINTER(u32)])
     exit_process = api('GetExitCodeProcess', boolean, [handle, C.POINTER(u32)])
@@ -145,6 +173,7 @@ def main():
     attached = False; threads = {}; hits = dumps = 0; initial_break = False
     started = time.monotonic(); reason = 'error'; failure = None
     restored = False; cleanup_break = False; attach_break_address = None
+    follow_pointer = None
     CONTINUE = 0x10002; NOT_HANDLED = 0x80010001
     assert C.sizeof(DebugEvent) == 176 and DebugEvent.data.offset == 16
     log = (args.out / 'events.jsonl').open('x', buffering=1)
@@ -164,6 +193,11 @@ def main():
         C.memmove(ptr+48, struct.pack('<I', 0x100010), 4)
         C.memmove(ptr+72, struct.pack('<6Q', *regs), 48)
         checked(set_context(th, ptr))
+    def watch_regs():
+        regs = [0, 0, 0, 0, 0, 0]
+        for i, a in enumerate(args.address):
+            regs[i] = a; regs[5] |= (1 << (2*i)) | (9 << (16+4*i))
+        return regs
     def arm(tid):
         if tid in threads: return
         th = open_thread(0x10005a, False, tid)
@@ -171,10 +205,7 @@ def main():
         try:
             buf, ptr = context(th); old = debug_regs(ptr)
             if old[5] & 0xff: raise RuntimeError('Existing hardware breakpoint; refusing interference')
-            regs = [0, 0, 0, 0, 0, 0]
-            for i, a in enumerate(args.address):
-                regs[i] = a; regs[5] |= (1 << (2*i)) | (9 << (16+4*i))
-            store_debug(th, ptr, regs); threads[tid] = (th, old)
+            store_debug(th, ptr, watch_regs()); threads[tid] = (th, old)
             record('armed', tid=tid)
         except BaseException:
             close(th); raise
@@ -183,6 +214,42 @@ def main():
         checked(read_mem(ph, address, b, size, C.byref(n)))
         if n.value != size: raise RuntimeError('Short target read')
         return b.raw
+    def follow_target():
+        nonlocal follow_pointer
+        memory = C.create_string_buffer(48)
+        if query_mem(ph, args.follow_be32, memory, 48) != 48:
+            raise C.WinError(C.get_last_error())
+        state = struct.unpack_from('<I', memory.raw, 32)[0]
+        if state != 0x1000:  # MEM_COMMIT; a deferred source may not exist yet.
+            if follow_pointer is not None:
+                raise RuntimeError('Follow source became unmapped after arming')
+            record('follow_source_unmapped', address=hex(args.follow_be32), state=hex(state))
+            return False
+        if guard and read(guard[0], len(guard[1])) != guard[1]:
+            if follow_pointer is not None:
+                raise RuntimeError('Follow guard changed after arming; object lifetime changed')
+            record('follow_guard_wait')
+            return True
+        pointer = int.from_bytes(read(args.follow_be32, 4), 'big')
+        if follow_pointer is not None:
+            if pointer != follow_pointer:
+                raise RuntimeError('Follow pointer changed after arming; object lifetime changed')
+            return True
+        if pointer == 0: return True
+        addresses = [args.follow_be32 & ~7] + [args.follow_base+pointer+off for off in args.follow_offset]
+        if len(set(addresses)) != len(addresses) or any(not 0 < a < (1 << 64)-7 or a % 8 for a in addresses):
+            raise RuntimeError('Resolved follow addresses are invalid or aliased')
+        # Validate all reads before changing debug registers. No target bytes
+        # are written. A held event suspends the other target threads.
+        values = [read(a).hex() for a in addresses]
+        args.address = addresses
+        for th, _ in threads.values():
+            active = u32(); checked(exit_thread(th, C.byref(active)))
+            if active.value == 259:
+                buf, ptr = context(th); store_debug(th, ptr, watch_regs())
+        follow_pointer = pointer
+        record('follow_armed', pointer=hex(pointer), addresses=addresses, values=values)
+        return True
     def dump(index):
         path = args.out / ('hit_%04d_stall.dmp' % index)
         fh = create_file(str(path.resolve()), 0x40000000, 0, None, 1, 0x80, None)
@@ -220,7 +287,9 @@ def main():
         checked(kill_exit(False))
         record('attach', owner=owner, addresses=args.address,
                stop_nonfinite_be_f32=args.stop_nonfinite_be_f32,
-               snapshot_registers=args.snapshot_register)
+               snapshot_registers=args.snapshot_register, follow_be32=args.follow_be32,
+               follow_base=args.follow_base, follow_offsets=args.follow_offset,
+               follow_guard=args.follow_guard)
         while True:
             if time.monotonic()-started > args.seconds+10:
                 raise TimeoutError('No cleanup debug event within bounded grace')
@@ -251,7 +320,10 @@ def main():
                     if ex.record.code == 0x80000003 and not initial_break:
                         initial_break = True; status = CONTINUE
                         attach_break_address = ex.record.address
-                        ready = dict(threads=len(threads), values=[read(a).hex() for a in args.address])
+                        source_mapped = follow_target() if follow else True
+                        ready = dict(threads=len(threads), values=[read(a).hex() for a in args.address] if source_mapped else [None],
+                                     follow_source_mapped=source_mapped,
+                                     addresses=args.address, follow_armed=follow_pointer is not None)
                         (args.out / 'ready.json').write_text(json.dumps(ready, indent=2))
                         record('attach_breakpoint', **ready)
                     elif ex.record.code == 0x80000003 and cleanup_break and ex.record.address == attach_break_address:
@@ -259,9 +331,24 @@ def main():
                     elif ex.record.code == 0x80000004:
                         th, old = threads[event.tid]; buf, ptr = context(th)
                         regs = list(debug_regs(ptr)); mask = regs[4] & ((1 << len(args.address))-1)
+                        if mask and follow and mask & 1:
+                            status = CONTINUE; hits += 1
+                            if mask & ~1: raise RuntimeError('Ambiguous simultaneous pointer/data write')
+                            record('pointer_write', tid=event.tid, index=hits,
+                                   rip=hex(struct.unpack('<Q', C.string_at(ptr+248, 8))[0]),
+                                   bytes=read(args.address[0]).hex())
+                            follow_target()
+                            # follow_target may have reprogrammed this context;
+                            # never restore the old address set when clearing DR6.
+                            buf, ptr = context(th); regs = list(debug_regs(ptr))
+                            regs[4] = 0; store_debug(th, ptr, regs)
+                            mask = 0
+                            if hits >= args.events:
+                                reason = 'event limit'; finished = True
                         if mask:
                             status = CONTINUE; hits += 1
                             values = [read(a).hex() for a in args.address]
+                            if follow: follow_target()
                             row = dict(tid=event.tid, index=hits, dr6=hex(regs[4]), mask=mask,
                                        rip=hex(struct.unpack('<Q', C.string_at(ptr+248, 8))[0]),
                                        registers=[hex(x) for x in struct.unpack('<16Q', C.string_at(ptr+120, 128))],
@@ -326,7 +413,9 @@ def main():
         for th, _ in threads.values(): close(th)
         close(ph)
         result = dict(reason=reason, hits=hits, dumps=dumps, failure=failure,
-                      cleanup_errors=cleanup_errors, elapsed=time.monotonic()-started)
+                      cleanup_errors=cleanup_errors, elapsed=time.monotonic()-started,
+                      follow_pointer=hex(follow_pointer) if follow_pointer is not None else None,
+                      addresses=args.address)
         (args.out / 'final.json').write_text(json.dumps(result, indent=2))
         log.close(); print(json.dumps(result), flush=True)
         if cleanup_errors: raise RuntimeError('Debugger cleanup failed: '+repr(cleanup_errors))
