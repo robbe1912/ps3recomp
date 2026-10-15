@@ -95,9 +95,11 @@ def main():
     if os.name=='nt':
         cmd=[compiler,'/nologo','/O2','/fp:strict','/I'+str(header_root),str(source),'/Fe'+str(exe),'/Fo'+str(out)+'/']
     else:
-        cmd=[compiler,'-O2','-std=c11','-ffp-contract=off','-I',str(header_root),str(source),'-o',str(exe),'-lm']
+        cmd=[compiler,'-O2','-std=c11','-ffp-contract=off','-I',str(header_root),str(source),'-o',str(exe)]
     if args.interpreter:
         cmd += [('/D' if os.name=='nt' else '-D')+'SPU_FLOAT_INTERPRETER',str(header_root/'runtime/spu/spu_interp.c')]
+    if os.name!='nt':
+        cmd += ['-lm'] # GNU linkers resolve libraries after their consuming objects.
     build=subprocess.run(cmd,capture_output=True,text=True)
     (out/'build.log').write_text(build.stdout+build.stderr)
     assert build.returncode==0,build.stdout+build.stderr
