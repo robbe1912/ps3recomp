@@ -103,6 +103,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -pthread -I runtime/syscalls -o /tmp/test_memory_capacity runtime/syscalls/tests/test_memory_capacity.c runtime/syscalls/sys_memory.c runtime/syscalls/spu_ea_alias.c
           /tmp/test_memory_capacity
 
+      - name: SPU extended float values and interpreter
+        env:
+          CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
+        run: |
+          python3 tools/test_spu_float.py
+          python3 tools/test_spu_float.py --interpreter
+
       - name: Run self-contained SPU helper tests
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \

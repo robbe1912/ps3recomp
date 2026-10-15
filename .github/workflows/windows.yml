@@ -99,6 +99,13 @@ jobs:
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c runtime/memory/guest_read_sync.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_spu_helpers.exe
+
+      - name: SPU extended float values and interpreter
+        env:
+          CC: clang-cl
+        run: |
+          python tools/test_spu_float.py
+          python tools/test_spu_float.py --interpreter
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
