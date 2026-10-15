@@ -108,6 +108,11 @@ jobs:
           python tools/test_spu_float.py --interpreter
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: PPU fault snapshot read-only regressions
+        run: |
+          python tools/test_ppu_fault_capture.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test

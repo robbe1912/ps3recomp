@@ -33,6 +33,7 @@
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
+#include "../diag/ppu_fault_capture.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -2797,6 +2798,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         return;   /* don't spam the log on a tight retry loop */
     }
     last = cur; streak = 0;
+    ppu_fault_capture(ctx, vm_base);
     fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
             (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
     /* With no NID table the very first one of these is the expected outcome
