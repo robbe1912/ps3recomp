@@ -15,6 +15,24 @@ from pathlib import Path
 import struct
 import time
 
+REGISTER_NAMES = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
+                  'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
+
+
+def snapshot_spec(value):
+    """REGISTER:SIZE[:BASE], with one small read at each bounded dump trigger."""
+    try:
+        parts = value.split(':')
+        if len(parts) not in (2, 3) or parts[0] not in REGISTER_NAMES:
+            raise ValueError()
+        size = int(parts[1], 0)
+        base = int(parts[2], 0) if len(parts) == 3 else 0
+        if not 1 <= size <= 4096 or not -(1 << 64) < base < (1 << 64):
+            raise ValueError()
+        return (parts[0], size, base)
+    except ValueError:
+        raise argparse.ArgumentTypeError('Use REGISTER:SIZE[:BASE], known x64 register, 1..4096 bytes')
+
 
 def filetime_to_unix(value):
     # Subtract the integer epoch before floating-point conversion; otherwise
@@ -68,6 +86,8 @@ def main():
     ap.add_argument('--dump-nonzero', type=int, default=0, help='Maximum matching-hit minidumps')
     ap.add_argument('--stop-nonfinite-be-f32', action='store_true',
                     help='Stop and dump the first write with a NaN/infinity in the triggered watched eight bytes, interpreted as two big-endian floats')
+    ap.add_argument('--snapshot-register', type=snapshot_spec, action='append', default=[],
+                    help='On dump, read REGISTER:SIZE[:BASE]; at most four 1..4096-byte blocks, address = register + BASE')
     args = ap.parse_args()
     if os.name != 'nt' or C.sizeof(C.c_void_p) != 8:
         raise SystemExit('Requires native 64-bit Windows Python')
@@ -79,6 +99,10 @@ def main():
         ap.error('Invalid bounded duration/event/dump budget')
     if args.stop_nonfinite_be_f32 and args.dump_nonzero:
         ap.error('Use either nonfinite-stop dump or nonzero dumps')
+    if len(args.snapshot_register) > 4:
+        ap.error('At most four bounded register snapshots')
+    if args.snapshot_register and not (args.stop_nonfinite_be_f32 or args.dump_nonzero):
+        ap.error('Register snapshots require a bounded dump trigger')
     owner = json.loads(args.owner.read_text())
     exe = Path(owner['exe']).resolve()
     if hashlib.sha256(exe.read_bytes()).hexdigest() != owner['exe_sha256']:
@@ -169,6 +193,21 @@ def main():
             checked(dbg.MiniDumpWriteDump(ph, owner['pid'], fh, 0x1000, None, None, None))
         finally: close(fh)
         return dict(path=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    def snapshots(index, registers):
+        captured = []
+        for i, (name, size, base) in enumerate(args.snapshot_register):
+            address = int(registers[REGISTER_NAMES.index(name)], 16) + base
+            if not 0 < address < (1 << 64) or address + size > (1 << 64):
+                raise RuntimeError(f'Snapshot {i} address overflows x64: {address:#x}')
+            try:
+                data = read(address, size)
+            except OSError as exc:
+                raise RuntimeError(f'Snapshot {i} read failed at {address:#x}, size {size}') from exc
+            path = args.out / f'hit_{index:04d}_snapshot_{i}_{name}.bin'
+            with path.open('xb') as output: output.write(data)
+            captured.append(dict(register=name, base=hex(base), address=hex(address), size=size,
+                                 path=path.name, sha256=hashlib.sha256(data).hexdigest()))
+        return captured
     def restore_stopped():
         nonlocal restored
         for tid, (th, old) in threads.items():
@@ -180,7 +219,8 @@ def main():
         checked(attach(owner['pid'])); attached = True
         checked(kill_exit(False))
         record('attach', owner=owner, addresses=args.address,
-               stop_nonfinite_be_f32=args.stop_nonfinite_be_f32)
+               stop_nonfinite_be_f32=args.stop_nonfinite_be_f32,
+               snapshot_registers=args.snapshot_register)
         while True:
             if time.monotonic()-started > args.seconds+10:
                 raise TimeoutError('No cleanup debug event within bounded grace')
@@ -235,6 +275,8 @@ def main():
                                 row['dump'] = dump(hits); dumps += 1
                             elif dumps < args.dump_nonzero and any(int.from_bytes(bytes.fromhex(v),'little') for i,v in enumerate(values) if mask & (1 << i)):
                                 row['dump'] = dump(hits); dumps += 1
+                            if row.get('dump') and args.snapshot_register:
+                                row['snapshots'] = snapshots(hits, row['registers'])
                             record('write', **row)
                             regs[4] = 0; store_debug(th, ptr, regs)
                             if nonfinite:

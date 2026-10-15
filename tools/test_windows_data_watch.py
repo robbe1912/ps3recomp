@@ -79,6 +79,10 @@ int main(int argc, char **argv) {
             cmd.append('--stop-nonfinite-be-f32')
         else:
             cmd.extend(['--dump-nonzero', '1'])
+        if mode == 'nan':
+            cmd.extend(['--snapshot-register', 'rsp:16', '--snapshot-register', 'rsp:8:8'])
+        elif mode == 'snapshot-error':
+            cmd.extend(['--snapshot-register', 'rsp:16:0x7000000000000000'])
         for a in addresses: cmd.extend(['--address', hex(a)])
         observer = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
@@ -89,6 +93,15 @@ int main(int argc, char **argv) {
             time.sleep(.01)
         if mode != 'deadline': go.write_text('authored writes')
         stdout, stderr = observer.communicate(timeout=20)
+        if mode == 'snapshot-error':
+            assert observer.returncode != 0, (stdout, stderr)
+            result = json.loads((watch/'final.json').read_text())
+            assert 'Snapshot 0 read failed' in result['failure'] and not result['cleanup_errors'], result
+            final, err = child.communicate(timeout=10)
+            assert child.returncode == 0 and 'FINAL 5 6' in final, (child.returncode, final, err)
+            (out/'result.json').write_text(json.dumps(dict(passed=True, mode=mode,
+                expected_failure=result['failure'], detached_writes='5 6'), indent=2))
+            print('PASS: '+mode+'; '+str(out)); return
         assert observer.returncode == 0, (stdout, stderr)
         result = json.loads((watch/'final.json').read_text())
         expected_hits = {'writes':4, 'deadline':0, 'nan':5, 'infinity':5}[mode]
@@ -106,6 +119,15 @@ int main(int argc, char **argv) {
             assert writes[-1]['nonfinite_be_f32'] and writes[-1].get('dump'), writes[-1]
             assert not any(e.get('nonfinite_be_f32') or e.get('dump') for e in writes[:-1])
             assert writes[-1]['values'][0].startswith('7fc00000' if mode=='nan' else '7f800000')
+            if mode == 'nan':
+                snapshots = writes[-1]['snapshots']; assert len(snapshots) == 2
+                data = []
+                for snapshot in snapshots:
+                    b = (watch/snapshot['path']).read_bytes(); data.append(b)
+                    assert len(b) == snapshot['size']
+                    assert hashlib.sha256(b).hexdigest() == snapshot['sha256']
+                    assert int(snapshot['address'],16) == int(writes[-1]['registers'][4],16)+int(snapshot['base'],16)
+                assert data[0][8:16] == data[1], 'Register-relative read did not capture the same stopped memory'
         elif mode=='writes': assert any(e.get('dump') for e in writes)
         else:
             assert result['reason']=='duration limit', result
@@ -125,4 +147,4 @@ int main(int argc, char **argv) {
 
 
 if __name__ == '__main__':
-    for mode in ('writes', 'deadline', 'nan', 'infinity'): main(mode)
+    for mode in ('writes', 'deadline', 'nan', 'infinity', 'snapshot-error'): main(mode)
