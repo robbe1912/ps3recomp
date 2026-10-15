@@ -376,6 +376,9 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    add_executable(test_rsx_capture_schedule tests/test_rsx_capture_schedule.c libs/video/rsx_capture_event.c)
+    target_include_directories(test_rsx_capture_schedule PRIVATE libs/video)
+    add_test(NAME rsx_capture_schedule COMMAND test_rsx_capture_schedule)
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so

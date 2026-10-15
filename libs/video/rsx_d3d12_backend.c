@@ -22,6 +22,8 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_capture_schedule.h"
+#include "rsx_capture_event.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1483,7 +1485,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     rb->lpVtbl->Release(rb);
 }
 
-static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx, unsigned reason, int presenting)
 {
     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
     if (!base || !*base) base = "rsxcap";
@@ -1498,6 +1500,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
     if (mf) {
         fprintf(mf, "frame_count=%llu draws=%u backbuffer=%ux%u\n",
                 (unsigned long long)s_d3d.frame_count, ndraws, s_d3d.width, s_d3d.height);
+        fprintf(mf, "capture_index=%u capture_reason=%u presenting=%d\n", capidx, reason, presenting);
         for (int i = 0; i < MAX_OFF_RTS; i++)
             if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].used)
                 fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
@@ -5097,24 +5100,65 @@ skip_dump_consider: ;
      * present transition would matter -- the backbuffer is in PRESENT here and
      * is restored to PRESENT after each readback. */
     { const char* cap = getenv("RSX_CAP");
-      if (cap) {
+      const char* arm = getenv("RSX_CAP_ARM_FILE");
+      if (cap || arm) {
         static int s_cap_parsed = 0;
-        static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
+        static rsx_capture_schedule s_cap;
+        static u32 s_burst_count = 64;
         if (!s_cap_parsed) {
             s_cap_parsed = 1;
             u32 a = 0, b = 1, c = 1;
-            int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
-            s_cap_start  = (n >= 1 && a) ? a : 200;
-            s_cap_count  = (n >= 2 && b) ? b : 1;
-            s_cap_stride = (n >= 3 && c) ? c : 1;
-        }
-        if (s_cap_done < s_cap_count) {
-            u32 target = s_cap_start + s_cap_done * s_cap_stride;
-            if (s_d3d.frame_count >= target && s_dbg_last_draws > 0) {
-                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
-                s_cap_done++;
+            int n = cap ? sscanf(cap, "%u:%u:%u", &a, &b, &c) : 0;
+            rsx_capture_schedule_init(&s_cap, (n >= 1 && a) ? a : 200,
+                cap ? ((n >= 2 && b) ? b : 1) : 0, (n >= 3 && c) ? c : 1);
+            const char* budget = getenv("RSX_CAP_BURST");
+            const char* pad = getenv("RSX_CAP_PAD_MASK");
+            if (pad) {
+                char* end;
+                unsigned long mask = strtoul(pad, &end, 0);
+                if (!*pad || *end || !mask || mask > 0xffff) {
+                    fprintf(stderr, "[rsxcap] invalid RSX_CAP_PAD_MASK (expected 1..0xffff)\n");
+                    abort();
+                }
+                rsx_capture_pad_configure((unsigned)mask);
+            }
+            if ((arm || pad) && budget) {
+                char* end;
+                unsigned long value = strtoul(budget, &end, 10);
+                if (!*budget || *end || !value || value > RSX_CAPTURE_BURST_MAX) {
+                    fprintf(stderr, "[rsxcap] invalid RSX_CAP_BURST (expected 1..%u)\n", RSX_CAPTURE_BURST_MAX);
+                    abort();
+                }
+                s_burst_count = (u32)value;
             }
         }
+        if (!s_cap.burst_seen) {
+            unsigned event = rsx_capture_pad_take();
+            if (event) {
+                rsx_capture_schedule_arm(&s_cap, s_burst_count);
+                fprintf(stderr, "[rsxcap] PAD_FILE event 0x%04X armed %u frames at frame=%llu next_index=%u\n",
+                    event, s_burst_count, (unsigned long long)s_d3d.frame_count, s_cap.index);
+            }
+        }
+        if (arm && !s_cap.burst_seen) {
+            DWORD attributes = GetFileAttributesA(arm);
+            if (attributes != INVALID_FILE_ATTRIBUTES) {
+                if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    fprintf(stderr, "[rsxcap] arm marker is a directory: %s\n", arm);
+                    abort();
+                }
+                rsx_capture_schedule_arm(&s_cap, s_burst_count);
+                fprintf(stderr, "[rsxcap] armed %u presented frames at frame=%llu next_index=%u\n",
+                    s_burst_count, (unsigned long long)s_d3d.frame_count, s_cap.index);
+            } else if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND) {
+                fprintf(stderr, "[rsxcap] arm marker query failed: %lu\n", (unsigned long)GetLastError());
+                abort();
+            }
+        }
+        u32 index;
+        unsigned reason = rsx_capture_schedule_next(&s_cap, s_d3d.frame_count,
+            s_dbg_last_draws > 0, s_present_this_frame, &index);
+        if (reason) rsx_capture_frame(fi, s_dbg_last_draws, index, reason, s_present_this_frame);
       } }
 
     /* Present */
