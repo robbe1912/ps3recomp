@@ -3,8 +3,25 @@
 import hashlib,json,os,subprocess,sys,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
-if sys.platform!='win32':raise SystemExit('Windows snapshot fixture requires Windows')
 out=ROOT/'temp/checks'/('ppu-fault-'+str(time.time_ns()));out.mkdir(parents=True)
+if sys.platform!='win32':
+    # Exercise the actual unsupported-platform contract rather than pretend
+    # the Windows API fixture ran, or silently ignore a requested capture.
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    source=out/'platform.cpp'
+    source.write_text('#include "runtime/diag/ppu_fault_capture.h"\nint main(){int c=0;ppu_fault_capture(&c,(const unsigned char*)1);return 0;}\n')
+    command=[os.environ.get('CXX','c++'),'-std=c++17','-I'+str(ROOT),str(source),'-o',str(out/'platform')]
+    with (out/'compile.log').open('wb') as log:subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=30)
+    env=dict(os.environ);env.pop('PPU_FAULT_CAPTURE_DIR',None)
+    disabled=subprocess.run([out/'platform'],env=env,capture_output=True,text=True,timeout=10)
+    assert disabled.returncode==0 and not disabled.stderr
+    env['PPU_FAULT_CAPTURE_DIR']=str(out)
+    enabled=subprocess.run([out/'platform'],env=env,capture_output=True,text=True,timeout=10)
+    assert enabled.returncode and 'FATAL snapshots require Windows' in enabled.stderr
+    (out/'result.json').write_text(json.dumps(dict(platform=sys.platform,disabled_returncode=disabled.returncode,unsupported_returncode=enabled.returncode,windows_api_fixture_executed=False),indent=2))
+    print('PASS non-Windows disabled/explicit-unsupported contract; Windows API fixture belongs to Windows CI:',out)
+    raise SystemExit(0)
 source=out/'fixture.cpp'
 source.write_text(r"""
 #include <windows.h>
