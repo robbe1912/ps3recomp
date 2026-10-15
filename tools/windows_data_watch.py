@@ -9,6 +9,7 @@ import argparse
 import ctypes as C
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -29,6 +30,13 @@ def process_creation_time(handle):
     if not k.GetProcessTimes(handle, *[C.byref(t) for t in times]):
         raise C.WinError(C.get_last_error())
     return filetime_to_unix(times[0].value)
+
+
+def same_creation_time(actual, expected):
+    # Independent FILETIME-to-Unix implementations can round to adjacent
+    # doubles. Allow one representable step, never a fixed time window.
+    return (math.isfinite(actual) and math.isfinite(expected) and actual > 0 and expected > 0
+            and abs(actual-expected) <= max(math.ulp(actual), math.ulp(expected)))
 
 
 class ExceptionRecord(C.Structure):
@@ -58,6 +66,8 @@ def main():
     ap.add_argument('--seconds', type=float, default=20)
     ap.add_argument('--events', type=int, default=256)
     ap.add_argument('--dump-nonzero', type=int, default=0, help='Maximum matching-hit minidumps')
+    ap.add_argument('--stop-nonfinite-be-f32', action='store_true',
+                    help='Stop and dump the first write with a NaN/infinity in the triggered watched eight bytes, interpreted as two big-endian floats')
     args = ap.parse_args()
     if os.name != 'nt' or C.sizeof(C.c_void_p) != 8:
         raise SystemExit('Requires native 64-bit Windows Python')
@@ -67,6 +77,8 @@ def main():
         ap.error('Addresses must be positive and eight-byte aligned')
     if not 0 < args.seconds <= 120 or not 1 <= args.events <= 4096 or not 0 <= args.dump_nonzero <= 8:
         ap.error('Invalid bounded duration/event/dump budget')
+    if args.stop_nonfinite_be_f32 and args.dump_nonzero:
+        ap.error('Use either nonfinite-stop dump or nonzero dumps')
     owner = json.loads(args.owner.read_text())
     exe = Path(owner['exe']).resolve()
     if hashlib.sha256(exe.read_bytes()).hexdigest() != owner['exe_sha256']:
@@ -99,8 +111,10 @@ def main():
     try:
         name = C.create_unicode_buffer(32768); size = u32(len(name))
         if not image_name(ph, 0, name, C.byref(size)): raise C.WinError(C.get_last_error())
-        if process_creation_time(ph) != owner['create_time'] or Path(name.value).resolve() != exe:
-            raise RuntimeError('Owned process identity mismatch')
+        actual_creation_time = process_creation_time(ph)
+        if not same_creation_time(actual_creation_time, owner['create_time']) or Path(name.value).resolve() != exe:
+            raise RuntimeError(f'Owned process identity mismatch: creation={actual_creation_time!r}, '
+                               f'expected={owner["create_time"]!r}, image={name.value!r}, expected_image={str(exe)!r}')
         args.out.mkdir(parents=True, exist_ok=False)
     except BaseException:
         close(ph); raise
@@ -111,7 +125,7 @@ def main():
     assert C.sizeof(DebugEvent) == 176 and DebugEvent.data.offset == 16
     log = (args.out / 'events.jsonl').open('x', buffering=1)
     def record(kind, **values):
-        log.write(json.dumps(dict(kind=kind, elapsed=time.monotonic()-started, **values))+'\n')
+        log.write(json.dumps(dict(kind=kind, utc=time.time(), elapsed=time.monotonic()-started, **values))+'\n')
     def checked(ok):
         if not ok: raise C.WinError(C.get_last_error())
     def context(th, flags=0x10001f):
@@ -165,7 +179,8 @@ def main():
     try:
         checked(attach(owner['pid'])); attached = True
         checked(kill_exit(False))
-        record('attach', owner=owner, addresses=args.address)
+        record('attach', owner=owner, addresses=args.address,
+               stop_nonfinite_be_f32=args.stop_nonfinite_be_f32)
         while True:
             if time.monotonic()-started > args.seconds+10:
                 raise TimeoutError('No cleanup debug event within bounded grace')
@@ -211,11 +226,20 @@ def main():
                                        rip=hex(struct.unpack('<Q', C.string_at(ptr+248, 8))[0]),
                                        registers=[hex(x) for x in struct.unpack('<16Q', C.string_at(ptr+120, 128))],
                                        values=values)
-                            if dumps < args.dump_nonzero and any(int.from_bytes(bytes.fromhex(v),'little') for i,v in enumerate(values) if mask & (1 << i)):
+                            nonfinite = args.stop_nonfinite_be_f32 and any(
+                                (word & 0x7f800000) == 0x7f800000
+                                for i, value in enumerate(values) if mask & (1 << i)
+                                for word in struct.unpack('>2I', bytes.fromhex(value)))
+                            if nonfinite:
+                                row['nonfinite_be_f32'] = True
+                                row['dump'] = dump(hits); dumps += 1
+                            elif dumps < args.dump_nonzero and any(int.from_bytes(bytes.fromhex(v),'little') for i,v in enumerate(values) if mask & (1 << i)):
                                 row['dump'] = dump(hits); dumps += 1
                             record('write', **row)
                             regs[4] = 0; store_debug(th, ptr, regs)
-                            if hits >= args.events and not cleanup_break:
+                            if nonfinite:
+                                reason = 'nonfinite BE float'; finished = True
+                            elif hits >= args.events and not cleanup_break:
                                 reason = 'event limit'; finished = True
                     if status == NOT_HANDLED:
                         record('exception_passed', code=hex(ex.record.code), first=ex.first, address=hex(ex.record.address or 0))
