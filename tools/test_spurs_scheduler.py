@@ -7,7 +7,7 @@ if os.name == 'nt':
 r=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
     out=Path(tmp)/'test'
-    units=['spu_channels','spu_drain','spu_lockstep','spu_coherency','spu_workload',
+    units=['spu_channels','spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_native_registry',
            'spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap',
            'spurs_policy_blob_weak','spu_interp','spu_float_simd','spu_task_lifecycle']
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
