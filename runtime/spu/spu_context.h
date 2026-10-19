@@ -392,7 +392,43 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    /* Per-context native module ownership, invalidated by actual LS writes. */
+    uint64_t native_requires_owner[SPU_LS_SIZE / 256];
+    struct {
+        uint32_t base, span, entry_pc, verified_offset;
+        int image_id, retry;
+    } native_stage[4];
+    unsigned native_stage_next;
+    struct { uint32_t base, size, source_ea; } native_dma[4];
+    unsigned native_dma_next;
 } spu_context;
+
+static inline void spu_native_require_owner(spu_context* ctx, uint32_t lsa, uint32_t size)
+{
+    if (!size || lsa >= SPU_LS_SIZE) return;
+    if (size > SPU_LS_SIZE - lsa) size = SPU_LS_SIZE - lsa;
+    uint32_t first = lsa >> 2, last = (lsa + size - 1) >> 2;
+    for (uint32_t w = first >> 6; w <= (last >> 6); ++w) {
+        unsigned lo = w == (first >> 6) ? first & 63 : 0;
+        unsigned hi = w == (last >> 6) ? last & 63 : 63;
+        ctx->native_requires_owner[w] |= (UINT64_MAX << lo) & (UINT64_MAX >> (63 - hi));
+    }
+}
+
+static inline void spu_native_note_write(spu_context* ctx, uint32_t lsa, uint32_t size)
+{
+    if (!size || lsa >= SPU_LS_SIZE) return;
+    if (size > SPU_LS_SIZE - lsa) size = SPU_LS_SIZE - lsa;
+    spu_native_require_owner(ctx, lsa, size);
+    for (unsigned i = 0; i < 4; ++i) {
+        if (ctx->native_stage[i].image_id &&
+            lsa < ctx->native_stage[i].base + ctx->native_stage[i].span &&
+            lsa + size > ctx->native_stage[i].base) {
+            ctx->native_stage[i].image_id = -1;
+            ctx->native_stage[i].retry = 1;
+        }
+    }
+}
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
  * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
@@ -451,6 +487,7 @@ static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 {
     lsa &= SPU_LS_MASK;
+    spu_native_note_write(ctx, lsa, 4);
     uint8_t* p = &ctx->ls[lsa];
     p[0] = (uint8_t)(val >> 24);
     p[1] = (uint8_t)(val >> 16);
@@ -619,6 +656,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+    spu_native_note_write(ctx, lsa, 16);
     uint8_t* p = &ctx->ls[lsa];
     /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
      * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes

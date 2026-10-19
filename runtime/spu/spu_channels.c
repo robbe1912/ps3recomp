@@ -17,6 +17,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_workload.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1389,8 +1390,23 @@ int spu_have_function(uint32_t addr)
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
  * spu_fn_registry.c before the registry was consolidated into this TU. */
-spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+spu_lifted_fn spu_lifted_lookup(spu_context* ctx, uint32_t lsa)
 {
+    if (lsa >= SPU_LS_SIZE) return NULL;
+    int owner = 0;
+    int stage = spu_workload_stage_resolve(ctx, lsa, &owner);
+    if (stage == 1)
+        return owner > 0 ? (spu_lifted_fn)spu_lookup(lsa, owner) : NULL;
+    if (ctx) {
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
+        if (stage == 2) return NULL;
+        spu_fn fn = ctx->resident_task ? spu_lookup(lsa, ctx->resident_task) : NULL;
+        if (!fn && ctx->resident_ovl) fn = spu_lookup(lsa, ctx->resident_ovl);
+        if (fn) return (spu_lifted_fn)fn;
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -1575,6 +1591,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    spu_workload_stage_note_dma(ctx, ea, lsa, size);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
@@ -2136,23 +2153,7 @@ void spu_indirect_branch(spu_context* ctx)
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
-    spu_fn fn = NULL;
-    int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
-    if (!code_owner && ctx->resident_task)
-        fn = spu_lookup(ctx->pc, ctx->resident_task);
-    /* Resident overlay next: streamed code overwrote that LS range, so its lift
-     * is the truth there -- the base image's stale bytes at the same addresses
-     * may also be registered (historical junk lifts) and must lose. */
-    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    spu_fn fn = (spu_fn)spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second

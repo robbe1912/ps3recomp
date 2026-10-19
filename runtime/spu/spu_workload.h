@@ -53,6 +53,30 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
 
+/* Record the local-store address at which the native image was translated.
+ * Register before execution; existing registrations use base zero. */
+void spu_workload_register_img_at(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                int image_id, uint32_t lift_base,
+                                const char* name);
+uint32_t spu_workload_img_base(uint64_t fingerprint);
+
+/* Identify a staged native module from its actual bytes. entry/seg_vaddr are
+ * module-relative offsets. Each (fingerprint, lift_base, entry) is distinct.
+ * Lookup prefers an exact native load base, always verifies current bytes,
+ * and leaves outputs unchanged on failure. Registration precedes execution. */
+void spu_workload_register_stage_probe(uint64_t fingerprint, int image_id,
+                                     uint32_t lift_base, uint32_t entry,
+                                     uint32_t seg_vaddr, uint32_t seg_size,
+                                     const char* name);
+int spu_workload_stage_probe(const uint8_t* ls, uint32_t pc,
+                            uint32_t* base_out, int* image_id_out,
+                            uint32_t* lift_base_out, uint32_t* span_out);
+/* 0: no staged owner; 1: authoritative owner (negative image rejects native
+ * execution); 2: overwritten word without an identified module. */
+int spu_workload_stage_resolve(spu_context* ctx, uint32_t pc, int* image_out);
+void spu_workload_stage_note_dma(spu_context* ctx, uint32_t ea,
+                                 uint32_t lsa, uint32_t size);
+
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 

@@ -33,7 +33,7 @@
  *         runtime/spu/tests/test_spu_lifted_start.c \
  *         runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
  *         runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
- *         runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+ *         runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c runtime/spu/spurs_policy.c \
  *         runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
  *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
  *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
@@ -98,6 +98,7 @@ static void guard_fault(int sig)
  * the group and thread tables to check what they did. */
 #include "../../syscalls/lv2_register.c"
 #include "../spu_helpers.h"
+#include "../spu_workload.h"
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
@@ -378,6 +379,38 @@ static void test_smc_xori(void)
 static void code_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 81; }
 static void code_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 82; }
 static void code_stale(spu_context* ctx) { ctx->gpr[3]._u32[0] = 83; }
+static void test_staged_native_dispatch(void)
+{
+    spu_context* ctx = calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate staged native context"); return; }
+    spu_context_init(ctx, 0);
+    uint8_t payload[96], replacement[96];
+    for (unsigned i = 0; i < sizeof payload; ++i) payload[i] = (uint8_t)(i * 11 + 2);
+    memcpy(replacement, payload, sizeof payload); replacement[0] ^= 1;
+    const uint32_t base = 0x12000, entry = base + 16;
+    spu_workload_register_img_at(spu_workload_fingerprint(payload, sizeof payload),
+                                code_a, 208, base, "authored-stage");
+    spu_workload_register_img_at(spu_workload_fingerprint(replacement, sizeof replacement),
+                                code_b, 209, base, "authored-replacement");
+    spu_begin_image(208); spu_register_function(entry, code_a);
+    spu_begin_image(209); spu_register_function(entry, code_b);
+    spu_begin_image(207); spu_register_function(entry, code_stale);
+    spu_begin_image(0);
+    ctx->image_id = 207;
+    memcpy(ctx->ls + base, payload, 32);
+    spu_overlay_note_get(ctx, 0x700000, ctx->ls + base, 32);
+    memcpy(ctx->ls + base + 32, payload + 32, 64);
+    spu_overlay_note_get(ctx, 0x700020, ctx->ls + base + 32, 64);
+    ctx->pc = entry; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "full resolver executes staged native image");
+    memcpy(ctx->ls + base, replacement, sizeof replacement);
+    spu_overlay_note_get(ctx, 0x700000, ctx->ls + base, sizeof replacement);
+    ctx->pc = entry; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 82, "same-source replacement executes new native image");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 static void test_resident_code_regions(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
@@ -764,6 +797,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_staged_native_dispatch();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();

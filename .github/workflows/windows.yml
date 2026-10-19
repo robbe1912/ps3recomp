@@ -126,6 +126,9 @@ jobs:
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
       # the platform most contributors build on.
+      - name: Staged native-module ownership and dispatch
+        run: python tools/test_spu_stage_registry.py
+
       - name: Run self-contained SPU helper tests
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c runtime/spu/spu_float_simd.c runtime/memory/guest_read_sync.c

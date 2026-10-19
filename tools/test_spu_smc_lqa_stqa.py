@@ -53,7 +53,7 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; }
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t a, uint32_t b)
 { (void)ctx; (void)a; (void)b; return 0; }
-spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)   /* #266's rejoin check */
+spu_lifted_fn spu_lifted_lookup(spu_context* ctx, uint32_t lsa)   /* #266's rejoin check */
 { (void)ctx; (void)lsa; return NULL; }
 
 %s

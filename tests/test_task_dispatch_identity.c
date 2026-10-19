@@ -28,6 +28,15 @@ static void entry(spu_context *c) { (void)c; abort(); }
 static struct { uint64_t fp; spu_lifted_entry_fn fn; int image_id; }
     s_registry[] = {{42, entry, 1}};
 static unsigned s_registry_count = 1;
+spu_lifted_entry_fn spu_workload_find_img(uint64_t fp, int* image) {
+    for (unsigned i = 0; i < s_registry_count; ++i)
+        if (s_registry[i].fp == fp) {
+            if (image) *image = s_registry[i].image_id;
+            return s_registry[i].fn;
+        }
+    if (image) *image = 0;
+    return NULL;
+}
 static spu_async_job captured;
 static unsigned spawns;
 static int refuse_spawn;

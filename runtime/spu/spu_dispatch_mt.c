@@ -1,3 +1,4 @@
+#include "spu_interp.h"
 /* Clang-compiled musttail fast path for SPU indirect-branch dispatch.
  *
  * The full resolver (spu_indirect_branch, runtime/spu/spu_channels.c) lives in
@@ -58,8 +59,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
         /* Resident overlay first (mirrors the full resolver): streamed plugin
          * code owns its LS range; base-image entries at the same address are
          * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        spu_dispatch_fn fn = (spu_dispatch_fn)spu_lifted_lookup(ctx, pc);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

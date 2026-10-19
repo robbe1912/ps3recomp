@@ -234,3 +234,24 @@ explicit requested mute failure is fatal. Guest PCM, consumption, device
 scheduling and recording remain intact. `check_audio_mute_host.py` requires
 two real mute/init/shutdown cycles with no backend warnings. This host
 preference establishes no guest audio accuracy or title performance result.
+
+## Staged native module ownership
+
+Atomic branch: `codex/spu-staged-native-registry`; native integration blocker
+[152](https://github.com/robbe1912/motorstorm-mv-recomp/issues/152).
+
+The native image registry records compiled load bases and distinct helper
+entries. Staged content must match current local-store bytes before its native
+image owns a range; an unsupported load base cannot select stale primary-image
+code. Ownership is context-local and invalidates on DMA replacement and native
+local-store writes. The full resolver, musttail dispatcher and interpreter
+rejoin use one ownership-aware lookup. Valid cached branches avoid content
+hashing, and ordinary code uses bitmap admission rather than scanning module
+contents. Complete payload registrations also support fragmented DMA staging.
+
+The portable authored regression executes production registry, shared lookup
+and musttail code against competing images, separate contexts, replacements,
+helper entries, bounds and unsupported relocation. Its unchanged pre-fix
+missing-API control must fail. The existing full-runtime lifted-start fixture
+also checks actual full-resolver execution and same-source replacement.
+This proves neither original-title Vulkan behavior nor sustained game FPS.

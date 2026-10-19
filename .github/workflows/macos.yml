@@ -78,6 +78,9 @@ jobs:
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_fixed.c                 -Wl,-dead_strip -o /tmp/test_savedata_fixed runtime/memory/guest_read_sync.c
           /tmp/test_savedata_fixed
 
+      - name: Staged native-module ownership and dispatch
+        run: python3 tools/test_spu_stage_registry.py
+
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \
@@ -376,7 +379,7 @@ jobs:
             -o /tmp/test_spu_lockline_peer \
             runtime/spu/tests/test_spu_lockline_peer.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_task_lifecycle.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c runtime/spu/spu_task_lifecycle.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c runtime/spu/spu_float_simd.c \
@@ -393,7 +396,7 @@ jobs:
             -o /tmp/test_spu_taskset_wake \
             runtime/spu/tests/test_spu_taskset_wake.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_task_lifecycle.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c runtime/spu/spu_task_lifecycle.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c runtime/spu/spu_float_simd.c \
@@ -417,7 +420,7 @@ jobs:
             runtime/spu/tests/test_spu_lifted_start.c \
             runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
             runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
-            runtime/spu/spu_workload.c runtime/spu/spu_task_lifecycle.c runtime/spu/spurs_policy.c \
+            runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c runtime/spu/spu_task_lifecycle.c runtime/spu/spurs_policy.c \
             runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_float_simd.c runtime/spu/spu_lifted_thread.c \
@@ -440,7 +443,7 @@ jobs:
             -o /tmp/test_spu_mfc_slots \
             runtime/spu/tests/test_spu_mfc_slots.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_task_lifecycle.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c runtime/spu/spu_task_lifecycle.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c runtime/spu/spu_float_simd.c \

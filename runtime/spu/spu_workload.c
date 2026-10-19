@@ -25,86 +25,6 @@
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
 
-/* ---- fingerprint ------------------------------------------------------- */
-
-uint64_t spu_workload_fingerprint(const void* data, size_t n)
-{
-    const uint8_t* p = (const uint8_t*)data;
-    uint64_t h = 1469598103934665603ULL;          /* FNV offset basis */
-    for (size_t i = 0; i < n; i++) {
-        h ^= p[i];
-        h *= 1099511628211ULL;                     /* FNV prime */
-    }
-    return h;
-}
-
-/* ---- registry ---------------------------------------------------------- */
-
-#ifndef SPU_WORKLOAD_MAX
-#define SPU_WORKLOAD_MAX 256
-#endif
-
-typedef struct {
-    uint64_t            fp;
-    spu_lifted_entry_fn fn;
-    int                 image_id;
-    const char*         name;
-} spu_workload_entry;
-
-static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
-static unsigned           s_registry_count = 0;
-
-void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                               int image_id, const char* name)
-{
-    if (!fn) return;
-    for (unsigned i = 0; i < s_registry_count; i++) {
-        if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
-            s_registry[i].fn       = fn;
-            s_registry[i].image_id = image_id;
-            s_registry[i].name     = name;
-            return;
-        }
-    }
-    if (s_registry_count >= SPU_WORKLOAD_MAX) {
-        fprintf(stderr, "[spu_workload] registry full (%u); dropping '%s'\n",
-                SPU_WORKLOAD_MAX, name ? name : "?");
-        return;
-    }
-    s_registry[s_registry_count].fp       = fingerprint;
-    s_registry[s_registry_count].fn       = fn;
-    s_registry[s_registry_count].image_id = image_id;
-    s_registry[s_registry_count].name     = name;
-    s_registry_count++;
-}
-
-void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                           const char* name)
-{
-    spu_workload_register_img(fingerprint, fn, 0, name);
-}
-
-spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
-{
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fingerprint)
-            return s_registry[i].fn;
-    return NULL;
-}
-
-spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out)
-{
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fingerprint) {
-            if (image_id_out) *image_id_out = s_registry[i].image_id;
-            return s_registry[i].fn;
-        }
-    if (image_id_out) *image_id_out = 0;
-    return NULL;
-}
-
-unsigned spu_workload_count(void) { return s_registry_count; }
-
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
 
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -200,10 +120,8 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
-    spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    spu_lifted_entry_fn fn = spu_workload_find_img(fp, &image_id);
     if (!fn) {
         fprintf(stderr,
             "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
@@ -812,10 +730,8 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
-    spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    spu_lifted_entry_fn fn = spu_workload_find_img(fp, &image_id);
     if (!fn) {
         /* Capped: an unlifted job a title dispatches every frame (Tornado
          * Outbreak's Wwise audio jobs) wrote 2 GB of these in three minutes,
@@ -1177,10 +1093,8 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
-    spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    spu_lifted_entry_fn fn = spu_workload_find_img(fp, &image_id);
     if (!fn) {
         /* SPU_DUMP_MISS also applies here. The sync path has written the
          * unrecognised image out for a while and the async path did not, so a

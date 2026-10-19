@@ -11,7 +11,7 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
-           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
+           'spu_workload.c', 'spu_native_registry.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
            'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c', 'spu_float_simd.c', 'spu_task_lifecycle.c']
 with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
     binary = Path(tmp) / 'test'

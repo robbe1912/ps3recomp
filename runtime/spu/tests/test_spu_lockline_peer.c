@@ -35,7 +35,7 @@
  *         -o /tmp/test_spu_lockline_peer \
  *         runtime/spu/tests/test_spu_lockline_peer.c \
  *         runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
- *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+ *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_native_registry.c \
  *         runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
  *         runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
  *         runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
