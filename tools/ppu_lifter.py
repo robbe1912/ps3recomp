@@ -3681,26 +3681,39 @@ class PPULifter:
 
         # Build an interval map: sorted list of (start, end) for existing funcs
         func_intervals = sorted((f.start_addr, f.end_addr) for f in self.functions)
+        starts = [a for a, _ in func_intervals]
+        # Intervals overlap after tail promotion. A max-end tree finds the
+        # rightmost containing start in O(log N), including an earlier long
+        # interval behind later intervals that have ended. Sorting equal starts
+        # by end selects the widest extent, matching emission deduplication.
+        tree_size = 1
+        while tree_size < len(func_intervals):
+            tree_size *= 2
+        ends = [0] * (2 * tree_size)
+        for i, (_, end) in enumerate(func_intervals):
+            ends[tree_size + i] = end
+        for i in range(tree_size - 1, 0, -1):
+            ends[i] = max(ends[2*i], ends[2*i + 1])
+
+        def find_container(target):
+            last = bisect.bisect_right(starts, target) - 1
+
+            def rightmost(node, lo, hi):
+                if lo > last or ends[node] <= target:
+                    return None
+                if hi - lo == 1:
+                    start, end = func_intervals[lo]
+                    return (start, end) if start < target else None
+                mid = (lo + hi) // 2
+                found = rightmost(2*node + 1, mid, hi)
+                return found if found is not None else rightmost(2*node, lo, mid)
+
+            return rightmost(1, 0, tree_size)
 
         count = 0
         gap_targets: list[int] = []
         for target in sorted(all_refs):
-            # Binary search: find the function whose range contains target
-            container = None
-            lo, hi = 0, len(func_intervals) - 1
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                fstart, fend = func_intervals[mid]
-                if target < fstart:
-                    hi = mid - 1
-                elif target >= fend:
-                    lo = mid + 1
-                else:
-                    # fstart <= target < fend, but skip if target == fstart
-                    # (that's the function itself, already defined)
-                    if target != fstart:
-                        container = (fstart, fend)
-                    break
+            container = find_container(target)
 
             if container is None:
                 # Gap-resident target: a branch / bctr / jump-table target that
