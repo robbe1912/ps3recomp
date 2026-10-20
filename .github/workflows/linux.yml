@@ -418,6 +418,13 @@ jobs:
             -lpthread -lm
           /tmp/test_spurs_signalled_atomic
 
+      - name: Run the interpreter thread-report test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -I include -I runtime \
+            runtime/spu/spu_interp.c runtime/spu/tests/spu_interp_thread_state_test.c \
+            -o /tmp/test_spu_interp_thread_state -lpthread -lm
+          /tmp/test_spu_interp_thread_state
+
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
       # group's threads completed instantly with status 0, the group reported a

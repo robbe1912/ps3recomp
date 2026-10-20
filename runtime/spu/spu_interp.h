@@ -36,6 +36,12 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
  * return point of the drain the caller goes back to (spu_smc_microstep). */
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 
+/* Reports belong to the host thread that ran the interpreter. In particular,
+ * publishing each instruction's PC must not contend with other SPU workers.
+ * Read these on that thread after a run; they are not process-wide telemetry. */
+extern SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc;
+extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
+
 /* The single dispatch point every computed branch routes through. If `target`
  * is a registered lifted entry, runs it; otherwise interprets from `target`.
  * The lifter emits `bi $reg` / unresolved indirect branches as a call here. */

@@ -101,6 +101,13 @@ jobs:
           .\test_spu_helpers.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Run the interpreter thread-report test
+        run: |
+          clang-cl /nologo /O2 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime /Fe:test_spu_interp_thread_state.exe runtime/spu/spu_interp.c runtime/spu/tests/spu_interp_thread_state_test.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_spu_interp_thread_state.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
