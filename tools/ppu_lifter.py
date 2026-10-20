@@ -875,6 +875,9 @@ class PPULifter:
         # legacy behaviour (no bound).
         self.code_lo: int = 0
         self.code_hi: int | None = None
+        # ELF executable sections can lie outside named-function bounds and
+        # have data gaps between them. Empty retains the raw/stripped fallback.
+        self.code_ranges: list[tuple[int, int]] = []
         # Firmware-import stubs: {stub_addr -> NID}. A function lifted at a stub
         # address is emitted as `ps3_hle_call(nid, ctx)` instead of the literal
         # `.lib.stub` trampoline (which derefs an import pointer table the recomp
@@ -3744,8 +3747,11 @@ class PPULifter:
             text_hi = max((f.end_addr for f in self.functions), default=0)
             for target in gap_targets:
                 idx = bisect.bisect_right(boundaries, target)
-                bound = boundaries[idx] if idx < len(boundaries) else text_hi
-                bound = min(bound, target + _MAX_MID_TAIL)   # cap span (see above)
+                region_end = next((b for a, b in self.code_ranges if a <= target < b), text_hi)
+                bound = boundaries[idx] if idx < len(boundaries) else region_end
+                bound = min(bound, region_end, target + _MAX_MID_TAIL)
+                if self.code_hi is not None:
+                    bound = min(bound, self.code_hi)
                 if bound <= target:
                     continue
                 gap_func = self.lift_function(_insn_slice(target, bound), target, bound)
@@ -3765,7 +3771,7 @@ class PPULifter:
         cont = func.fallthrough_to
         if not cont:
             return
-        if self.code_hi is not None and not (self.code_lo <= cont < self.code_hi):
+        if self._outside_code(cont):
             return
         self.branch_targets.add(cont)
 
@@ -3946,11 +3952,11 @@ class PPULifter:
         clean build.
 
         A stub address is declared callable by definition, so exempt it."""
-        if self.code_hi is None:
-            return False
         if tgt in self.hle_stub_nids:
             return False
-        return not (self.code_lo <= tgt < self.code_hi)
+        if self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+            return True
+        return bool(self.code_ranges) and not any(a <= tgt < b for a, b in self.code_ranges)
 
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
@@ -4701,7 +4707,8 @@ _WORKER_STATE: dict = {}
 
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
-                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None):
+                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
+                 code_ranges=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4714,6 +4721,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["function_entries"] = function_entries or set()
     _WORKER_STATE["code_lo"] = code_lo
     _WORKER_STATE["code_hi"] = code_hi
+    _WORKER_STATE["code_ranges"] = code_ranges or []
     _WORKER_STATE["jump_tables"] = jump_tables or {}
 
 
@@ -4728,6 +4736,7 @@ def _worker_lift(task):
     lifter.function_entries = _WORKER_STATE.get("function_entries", set())
     lifter.code_lo = _WORKER_STATE.get("code_lo", 0)
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
+    lifter.code_ranges = _WORKER_STATE.get("code_ranges", [])
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     results = []
     for start, end in bounds:
@@ -4762,7 +4771,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     pool = mp.Pool(processes=jobs, initializer=_worker_init,
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
-                             lifter.code_lo, lifter.code_hi, lifter.jump_tables))
+                             lifter.code_lo, lifter.code_hi, lifter.jump_tables,
+                             lifter.code_ranges))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4870,6 +4880,7 @@ def main() -> None:
 
     # Get instructions (and keep the raw executable blobs for worker processes)
     seg_blobs: list[tuple[int, bytes]] = []
+    code_ranges: list[tuple[int, int]] = []
     if args.raw:
         all_insns = disassemble_bytes(file_data, base_addr, big_endian)
         seg_blobs = [(base_addr, file_data)]
@@ -4879,6 +4890,9 @@ def main() -> None:
             elf = ELFFile(args.input)
             elf.load()
             big_endian = elf.elf_header.big_endian
+            code_ranges = sorted((sh.sh_addr, sh.sh_addr + sh.sh_size)
+                                 for sh in elf.section_headers
+                                 if sh.sh_flags & 4 and sh.sh_size and sh.sh_type != 8)
             all_insns = []
             for ph in elf.program_headers:
                 if ph.p_type == PT_LOAD and (ph.p_flags & 1):
@@ -4894,6 +4908,7 @@ def main() -> None:
                         break
         except Exception as exc:
             print(f"Warning: ELF parse failed ({exc}), treating as raw", file=sys.stderr)
+            code_ranges = []
             all_insns = disassemble_bytes(file_data, base_addr, big_endian)
             seg_blobs = [(base_addr, file_data)]
 
@@ -5290,12 +5305,16 @@ def main() -> None:
     lifter.cpp_nonlocal_jumps = args.cpp_nonlocal_jumps
     lifter.header_name = args.header_name
     lifter.code_hi = args.code_end
-    # Without --code-end, default the executable window to the function-bounds
-    # span so branches into data still get clamped. With no window at all, a
-    # garbage target decoded from data (e.g. dead bytes after a blrl reached by
-    # fallthrough) is emitted as a call to a nonexistent func_XXXXXXXX and the
-    # link fails (LBP: func_FFFFFFEC from a literal pool misread as a bc).
-    if lifter.code_hi is None and func_bounds:
+    # Named functions need not cover executable linkage/init/fini sections.
+    # Admit those bytes without admitting data gaps in the same R-X segment.
+    # Keep --code-end as an additional ceiling, and the historical bounded
+    # function-span fallback when a raw/stripped input has no section metadata.
+    lifter.code_ranges = code_ranges
+    if code_ranges:
+        lifter.code_lo = min(a for a, _ in code_ranges)
+        if lifter.code_hi is None:
+            lifter.code_hi = max(b for _, b in code_ranges)
+    elif lifter.code_hi is None and func_bounds:
         lifter.code_lo = min(s for s, _ in func_bounds)
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
