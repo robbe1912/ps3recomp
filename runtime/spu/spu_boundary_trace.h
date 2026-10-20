@@ -48,6 +48,7 @@ static unsigned sb_tid(void){return (unsigned)(uintptr_t)pthread_self();}
 static unsigned sb_pid(void){return (unsigned)getpid();}
 static FILE* sb_open(const char* p){return fopen(p,"w+bx");}
 #endif
+#define SPU_BOUNDARY_CONTEXT_V2 1
 #define SB_CONTEXTS 32
 #define SB_HEADER_BYTES 4096
 #define SB_LS_BYTES 4096
@@ -63,11 +64,14 @@ typedef struct sb_context {
     uint64_t sequence;
     sb_mutex lock;
     int failed;
+    unsigned context_bytes,record_bytes,commit_offset;
 } sb_context;
 static struct {
     int enabled,policy_only,full_reported;
     unsigned capacity,ls_start,ls_length,match_start,match_value;
-    int match_enabled;
+    int match_enabled,first_pc_enabled,bad_context_reported;
+    unsigned context_limit,first_pc;
+    char arm_file[2048];
     char directory[2048],pcs_text[1024];
     uint8_t selected[65536];
     sb_context contexts[SB_CONTEXTS];
@@ -114,25 +118,56 @@ static void sb_initialize(void){
         }
     }
     if(!count){sb_error("empty PC filter");goto done;}
+    {
+        const char* limit=getenv("SPU_BOUNDARY_CONTEXT_LIMIT");
+        const char* first=getenv("SPU_BOUNDARY_FIRST_PC");
+        const char* arm=getenv("SPU_BOUNDARY_ARM_FILE");
+        if(limit&&(!sb_number(limit,&sb_state.context_limit)||!sb_state.context_limit||sb_state.context_limit>16)){
+            sb_error("invalid full-context limit (1..16)");goto done;}
+        if(first){
+            if(!sb_number(first,&sb_state.first_pc)||sb_state.first_pc>=0x40000u||
+               (sb_state.first_pc&3)||!sb_state.selected[sb_state.first_pc>>2]){
+                sb_error("first PC must be selected");goto done;}
+            sb_state.first_pc_enabled=1;
+        }
+        if(arm){if(!*arm||strlen(arm)>=sizeof(sb_state.arm_file)){
+            sb_error("invalid arm-file path");goto done;}strcpy(sb_state.arm_file,arm);}
+    }
     strcpy(sb_state.directory,dir);strcpy(sb_state.pcs_text,pcs);
     sb_state.policy_only=policy&&!strcmp(policy,"1");sb_state.enabled=1;
 done:
     SB_PUBLISH();sb_unlock(&sb_registry_lock);
 }
-static sb_context* sb_find_context(const void* owner){
+static sb_context* sb_find_context(const void* owner,size_t context_bytes){
     sb_context* found=NULL;sb_lock(&sb_registry_lock);
+    if(sb_state.context_limit&&(!context_bytes||context_bytes>524288u)){
+        if(!sb_state.bad_context_reported){sb_state.bad_context_reported=1;sb_error("full-context hook size unavailable or too large");}
+        sb_unlock(&sb_registry_lock);return NULL;
+    }
     for(unsigned i=0;i<SB_CONTEXTS;i++){
         sb_context* c=&sb_state.contexts[i];
-        if(c->owner==owner){found=c;break;}
+        if(c->owner==owner){
+            found=c;
+            if(c->context_bytes!=(sb_state.context_limit?(unsigned)context_bytes:0)&&!c->failed){
+                c->failed=1;sb_error("context size changed; capture unavailable");}
+            break;
+        }
         if(!c->owner){
             char path[2304],header[SB_HEADER_BYTES]={0};int n;
             c->owner=owner;sb_mutex_init(&c->lock);found=c;
+            c->context_bytes=sb_state.context_limit?(unsigned)context_bytes:0;
+            c->commit_offset=(unsigned)offsetof(sb_record,committed_sequence)+
+                c->context_bytes+(c->context_bytes?0x40000u:0);
+            c->record_bytes=c->commit_offset+8;
             n=snprintf(path,sizeof(path),"%s/boundary-%u-%u.bin",sb_state.directory,sb_pid(),i);
             if(n<0||n>=(int)sizeof(path)||!(c->file=sb_open(path))){c->failed=1;sb_error("exclusive trace file creation failed");break;}
-            n=snprintf(header,sizeof(header),"{\"format\":1,\"endian\":16909060,\"phase\":\"fetched-before-execution\",\"context\":%llu,\"capacity\":%u,\"policy_only\":%d,\"match_enabled\":%d,\"match_start\":%u,\"match_value\":%u,\"record_size\":%u,\"gpr_offset\":%u,\"ls_offset\":%u,\"commit_offset\":%u,\"ls_start\":%u,\"ls_length\":%u,\"frequency\":%llu,\"pcs\":\"%s\"}",
-                (unsigned long long)(uintptr_t)owner,sb_state.capacity,sb_state.policy_only,sb_state.match_enabled,sb_state.match_start,sb_state.match_value,(unsigned)sizeof(sb_record),
-                (unsigned)offsetof(sb_record,gpr),(unsigned)offsetof(sb_record,ls),(unsigned)offsetof(sb_record,committed_sequence),
-                sb_state.ls_start,sb_state.ls_length,(unsigned long long)sb_frequency(),sb_state.pcs_text);
+            n=snprintf(header,sizeof(header),"{\"format\":%u,\"endian\":16909060,\"phase\":\"fetched-before-execution\",\"context\":%llu,\"capacity\":%u,\"policy_only\":%d,\"match_enabled\":%d,\"match_start\":%u,\"match_value\":%u,\"record_size\":%u,\"gpr_offset\":%u,\"ls_offset\":%u,\"commit_offset\":%u,\"ls_start\":%u,\"ls_length\":%u,\"frequency\":%llu,\"pcs\":\"%s\",\"context_offset\":%u,\"context_bytes\":%u,\"full_ls_offset\":%u,\"full_ls_bytes\":%u,\"context_limit\":%u,\"first_pc_enabled\":%d,\"first_pc\":%u}",
+                c->context_bytes?2u:1u,(unsigned long long)(uintptr_t)owner,sb_state.capacity,sb_state.policy_only,sb_state.match_enabled,sb_state.match_start,sb_state.match_value,c->record_bytes,
+                (unsigned)offsetof(sb_record,gpr),(unsigned)offsetof(sb_record,ls),c->commit_offset,
+                sb_state.ls_start,sb_state.ls_length,(unsigned long long)sb_frequency(),sb_state.pcs_text,
+                (unsigned)offsetof(sb_record,committed_sequence),c->context_bytes,
+                (unsigned)offsetof(sb_record,committed_sequence)+c->context_bytes,c->context_bytes?0x40000u:0,
+                sb_state.context_limit,sb_state.first_pc_enabled,sb_state.first_pc);
             if(n<0||n>=(int)sizeof(header)||fwrite(header,1,sizeof(header),c->file)!=sizeof(header)||fflush(c->file)){
                 c->failed=1;sb_error("trace header write failed");}
             break;
@@ -148,25 +183,55 @@ __declspec(noinline)
 #else
 __attribute__((noinline))
 #endif
-static void sb_capture(const void* owner,uint32_t pc,uint32_t instruction,
+static void sb_capture(const void* owner,size_t context_bytes,uint32_t pc,uint32_t instruction,
                        const void* gpr,const uint8_t* ls,int policy){
-    sb_context* c=sb_find_context(owner);sb_record r;uint64_t zero=0;long offset;
-    if(!c)return;sb_lock(&c->lock);if(c->failed){sb_unlock(&c->lock);return;}
+    sb_context* c=sb_find_context(owner,context_bytes);sb_record r;
+    uint8_t* bytes=(uint8_t*)&r;uint64_t zero=0;long offset;
+    if(!c)return;sb_lock(&c->lock);
+    if(c->failed||(sb_state.context_limit&&c->sequence>=sb_state.context_limit)||
+       (!c->sequence&&sb_state.first_pc_enabled&&pc!=sb_state.first_pc)){
+        sb_unlock(&c->lock);return;
+    }
     memset(&r,0,sizeof(r));r.sequence=++c->sequence;r.tick=sb_tick();r.context=(uint64_t)(uintptr_t)owner;
     r.thread=sb_tid();r.pc=pc;r.instruction=instruction;r.policy=(uint32_t)policy;
     memcpy(r.gpr,gpr,sizeof(r.gpr));memcpy(r.ls,ls+sb_state.ls_start,sb_state.ls_length);
-    offset=(long)(SB_HEADER_BYTES+((r.sequence-1)%sb_state.capacity)*sizeof(r));
-    /* Invalidate the old slot before overwriting; publish its trailing sequence
-     * only after the entire new snapshot is visible to the reader. */
-    if(fseek(c->file,offset+(long)offsetof(sb_record,committed_sequence),SEEK_SET)
+    if(c->context_bytes){
+        bytes=(uint8_t*)calloc(1,c->record_bytes);
+        if(!bytes){c->failed=1;sb_error("full-context allocation failed");sb_unlock(&c->lock);return;}
+        memcpy(bytes,&r,offsetof(sb_record,committed_sequence));
+        memcpy(bytes+offsetof(sb_record,committed_sequence),owner,c->context_bytes);
+        memcpy(bytes+offsetof(sb_record,committed_sequence)+c->context_bytes,ls,0x40000u);
+    }
+    offset=(long)(SB_HEADER_BYTES+((r.sequence-1)%sb_state.capacity)*c->record_bytes);
+    if(fseek(c->file,offset+(long)c->commit_offset,SEEK_SET)
        ||fwrite(&zero,sizeof(zero),1,c->file)!=1||fflush(c->file)
-       ||fseek(c->file,offset,SEEK_SET)||fwrite(&r,sizeof(r),1,c->file)!=1||fflush(c->file)
-       ||fseek(c->file,offset+(long)offsetof(sb_record,committed_sequence),SEEK_SET)
+       ||fseek(c->file,offset,SEEK_SET)||fwrite(bytes,1,c->record_bytes,c->file)!=c->record_bytes||fflush(c->file)
+       ||fseek(c->file,offset+(long)c->commit_offset,SEEK_SET)
        ||fwrite(&r.sequence,sizeof(r.sequence),1,c->file)!=1||fflush(c->file)){
         c->failed=1;sb_error("trace record write failed; coverage incomplete");}
+    if(c->context_bytes)free(bytes);
     sb_unlock(&c->lock);
 }
-static inline void spu_boundary_observe(const void* owner,uint32_t pc,uint32_t instruction,
+/* Arm-file polling is limited to selected boundaries and at most 10 Hz per
+ * host thread. It gates observation only; it never changes guest execution. */
+static int sb_arm_ready(void){
+#ifdef _WIN32
+    static __declspec(thread) int armed,failed;
+    static __declspec(thread) uint64_t next_check;
+#else
+    static __thread int armed,failed;
+    static __thread uint64_t next_check;
+#endif
+    uint64_t now;FILE* f;
+    if(!sb_state.arm_file[0]||armed)return 1;
+    if(failed)return 0;
+    now=sb_tick();if(now<next_check)return 0;next_check=now+sb_frequency()/10;
+    f=fopen(sb_state.arm_file,"rb");
+    if(f){fclose(f);armed=1;return 1;}
+    if(errno!=ENOENT){failed=1;sb_error("arm-file read failed; capture unavailable");}
+    return 0;
+}
+static inline void spu_boundary_observe_context(const void* owner,size_t context_bytes,uint32_t pc,uint32_t instruction,
                                         const void* gpr,const uint8_t* ls,int policy){
     if(!SB_READY())sb_initialize();
     if(!sb_state.enabled||(sb_state.policy_only&&!policy)||pc>=0x40000u||(pc&3)||!sb_state.selected[pc>>2])return;
@@ -175,6 +240,14 @@ static inline void spu_boundary_observe(const void* owner,uint32_t pc,uint32_t i
         uint32_t word=((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
         if(word!=sb_state.match_value)return;
     }
-    sb_capture(owner,pc,instruction,gpr,ls,policy);
+    if(!sb_arm_ready())return;
+    sb_capture(owner,context_bytes,pc,instruction,gpr,ls,policy);
 }
+/* Legacy callers retain version-1 rings unless full-context capture was
+ * requested. A missing size then fails explicitly, never yielding zero state. */
+static inline void spu_boundary_observe(const void* owner,uint32_t pc,uint32_t instruction,
+                                        const void* gpr,const uint8_t* ls,int policy){
+    spu_boundary_observe_context(owner,0,pc,instruction,gpr,ls,policy);
+}
+
 #endif

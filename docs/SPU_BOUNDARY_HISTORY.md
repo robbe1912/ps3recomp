@@ -55,3 +55,42 @@ Linux and Windows hosted workflows passed the implementation at exact commit
 Native diagnostic use exposed the importance of retaining overwrite counts,
 actual writer TIDs and an exact PE/PDB archive before relinking. These are
 capture-method findings, not a target-runtime correctness fix.
+
+## Bounded full-context capture
+
+The actual interpreter hook supplies `sizeof(*ctx)` to the writer. Setting
+`SPU_BOUNDARY_CONTEXT_LIMIT` to 1 through 16 selects version-2 records: each
+includes the raw host context and the full 256-KiB LS in addition to the legacy
+GPR/window fields. Each context stops recording after that many observations;
+execution continues normally. Missing/oversized context sizes are reported as
+capture errors, rather than substituted with zero state. Without this option,
+the existing version-1 ring format and wrapping behavior are preserved.
+
+`SPU_BOUNDARY_FIRST_PC` optionally requires the first observation for each
+context to match one of the selected PCs. `SPU_BOUNDARY_ARM_FILE` optionally
+gates observation until that file exists. Only selected boundaries poll for it,
+at most ten times per second per host thread; after arming, no further file
+checks occur on that thread. These controls select evidence and do not change
+instruction results, service responses, target state, or completion.
+
+Full-context records require the exact context header/source and ABI layout
+from their build. Raw pointers are opaque evidence, never valid replay pointers.
+Retain matching EXE/PDB/build identities and explicitly reconstruct any required
+pointer ownership. Other writers can change shared fields during copying, so
+the record is not an all-writer atomic snapshot. Same-address reuse, missing
+external memory and asynchronous service state still constrain replay. A
+pre/successor pair does not establish arbitrary service semantics or full PM
+parity. Recording adds substantial latency and is unsuitable for FPS claims.
+
+There are at most 32 context slots; each version-2 record has at most 512 KiB of
+raw context plus 256 KiB LS and legacy metadata. The 16-record limit bounds
+payload volume below 400 MiB. Files remain private. The reader validates record
+layout and commit markers; it never synthesizes missing context or tail bytes.
+
+`python tools/test_spu_boundary_context.py` first rejects the legacy writer for
+missing full context, then checks C/C++ nonzero event/decrementer fields, the
+last LS byte, first-PC gating, bounded recording, arming, invalid configuration,
+missing/oversized context sizes and torn records. It also executes the actual
+interpreter's authored CPU program, preserving nonzero context fields and both
+sides of its LS store. No game bytes are used. These are capture-method checks,
+not a compiled-execution or performance verdict.

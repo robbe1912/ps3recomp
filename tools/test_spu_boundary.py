@@ -76,7 +76,7 @@ def main():
     # Removing just the hook still executes that program but loses the required
     # boundary evidence: a red-capable check of the actual integration seam.
     actual=ROOT/'runtime/spu/spu_interp.c';text=actual.read_bytes()
-    hook=b'    spu_boundary_observe(ctx, pc, insn, ctx->gpr, ctx->ls, ctx->policy_mode);'
+    hook=b'    spu_boundary_observe_context(ctx, sizeof(*ctx), pc, insn, ctx->gpr, ctx->ls, ctx->policy_mode);'
     assert text.count(hook)==1
     for baseline in (True,False):
         name='actual-without-hook' if baseline else 'actual-interpreter'

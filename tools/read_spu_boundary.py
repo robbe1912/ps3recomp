@@ -7,10 +7,19 @@ def read_ring(path):
     data=Path(path).read_bytes()
     assert len(data)>=4096, 'Missing boundary header'
     h=json.loads(data[:4096].split(b'\0',1)[0])
-    assert h['format']==1 and h['endian']==0x01020304
+    assert h['format'] in (1,2) and h['endian']==0x01020304
     size=h['record_size'];cap=h['capacity'];commit=h['commit_offset']
     assert 16<=cap<=1024 and 40<=h['gpr_offset'] and h['gpr_offset']+2048<=h['ls_offset']
-    assert h['ls_offset']+4096<=commit and commit+8==size<=8192
+    assert h['ls_offset']+4096<=commit and commit+8==size
+    if h['format']==1:
+        assert size<=8192
+    else:
+        assert 1<=h['context_limit']<=16 and 0<h['context_bytes']<=524288
+        assert h['full_ls_bytes']==0x40000
+        assert h['ls_offset']+4096==h['context_offset']
+        assert h['context_offset']+h['context_bytes']==h['full_ls_offset']
+        assert h['full_ls_offset']+h['full_ls_bytes']==commit
+        assert size<=1048576
     assert 0<h['ls_length']<=4096 and 0<=h['ls_start']<=0x40000-h['ls_length']
     assert len(data)<=4096+cap*size, 'Oversized ring'
     rows=[];invalid=[]
@@ -25,6 +34,13 @@ def read_ring(path):
         rows.append(dict(sequence=seq,tick=tick,context=owner,thread=tid,pc=pc,instruction=insn,
                          policy=policy,gpr=r[h['gpr_offset']:h['gpr_offset']+2048],
                          ls=r[h['ls_offset']:h['ls_offset']+h['ls_length']]))
+    if h['format']==2:
+        for row in rows:
+            slot=(row['sequence']-1)%cap
+            r=data[4096+slot*size:4096+(slot+1)*size]
+            row['context_bytes']=r[h['context_offset']:h['full_ls_offset']]
+            row['full_ls']=r[h['full_ls_offset']:commit]
+            assert row['sequence']<=h['context_limit']
     rows.sort(key=lambda r:r['sequence'])
     sequences=[r['sequence'] for r in rows]
     assert len(sequences)==len(set(sequences)), 'Duplicate committed sequence'
@@ -38,5 +54,6 @@ if __name__=='__main__':
     result=read_ring(sys.argv[1])
     for r in result['rows']:
         r['gpr']=r['gpr'].hex();r['ls']=r['ls'].hex()
+        if 'context_bytes' in r:r['context_bytes']=r['context_bytes'].hex();r['full_ls']=r['full_ls'].hex()
     print(json.dumps(result,indent=2))
     raise SystemExit(2 if result['invalid_slots'] or result['gaps'] else 0)
