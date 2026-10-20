@@ -17,11 +17,7 @@ from ppu_lifter import LiftedFunction, PPULifter  # noqa: E402
 
 
 def _lifter():
-    try:
-        return PPULifter.__new__(PPULifter)
-    except Exception as exc:  # pragma: no cover
-        print(f"cannot construct lifter: {exc}")
-        raise
+    return PPULifter()
 
 
 def main() -> int:
