@@ -1,0 +1,32 @@
+name: Bounded native job trace
+on:
+  push:
+    branches: [master, main, combined, 'codex/**']
+    paths: ['include/ps3emu/native_job_trace.h', 'runtime/diag/native_job_trace.c', 'tests/test_native_job_trace.c', 'tools/test_native_job_trace.py', '.github/workflows/native-job-trace.yml']
+  pull_request:
+    paths: ['include/ps3emu/native_job_trace.h', 'runtime/diag/native_job_trace.c', 'tests/test_native_job_trace.c', 'tools/test_native_job_trace.py', '.github/workflows/native-job-trace.yml']
+  workflow_dispatch:
+jobs:
+  recorder:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python tools/test_native_job_trace.py --mutants
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-job-trace-${{ matrix.os }}
+          path: |
+            build/native-job-trace-tests/**/*.log
+            build/native-job-trace-tests/**/*.json
+          retention-days: 5
