@@ -93,14 +93,20 @@ if args.mutants:
         'overwrite-records': overwrite,
         'hidden-invalid-clock': text.replace(clock, ''),
     }
+    expected_assertions = {
+        'premature-publication': 'ps3_job_trace_read(trace, 0, &untouched) == 0 && untouched.data0 == 123',
+        'hidden-loss': 'ps3_job_trace_describe(trace, &info) && info.attempted == 9 && info.dropped == 6',
+        'overwrite-records': 'ps3_job_trace_read(trace, i, &event) == 1 && event.data0 == i',
+        'hidden-invalid-clock': 'event.flags & PS3_JOB_TRACE_CLOCK_INVALID',
+    }
     for name, variant in variants.items():
         directory = out / name
         directory.mkdir(parents=True, exist_ok=True)
         implementation = directory / 'implementation.c'
         implementation.write_text(variant)
         result = compile_and_run(directory, implementation)
-        assert result.returncode != 0 and 'assert' in (result.stdout + result.stderr).lower(), (
-            name + ' must fail a real fixture assertion, not compilation, timeout or infrastructure')
+        assert result.returncode != 0 and expected_assertions[name] in (result.stdout + result.stderr), (
+            name + ' must fail its specific recorder assertion, not setup, compilation, timeout or infrastructure')
         rejected.append(name)
         print('PASS rejected ' + name + ' by actual recorder fixture assertion')
 
