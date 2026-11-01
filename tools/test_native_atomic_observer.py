@@ -121,6 +121,13 @@ if a.mutants:
     assert spu_body.count(anchor)==1
     mutants['callback-under-lock']=(ppu_body,spu_body.replace(anchor,
         endblock+'\n        spu_lockline_unlock();'),header,'!fixture_lock_held')
+    host_call='if (g_spu_host_line_commit_hook) g_spu_host_line_commit_hook(ea & ~127u);'
+    assert spu_body.count(host_call)==2
+    mutants['missing-host-wakeup']=(ppu_body,spu_body.replace(host_call,
+        '/* Deliberately omit host wakeup. */'),header,
+        'host_notifications==(unsigned)success')
+    mutants['host-wakeup-under-lock']=(ppu_body,spu_body.replace(anchor,
+        '        '+host_call+'\n'+anchor,1),header,'!fixture_lock_held')
     for name,(pp,sp,api,expected) in mutants.items():
         assert (pp,sp,api)!=(ppu_body,spu_body,header),name
         r=run(name,1,pp,sp,api)

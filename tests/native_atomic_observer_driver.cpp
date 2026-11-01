@@ -6,6 +6,8 @@ int fixture_lock_held,fixture_lock_opens,fixture_notifications,fixture_rewrite_o
 unsigned g_spu_putllc_count,g_spu_putllc_sync_hit;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_line_commit_hook)(uint32_t);
+void (*g_spu_host_line_commit_hook)(uint32_t);
+static unsigned host_notifications, line_notifications;
 static unsigned taskset_notifications,event_count;
 static uint64_t ticks=100;
 static int clock_mode;
@@ -39,7 +41,8 @@ static void observe(void*,const ps3_atomic_observation* e){
 static int accept(void*,uint32_t,uintptr_t,uint64_t,uint32_t){
     assert(!fixture_lock_held);assert(!issue219_ppu_lock_held());return accept_enabled;
 }
-static void line_hook(uint32_t){assert(!fixture_lock_held);}
+static void line_hook(uint32_t line){assert(!fixture_lock_held && line==256);line_notifications++;}
+static void host_hook(uint32_t line){assert(!fixture_lock_held && line==256);host_notifications++;}
 static void be32(uint8_t*p,uint32_t x){for(int i=3;i>=0;i--){p[i]=(uint8_t)x;x>>=8;}}
 static void be64(uint8_t*p,uint64_t x){for(int i=7;i>=0;i--){p[i]=(uint8_t)x;x>>=8;}}
 static int all(const uint8_t*p,unsigned n,uint8_t value){for(unsigned i=0;i<n;i++)if(p[i]!=value)return 0;return 1;}
@@ -89,6 +92,7 @@ int main(void){
         }
         spu_context*c=(spu_context*)calloc(1,sizeof(*c));assert(c);c->ls=c->ls_store;
         g_spu_line_commit_hook=line_hook;
+        g_spu_host_line_commit_hook=host_hook;
         for(unsigned mode=0;mode<9;mode++){
             memset(arena,0x11,sizeof(arena));memset(c->ls,0x22,SPU_LS_SIZE);
             c->mfc_eal=256;c->mfc_lsa=128;c->pc=0x3240;c->gpr[0]._u32[0]=0x100;
@@ -100,11 +104,13 @@ int main(void){
             uint32_t command=mode==4||mode==7?MFC_PUTLLUC_CMD:
                 mode==5||mode==8?MFC_PUTQLLUC_CMD:MFC_PUTLLC_CMD;
             fixture_notifications=0;taskset_notifications=0;unsigned n=event_count;
+            host_notifications=0;line_notifications=0;
             const int success=mode==0||mode==4||mode==5;
             fixture_rewrite_on_unlock=success;
             assert(issue219_atomic(c,command)==1);fixture_rewrite_on_unlock=0;
             assert(c->atomic_stat==(unsigned)(mode==4||mode==5?2:success?0:1));
             assert(fixture_notifications==success&&taskset_notifications==(unsigned)success);
+            assert(host_notifications==(unsigned)success && line_notifications==(unsigned)success);
             check_event(n,enabled,success,mode<6);
             if(enabled){
                 assert(last.source==PS3_ATOMIC_SPU_STORE&&last.size==128&&last.command==command);

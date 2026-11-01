@@ -17,6 +17,7 @@ extern int fixture_rewrite_on_unlock;
 extern unsigned g_spu_putllc_count, g_spu_putllc_sync_hit;
 extern uint32_t g_barrier_sync_watch;
 extern void (*g_spu_line_commit_hook)(uint32_t);
+extern void (*g_spu_host_line_commit_hook)(uint32_t);
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
 void spu_coh_notify_write(uint32_t);
