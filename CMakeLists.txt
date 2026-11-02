@@ -381,6 +381,18 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    if(UNIX AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        add_executable(test_spu_dispatch_checks runtime/spu/tests/test_dispatch_checks.c runtime/diag/spu_execution_observer.c)
+        target_compile_definitions(test_spu_dispatch_checks PRIVATE PS3_EXECUTION_OBSERVATION=1)
+        target_include_directories(test_spu_dispatch_checks PRIVATE include runtime runtime/spu)
+        target_compile_options(test_spu_dispatch_checks PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(test_spu_dispatch_checks PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(test_spu_dispatch_checks PRIVATE -Wl,--gc-sections)
+        endif()
+        add_test(NAME spu_dispatch_checks COMMAND test_spu_dispatch_checks)
+    endif()
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so

@@ -51,14 +51,28 @@ extern void spu_halt(spu_context*);
  * ended where it should not have (spurs_policy.c, [pm-end]). */
 static _Thread_local uint32_t t_recent[32];
 static _Thread_local uint32_t t_recent_n;
+/* The opt-in fast path has no complete recent-PC history. */
+static int s_fast_dispatch = -1;
+static int spu_fast_dispatch_init(void)
+{
+    const char* e = getenv("SPU_FAST_DISPATCH");
+    int fast = e && e[0] == '1';
+    const char* probes[] = {"MOTORSTORM_WWS_WAIT_TRACE", "SPU_NO_LS0_END", "SPU_EXITTRACE",
+                            "SPU_STEPTRACE", "SPU_STEPTRACE_FROM", "SPU_JOBDRAIN"};
+    for (unsigned i = 0; i < sizeof probes / sizeof probes[0]; ++i)
+        if (getenv(probes[i])) fast = 0;
+    __atomic_store_n(&s_fast_dispatch, fast, __ATOMIC_RELAXED);
+    return fast;
+}
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
+    if (__atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED) == 1) return 0;
     unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
     for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
     return k;
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
+static void spu_task_launch_slow(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -148,6 +162,21 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     static int _n = 0;
     if (marked && _n++ < 12)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
+}
+
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    int fast = __atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED);
+    if (fast < 0) fast = spu_fast_dispatch_init();
+    if (fast && (ctx->pc & SPU_LS_MASK) && g_pm_flow_ctx != (void*)ctx) {
+        if (!ctx->policy_mode && ctx->host_depth) {
+            extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+            spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+        }
+        ++ctx->steps;
+        return;
+    }
+    spu_task_launch_slow(ctx, fn);
 }
 
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
