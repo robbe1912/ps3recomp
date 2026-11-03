@@ -73,7 +73,7 @@ jobs:
         run: |
           cmake -S . -B build -DPS3RECOMP_BUILD_TESTS=ON
           cmake --build build --target test_cpu_surface_hle test_spu_shufb_dispatch test_spu_shufb_scalar test_spu_float_simd test_spu_mfc_registry test_rsx_pipeline_cache test_rsx_capture_schedule test_rsx_slot_pool test_rsx_shader_cache test_rsx_gpu_references test_rsx_gpu_submission test_rsx_fp_decompiler test_memory_container test_gcm_draw_trace test_rsx_upload_buffer test_rsx_upload_strip test_rsx_indexed_strip test_rsx_record_batch test_rsx_texture_remap test_rsx_timeline_select test_rsx_mrt_observer test_rsx_mrt_masks
-          ctest --test-dir build -R "^(cpu_surface_hle|ppu_inline_read_sync|spu_shufb_dispatch|spu_shufb_scalar|spu_float_simd|spu_mfc_registry|rsx_pipeline_cache|rsx_capture_schedule|rsx_slot_pool|rsx_shader_cache|rsx_gpu_references|rsx_gpu_submission|rsx_fp_decompiler|memory_container_allocation|gcm_draw_trace|rsx_upload_buffer|rsx_upload_strip|rsx_indexed_strip|rsx_record_batch|rsx_texture_remap|rsx_timeline_select|rsx_mrt_observer|rsx_mrt_masks)$" --output-on-failure
+          ctest --test-dir build -R "^(cpu_surface_hle|ppu_inline_read_sync|spu_shufb_dispatch|spu_shufb_scalar|spu_float_simd|spu_mfc_registry|rsx_pipeline_cache|rsx_capture_schedule|rsx_slot_pool|rsx_shader_cache|rsx_gpu_references|rsx_gpu_submission|rsx_fp_decompiler|memory_container_allocation|gcm_draw_trace|rsx_upload_buffer|rsx_upload_strip|rsx_indexed_strip|rsx_record_batch|rsx_triangle_capacity|rsx_texture_remap|rsx_timeline_select|rsx_mrt_observer|rsx_mrt_masks)$" --output-on-failure
 
       - name: Verify the archive exists and is x86-64
         run: |

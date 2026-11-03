@@ -6406,6 +6406,24 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     return o;
 }
 
+/* A compatible TRIANGLES continuation consumes no new record slot. Decide
+ * before a capacity drain can discard the unfinished primitive tail. Keep the
+ * predicate shared with the post-upload merge so reservation and merge agree. */
+static int vp_triangle_can_merge(u32 primitive, u32 first, u32 rec)
+{
+    if (primitive != RSX_PRIMITIVE_TRIANGLES || !s_d3d.merge_prev_draw ||
+        !s_d3d.draw_count || s_d3d.merge_first_end != first ||
+        !s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return 0;
+    const D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+    const rsx_state* state = s_d3d.current_rsx_state;
+    return pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
+        pv->fp_addr == (state ? state->shader_program : 0) &&
+        pv->cmask == rsx_record_color_masks(state) &&
+        pv->blend_key == rsx_blend_key(state, state ? state->blend_enable : 1) &&
+        pv->begin_epoch == (state ? state->begin_epoch : 0) &&
+        (u64)pv->vb_byte_offset + (u64)pv->vertex_count * VP_VERT_STRIDE == rec;
+}
+
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
@@ -6427,7 +6445,9 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 
     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
     if (count == 0 || count > MAX_VERTICES) return;
-    ensure_draw_record_capacity();
+    if (!(s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16 &&
+          vp_triangle_can_merge(primitive, first, s_d3d.vp_vb_offset)))
+        ensure_draw_record_capacity();
 
     /* QUADS (prim 8) have no D3D12 topology; expand to a triangle list.
      * dbgfont draws all text as quads. Prefer the real vertex-program path
@@ -6544,23 +6564,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          * rendered as spike triangles with a zero texcoord along the tub rim.
          * The batches land contiguously in the vertex buffer, so extending the
          * previous record is all that is needed to restore the stream. */
-        if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
-            s_d3d.merge_first_end == first) {
-            D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
-            u32 fpnow = s_d3d.current_rsx_state
-                        ? s_d3d.current_rsx_state->shader_program : 0;
-            if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
-                pv->fp_addr == fpnow &&
-                pv->cmask == rsx_record_color_masks(s_d3d.current_rsx_state) &&
-                pv->blend_key == rsx_blend_key(s_d3d.current_rsx_state,
-                    s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1) && primitive == RSX_PRIMITIVE_TRIANGLES &&
-                pv->begin_epoch == (s_d3d.current_rsx_state
-                                    ? s_d3d.current_rsx_state->begin_epoch : 0) &&
-                pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
-                pv->vertex_count += emitted;
-                s_d3d.merge_first_end = first + count;
-                return;
-            }
+        if (emitted && vp_triangle_can_merge(primitive, first, rec)) {
+            s_d3d.draws[s_d3d.draw_count - 1].vertex_count += emitted;
+            s_d3d.merge_first_end = first + count;
+            return;
         }
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
@@ -6665,7 +6672,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     }
     if (!s_d3d.pipeline_ready) return;
     if (count == 0 || count > MAX_VERTICES) return;
-    ensure_draw_record_capacity();
+    if (!vp_triangle_can_merge(primitive, first, s_d3d.vp_vb_offset))
+        ensure_draw_record_capacity();
     if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
 
     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
@@ -6686,23 +6694,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     /* Same BEGIN/END batch concatenation as the non-indexed path: this title's
      * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
      * multiple of 3, so every batch after the first assembled out of phase. */
-    if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
-        s_d3d.merge_first_end == first && primitive == RSX_PRIMITIVE_TRIANGLES) {
-        D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
-        u32 fpnow = s_d3d.current_rsx_state
-                    ? s_d3d.current_rsx_state->shader_program : 0;
-        if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
-            pv->fp_addr == fpnow &&
-                pv->cmask == rsx_record_color_masks(s_d3d.current_rsx_state) &&
-                pv->blend_key == rsx_blend_key(s_d3d.current_rsx_state,
-                    s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1) &&
-            pv->begin_epoch == (s_d3d.current_rsx_state
-                                ? s_d3d.current_rsx_state->begin_epoch : 0) &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
-            pv->vertex_count += emitted;
-            s_d3d.merge_first_end = first + count;
-            return;
-        }
+    if (emitted && vp_triangle_can_merge(primitive, first, rec)) {
+        s_d3d.draws[s_d3d.draw_count - 1].vertex_count += emitted;
+        s_d3d.merge_first_end = first + count;
+        return;
     }
     if (emitted && s_d3d.draw_count < MAX_DRAWS) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];

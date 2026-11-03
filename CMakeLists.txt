@@ -619,6 +619,10 @@ if(PS3RECOMP_BUILD_TESTS OR BUILD_TESTING)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_gcm_draw_trace.cmake.in")
     add_executable(test_rsx_record_batch tests/test_rsx_record_batch.c)
     add_test(NAME rsx_record_batch COMMAND test_rsx_record_batch)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME rsx_triangle_capacity COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_triangle_capacity.py" --cc "${CMAKE_C_COMPILER}")
+    set_tests_properties(rsx_triangle_capacity PROPERTIES TIMEOUT 180)
     add_executable(test_rsx_texture_remap tests/test_rsx_texture_remap.c
         libs/video/rsx_texture_layout.c)
     target_include_directories(test_rsx_texture_remap PRIVATE include libs/video)

@@ -1,0 +1,85 @@
+/* Production callbacks/record layout; authored storage and submission adapters. */
+#include "rsx_commands.h"
+#include "rsx_primitives.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef MAX_DRAWS
+#define MAX_DRAWS 4
+#endif
+#define MAX_VERTICES 393216
+#define VP_VERT_STRIDE 256
+@RECORD@
+static struct { int pipeline_ready,tex_bound,merge_prev_draw; void *vb_mapped,*vp_root_sig,*vp_vb_mapped; u32 vb_offset,vp_vb_offset,draw_count,merge_first_end,vp_parity; rsx_state* current_rsx_state; D3D12DrawRecord draws[MAX_DRAWS]; struct {u32 off,raw,w,h,fmt,ctrl1,cube,mips;int set;} cur_texs[4]; } s_d3d;
+static unsigned vertices[8192], output[8192], output_n, drains, cb_calls;
+static void submit(void) { for(u32 d=0;d<s_d3d.draw_count;d++){D3D12DrawRecord*r=&s_d3d.draws[d]; if(!r->is_vp)continue; for(u32 v=0;v<r->vertex_count/3*3;v++) output[output_n++]=vertices[r->vb_byte_offset/256+v];} s_d3d.draw_count=0;s_d3d.vp_vb_offset=0;s_d3d.vp_parity^=1; }
+static void ensure_draw_record_capacity(void){if(s_d3d.draw_count==MAX_DRAWS){drains++;submit();}}
+static u32 rsx_record_color_masks(const rsx_state*s){return s?s->color_mask:0;}
+static u32 rsx_blend_key(const rsx_state*s,int b){(void)s;return b;}
+static u32 rsx_cull_key(const rsx_state*s){(void)s;return 0;}
+static int vp_get_vs(const rsx_state*s){(void)s;return 0;}
+static void vp_record_cb(u32 i,int vs,D3D12DrawRecord*r){(void)i;(void)vs;(void)r;cb_calls++;}
+static u32 current_rt_off(u32*w,u32*h,u32*m){*w=*h=1;memset(m,0,12);return 0;}
+static void cpu_surface_capture(D3D12DrawRecord*r){(void)r;}
+static u32 upload_tris_vp(const rsx_state*s,u32 first,u32 n){(void)s;for(u32 v=0;v<n;v++)vertices[s_d3d.vp_vb_offset/256+v]=first+v;s_d3d.vp_vb_offset+=n*256;return n;}
+static u32 upload_tris_vp_indexed(const rsx_state*s,u32 f,u32 n){return upload_tris_vp(s,f,n);}
+static u32 upload_quads_vp(const rsx_state*s,u32 f,u32 n){return upload_tris_vp(s,f,n);}
+static u32 upload_quads_vp_indexed(const rsx_state*s,u32 f,u32 n){return upload_tris_vp(s,f,n);}
+static u32 upload_strip_vp(const rsx_state*s,u32 f,u32 n,int fan){(void)fan;return upload_tris_vp(s,f,n);}
+static u32 upload_strip_vp_indexed(const rsx_state*s,u32 f,u32 n,int fan){return upload_strip_vp(s,f,n,fan);}
+static u32 upload_quads_from_rsx(u32 f,u32 n){(void)f;return n;}
+static u32 upload_vertices_from_rsx(u32 f,u32 n){(void)f;return n;}
+
+@HELPER@
+@CALLBACKS@
+static int run_case(int indexed, u32 first_count, unsigned changed)
+{
+    rsx_state state;
+    memset(&state, 0, sizeof state);
+    state.vp_ucode_bytes = 16;
+    state.begin_epoch = 7;
+    state.shader_program = 0x123;
+    state.color_mask = 15;
+    memset(&s_d3d, 0, sizeof s_d3d);
+    s_d3d.current_rsx_state = &state;
+    s_d3d.pipeline_ready = 1;
+    s_d3d.vb_mapped = s_d3d.vp_vb_mapped = s_d3d.vp_root_sig = (void*)1;
+    s_d3d.draw_count = MAX_DRAWS - 1;
+    output_n = drains = cb_calls = 0;
+    void (*draw)(void*,u32,u32,u32) = indexed ? d3d12_draw_indexed : d3d12_draw_arrays;
+    draw(NULL, RSX_PRIMITIVE_TRIANGLES, 0, first_count);
+    if (changed == 1) state.shader_program++;
+    if (changed == 2) state.begin_epoch++;
+    if (changed == 3) state.color_mask ^= 1;
+    if (changed == 4) state.blend_enable ^= 1;
+    draw(NULL, RSX_PRIMITIVE_TRIANGLES, first_count, 256);
+    if ((!changed && (drains || s_d3d.draw_count != MAX_DRAWS || cb_calls != 1)) ||
+        (changed && (drains != 1 || s_d3d.draw_count != 1 || cb_calls != 2))) {
+        fprintf(stderr, "FAIL record ownership indexed=%d change=%u drains=%u cb=%u\n", indexed, changed, drains, cb_calls);
+        return 1;
+    }
+    submit();
+    u32 expected = (first_count + 256) / 3 * 3;
+    if (output_n != expected) {
+        fprintf(stderr, "FAIL triangle count indexed=%d first=%u expected=%u got=%u\n", indexed, first_count, expected, output_n);
+        return 1;
+    }
+    for (u32 v=0; v<expected; v++) if (output[v] != v) {
+        fprintf(stderr, "FAIL sequence indexed=%d vertex=%u got=%u\n", indexed, v, output[v]);
+        return 1;
+    }
+    return 0;
+}
+int main(int argc, char** argv)
+{
+    int only = argc > 1 ? atoi(argv[1]) : -1;
+    for (int indexed=0; indexed<2; indexed++) {
+        if (only >= 0 && only != indexed) continue;
+        const u32 chunks[] = {127,128,129,256};
+        for (unsigned c=0; c<4; c++) if (run_case(indexed, chunks[c], 0)) return 1;
+        for (unsigned changed=1; changed<=4; changed++)
+            if (run_case(indexed, 129, changed)) return 1;
+    }
+    printf("PASS exact triangle output across full record capacity\n");
+    return 0;
+}
