@@ -21,12 +21,15 @@ def main():
     out.mkdir(parents=True)
     fixture = r'''
 #include "spu_context.h"
+#include "spu_policy_overlay.h"
 #include "spu_interp.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 ''' + registry + r'''
+/* These ownership cases are nonpolicy; matching WWS code would be a bug. */
+int spu_overlay_match_sig(const uint8_t hdr[16]){(void)hdr;abort();}
 static volatile unsigned called;
 static void base(spu_context*c){(void)c;called=1;abort();}
 static void owner(spu_context*c){(void)c;called=2;abort();}

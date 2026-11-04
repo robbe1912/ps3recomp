@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_policy_overlay.h"
 #include "ps3emu/native_atomic_observer.h"
 void spu_halt(spu_context*); /* Policy trampolines can precede its definition. */
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
@@ -1471,6 +1472,14 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
                 return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
         }
     }
+    if (spu_policy_job_address(ctx, lsa)) {
+        /* A current task keeps priority. Otherwise an overwritten job region
+         * cannot rejoin stale primary code or an earlier resident overlay. */
+        spu_fn task = ctx->resident_task ? spu_lookup(lsa, ctx->resident_task) : NULL;
+        if (task) return (spu_lifted_fn)task;
+        const int image = spu_policy_overlay_image(ctx, lsa);
+        return image ? (spu_lifted_fn)spu_lookup(lsa, image) : NULL;
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -2215,6 +2224,9 @@ void spu_indirect_branch(spu_context* ctx)
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
+    /* Reidentify before any cached resident/primary choice, including a
+     * previous overlay hit. Resident-code/task priority below is unchanged. */
+    spu_policy_overlay_refresh(ctx, ctx->pc);
     spu_fn fn = NULL;
     int code_owner = 0;
     for (unsigned slot = 0; slot < 4; ++slot) {
@@ -2340,28 +2352,6 @@ void spu_indirect_branch(spu_context* ctx)
           } }
         spu_halt(ctx);
         return;
-    }
-    /* WWS job-code overlay match: the PM (image 2) streams a job module into the
-     * code buffer (base = LS[0x1320]) and branches to base+entryOffset. Its 16-byte
-     * ila header identifies which of the 89 lifted job modules it is; match it and
-     * mark that overlay resident so the module's lifted functions dispatch. The
-     * module arrives via a DMA LIST, so the single-GET note_get hook never fired. */
-    if (!fn && ctx->image_id == 2 && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
-        uint32_t codeBase = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
-                            ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
-        if (codeBase + 16 <= SPU_LS_SIZE) {
-            extern int spu_overlay_match_sig(const uint8_t hdr[16]);
-            int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
-            if (img) {
-                if (ctx->resident_ovl != img) {
-                    ctx->resident_ovl = img;
-                    static int _n = 0; if (_n++ < 32)
-                        fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
-                                "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
-                }
-                fn = spu_lookup(ctx->pc, img);
-            }
-        }
     }
     /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
      * code into an LS buffer and branches into it. The staged blobs are

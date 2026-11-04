@@ -1,10 +1,10 @@
 name: SPU resident lookup
 on:
   push:
-    branches: [master, main, combined, codex/spu-resident-lookup]
-    paths: ['runtime/spu/spu_channels.c', 'runtime/spu/spu_context.h', 'tools/test_spu_resident_lookup.py', '.github/workflows/spu-resident-lookup.yml']
+    branches: [master, main, combined, codex/spu-resident-lookup, codex/issue-268-policy-overlays]
+    paths: ['runtime/spu/spu_channels.c', 'runtime/spu/spu_context.h', 'tools/test_spu_resident_lookup.py', 'runtime/spu/spu_policy_overlay.h', 'tools/test_spu_policy_overlay.py', 'runtime/spu/tests/test_spu_policy_overlay.c', 'runtime/spu/tests/spu_policy_overlay_legacy.inc', '.github/workflows/spu-resident-lookup.yml']
   pull_request:
-    paths: ['runtime/spu/spu_channels.c', 'runtime/spu/spu_context.h', 'tools/test_spu_resident_lookup.py', '.github/workflows/spu-resident-lookup.yml']
+    paths: ['runtime/spu/spu_channels.c', 'runtime/spu/spu_context.h', 'tools/test_spu_resident_lookup.py', 'runtime/spu/spu_policy_overlay.h', 'tools/test_spu_policy_overlay.py', 'runtime/spu/tests/test_spu_policy_overlay.c', 'runtime/spu/tests/spu_policy_overlay_legacy.inc', '.github/workflows/spu-resident-lookup.yml']
   workflow_dispatch:
 jobs:
   ownership:
@@ -22,3 +22,4 @@ jobs:
         with:
           arch: x64
       - run: python tools/test_spu_resident_lookup.py
+      - run: python tools/test_spu_policy_overlay.py
