@@ -17,11 +17,17 @@ out = root / 'build/native-leaf-tests'
 out.mkdir(parents=True, exist_ok=True)
 env = {k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
 
-def build(name, source):
+import spu_owned_options
+# The production owned-job option readers, extracted verbatim from spu_channels.c.
+owned_options=out/'owned-options.c'
+owned_options.write_text(spu_owned_options.source(root))
+
+def build(name, source, readers=True, expect_link=True):
     directory=out/name
     directory.mkdir(exist_ok=True)
     exe=directory/('fixture.exe' if os.name=='nt' else 'fixture')
-    command=[args.compiler, str(source), str(spu/'spu_float_simd.c'), str(spu/'tests/spu_native_leaf_test.c')]
+    command=[args.compiler, str(source), str(spu/'spu_float_simd.c'), str(spu/'tests/spu_native_leaf_test.c'),
+             *([str(owned_options)] if readers else [])]
     if os.name=='nt':
         command+=['/nologo','/std:c17','/O2','/UNDEBUG','/D_CRT_SECURE_NO_WARNINGS',
                   '/I'+str(root/'include'),'/I'+str(spu),'/Fo'+str(directory)+os.sep,'/Fe'+str(exe)]
@@ -30,6 +36,7 @@ def build(name, source):
     (directory/'command.json').write_text(json.dumps(command,indent=2))
     r=subprocess.run(command,cwd=root,env=env,capture_output=True,text=True)
     (directory/'build.log').write_text(r.stdout+r.stderr)
+    if not expect_link: return r
     assert r.returncode==0, r.stdout+r.stderr
     return exe
 
@@ -58,6 +65,10 @@ def instrument(contents):
     return contents.replace(anchor,reader+'\n'+anchor)
 production=out/'instrumented-interpreter.c'
 production.write_text(instrument(source))
+# Historical control: without the real readers the interpreter does not link
+# (macOS reported it first; GNU ld and link.exe fail the same way).
+r=build('missing-owned-readers',production,readers=False,expect_link=False)
+assert r.returncode!=0 and 'spu_native_owned_enabled' in r.stdout+r.stderr,r.stdout+r.stderr
 exe=build('production',production)
 for mode in ['normal','empty','lookups','cold_workers','prefreeze_trace']:
     r=run(exe,mode);assert r.returncode==0,r.stdout+r.stderr
@@ -83,4 +94,4 @@ for name,before,after in [
     r=run(build(name,path),'lookups' if name=='hot-environment-scan' else 'normal')
     message='FAIL no warmed native-option environment reads' if name=='hot-environment-scan' else 'FAIL real host execution count'
     assert r.returncode==1 and message in r.stderr,r.stdout+r.stderr
-print('PASS actual interpreter native-leaf state/stop/budget/guard/FP/thread tests; five unsafe dispatch/environment mutants rejected')
+print('PASS actual interpreter native-leaf state/stop/budget/guard/FP/thread tests with the production owned-job readers; missing-reader link control and five unsafe dispatch/environment mutants rejected')

@@ -8,6 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import spu_owned_options
 
 root=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser(description=__doc__)
@@ -56,7 +60,7 @@ if a.syntax:
                 '-I'+str(root/'include'),'-I'+str(spu)])
         r=execute([compiler,*flags,str(consumer)],out,'cpp-syntax-'+str(enabled))
         assert r.returncode==0,r.stdout+r.stderr
-def build_run(name,enabled,changes=None):
+def build_run(name,enabled,changes=None,readers=True):
     d=out/name;d.mkdir(exist_ok=True);contents=dict(sources)
     for path,before,after in changes or []:
         assert contents[path].count(before)==1,(path,before)
@@ -80,7 +84,11 @@ def build_run(name,enabled,changes=None):
     fixture=fixture.replace('/* ACTUAL_RESOLVED_TAIL */',tail)
     (d/'fixture.c').write_text(fixture.replace('/* ACTUAL_SCOPED_BODY */',body))
     exe=d/('fixture.exe'if os.name=='nt'else'fixture')
-    inputs=[str(local/'spu_interp.c'),str(local/'spu_float_simd.c'),str(d/'observer.c'),str(d/'fixture.c')]
+    # Production owned-job option readers (spu_channels.c), compiled in the same
+    # observation mode as everything else rather than stubbed.
+    (d/'owned_options.c').write_text(spu_owned_options.source(root))
+    inputs=[str(local/'spu_interp.c'),str(local/'spu_float_simd.c'),str(d/'observer.c'),str(d/'fixture.c'),
+            *([str(d/'owned_options.c')] if readers else [])]
     if msvc:
         flags=['/nologo','/std:c17','/O2','/UNDEBUG','/D_CRT_SECURE_NO_WARNINGS',
             '/DPS3_EXECUTION_OBSERVATION='+str(enabled),'/I'+str(root/'include'),'/I'+str(local),
@@ -89,9 +97,14 @@ def build_run(name,enabled,changes=None):
         flags=['-std=gnu17','-O2','-UNDEBUG','-DPS3_EXECUTION_OBSERVATION='+str(enabled),
             '-I'+str(root/'include'),'-I'+str(local),'-lm','-o',str(exe)]
     r=execute([compiler,*inputs,*flags],d,'build')
+    if not readers: return r
     assert r.returncode==0,r.stdout+r.stderr
     r=execute([str(exe)],d,'run')
     return r
+# Historical control: without the production readers the scoped drain body and
+# interpreter do not link (the failure #284 recorded on all three OSes).
+r=build_run('missing-owned-readers',0,readers=False)
+assert r.returncode!=0 and 'spu_native_owned_enabled' in r.stdout+r.stderr,r.stdout+r.stderr
 for enabled in (0,1):
     r=build_run('production-'+str(enabled),enabled)
     assert r.returncode==0,r.stdout+r.stderr
@@ -133,7 +146,7 @@ manifest={'compiler':compiler,'production_modes':[0,1],'controls':controls,
     'sources':{x:hashlib.sha256((root/x).read_bytes()).hexdigest() for x in [*sources,
         'runtime/spu/spu_native_leaf.h','runtime/spu/spu_float_simd.c',
         'runtime/spu/spu_interp_tables.inc','include/ps3emu/spu_execution_observer.h','tests/spu_execution_observer.c',
-        'tools/test_spu_execution_observer.py']},
+        'tools/test_spu_execution_observer.py','tools/spu_owned_options.py']},
     'scope':'Actual interpreter/native admission, real return/dispatch macros and extracted scoped body; authored channel/VM/IRQ dependencies. Not full interrupt/coherence/game timeline or overhead proof.'}
 (out/'result.json').write_text(json.dumps(manifest,indent=2))
-print('PASS actual execution modes 0/1, native admission and specific coverage controls')
+print('PASS actual execution modes 0/1 with the production owned-job readers, native admission, missing-reader link control and specific coverage controls')

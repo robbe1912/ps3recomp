@@ -2,9 +2,9 @@ name: Native workload regressions
 on:
   push:
     branches: [master, main, combined, 'codex/**']
-    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/spurs_scheduler_observer.c', 'libs/spurs/**', 'include/**', 'tests/test_spurs_scheduler.c', 'tests/spurs_scheduler_observer_fixture.h', 'tools/test_spurs_scheduler.py', 'tools/test_spu_native_leaf.py', '.github/workflows/spu-native-leaf.yml']
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/spurs_scheduler_observer.c', 'libs/spurs/**', 'include/**', 'tests/test_spurs_scheduler.c', 'tests/spurs_scheduler_observer_fixture.h', 'tools/test_spurs_scheduler.py', 'tools/test_spu_native_leaf.py', 'tools/spu_owned_options.py', '.github/workflows/spu-native-leaf.yml']
   pull_request:
-    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/spurs_scheduler_observer.c', 'libs/spurs/**', 'include/**', 'tests/test_spurs_scheduler.c', 'tests/spurs_scheduler_observer_fixture.h', 'tools/test_spurs_scheduler.py', 'tools/test_spu_native_leaf.py', '.github/workflows/spu-native-leaf.yml']
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/spurs_scheduler_observer.c', 'libs/spurs/**', 'include/**', 'tests/test_spurs_scheduler.c', 'tests/spurs_scheduler_observer_fixture.h', 'tools/test_spurs_scheduler.py', 'tools/test_spu_native_leaf.py', 'tools/spu_owned_options.py', '.github/workflows/spu-native-leaf.yml']
   workflow_dispatch:
 jobs:
   native-leaf:

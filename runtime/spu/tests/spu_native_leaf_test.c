@@ -44,6 +44,9 @@ void spu_wrch(spu_context* c,uint32_t ch,u128 v) { (void)c;(void)ch;(void)v;abor
 uint32_t spu_rchcnt(spu_context* c,uint32_t ch) { (void)c;(void)ch;abort(); }
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c;abort(); }
 void spu_trace_pc(spu_context* c,uint32_t pc) { (void)c;(void)pc;abort(); }
+/* Interrupt delivery is a host-service boundary these leaf tests never reach:
+ * owned policy is off (SPU_NATIVE_OWNED_JOBS unset), so abort visibly if it is. */
+void (*spu_take_interrupt(spu_context* c,void (*fn)(spu_context*)))(spu_context*) { (void)c;(void)fn;abort(); }
 spu_lifted_fn spu_lifted_lookup(const spu_context* c,uint32_t pc) { (void)c;(void)pc;return NULL; }
 uint8_t* vm_base;
 int g_spu_ls_watch_n,g_spu_ls_probe,g_wws_read_probe,g_wws_code_probe,g_spu_smc_watch,g_spu_ls_dbg;

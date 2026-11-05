@@ -1,6 +1,7 @@
 /* Authored control-flow streams and dependencies; no original game code. */
 #include "spu_interp.h"
 #include "spu_native_leaf.h"
+#include "spu_native_owned.h"   /* actual owned policy used by the extracted drain body */
 #include <assert.h>
 #include <setjmp.h>
 #include <stdio.h>

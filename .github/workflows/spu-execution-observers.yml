@@ -8,6 +8,7 @@ on:
       - 'include/ps3emu/spu_execution_observer.h'
       - 'tests/spu_execution_observer.c'
       - 'tools/test_spu_execution_observer.py'
+      - 'tools/spu_owned_options.py'
       - 'CMakeLists.txt'
       - '.github/workflows/spu-execution-observers.yml'
   pull_request:
@@ -17,6 +18,7 @@ on:
       - 'include/ps3emu/spu_execution_observer.h'
       - 'tests/spu_execution_observer.c'
       - 'tools/test_spu_execution_observer.py'
+      - 'tools/spu_owned_options.py'
       - 'CMakeLists.txt'
       - '.github/workflows/spu-execution-observers.yml'
   workflow_dispatch:
