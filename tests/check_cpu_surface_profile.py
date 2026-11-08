@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 ROOT=Path(__file__).resolve().parents[1]
@@ -15,16 +16,19 @@ def function(source,name):
 def main():
     source=(ROOT/'libs/video/rsx_cpu_surface.inc').read_text()
     out=ROOT/'build/self-tests/cpu-surface-profile';out.mkdir(parents=True,exist_ok=True)
-    fixture=(ROOT/'tests/test_cpu_surface_profile.c').read_text()
+    fixture='#include "ps3emu/guest_read_sync.h"\n'+(ROOT/'tests/test_cpu_surface_profile.c').read_text()
+    fixture=fixture.replace('static void cpu_surface_service(void);','static void cpu_surface_service(int snapshot_boundary);')
     declarations=source[source.index('typedef struct CpuSurfaceRequest'):source.index('static ID3D12CommandAllocator')]
-    declarations+='\nstatic int s_cpu_surface_live;\n'
+    declarations+='\nstatic int s_cpu_surface_live;\nstatic int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,void *staging,u32 output_bytes){(void)ranges;(void)count;(void)staging;(void)output_bytes;return 0;}\n'
     helper=source[source.index('static int s_cpu_surface_profile;'):source.index('static void cpu_surface_fence_wait')]
     for marker,value in [('DECLARATIONS',declarations),('HELPERS',helper),('SERVICE',function(source,'cpu_surface_service')),('COMPLETION',function(source,'cpu_surface_frame_complete')),('REQUEST',function(source,'cpu_surface_request'))]:
         fixture=fixture.replace('/* PRODUCTION_'+marker+' */',value)
     c=out/'check.c';c.write_text(fixture);exe=out/('check.exe' if os.name=='nt' else 'check')
-    compiler=os.environ.get('MV_CLANG') or os.environ.get('CC') or ('clang-cl' if os.name=='nt' else 'cc')
-    if os.name=='nt':cmd=[compiler,'/nologo','/O2','/UNDEBUG','/I'+str(ROOT/'libs/video'),str(c),'/Fo'+str(out) + os.sep,'/Fe'+str(exe)]
-    else:cmd=[compiler,'-std=c11','-O2','-UNDEBUG','-Wall','-Wextra','-Werror','-I'+str(ROOT/'libs/video'),str(c),'-o',str(exe)]
+    compiler=os.environ.get('MV_CLANG') or os.environ.get('CC') or shutil.which('clang-cl') or shutil.which('clang') or shutil.which('cc')
+    if not compiler:raise RuntimeError('No C compiler found; set MV_CLANG or CC')
+    msvc_style=Path(compiler).name.lower() in ('cl','cl.exe','clang-cl','clang-cl.exe')
+    if msvc_style:cmd=[compiler,'/nologo','/O2','/UNDEBUG','/I'+str(ROOT/'libs/video'),'/I'+str(ROOT/'include'),str(c),'/Fo'+str(out) + os.sep,'/Fe'+str(exe)]
+    else:cmd=[compiler,'-std=c11','-O2','-UNDEBUG','-Wall','-Wextra','-Werror','-I'+str(ROOT/'libs/video'),'-I'+str(ROOT/'include'),str(c),'-o',str(exe)]
     build=subprocess.run(cmd,capture_output=True,text=True);(out/'build.log').write_text(build.stdout+build.stderr)
     if build.returncode:print(build.stdout+build.stderr);return build.returncode
     run=subprocess.run([str(exe)],capture_output=True,text=True);(out/'run.log').write_text(run.stdout+run.stderr);print(run.stdout+run.stderr)
@@ -49,7 +53,7 @@ def main():
     assert header.count('if(stages[i]>remaining)return 0;')==1
     (mutant/'rsx_cpu_surface_profile.h').write_text(header.replace('if(stages[i]>remaining)return 0;','if(stages[i]>remaining)return 1;'))
     changed=list(cmd)
-    if os.name=='nt':
+    if msvc_style:
         changed.insert(1,'/I'+str(mutant));changed=[('/Fe'+str(mutant/'check.exe')) if x.startswith('/Fe') else x for x in changed]
     else:
         changed[1:1]=['-I'+str(mutant)];changed[-1]=str(mutant/'check')
@@ -60,11 +64,11 @@ def main():
     (mutant/'run.log').write_text(bad.stdout+bad.stderr)
     assert bad.returncode==1 and 'overlapping/over-accounted stages rejected' in bad.stderr
     completion=function(source,'cpu_surface_frame_complete')
-    assert completion.count('cpu_surface_service();')==1
-    absent=out/'missing-service.c';absent.write_text(fixture.replace(completion,completion.replace('cpu_surface_service();','(void)&cpu_surface_service; /* deliberate missing completion */')))
+    assert completion.count('cpu_surface_service(0);')==1
+    absent=out/'missing-service.c';absent.write_text(fixture.replace(completion,completion.replace('cpu_surface_service(0);','(void)&cpu_surface_service; /* deliberate missing completion */')))
     missing=out/('missing-service.exe' if os.name=='nt' else 'missing-service')
     changed=[str(absent) if x==str(c) else x for x in cmd]
-    if os.name=='nt':changed=[('/Fe'+str(missing)) if x.startswith('/Fe') else x for x in changed]
+    if msvc_style:changed=[('/Fe'+str(missing)) if x.startswith('/Fe') else x for x in changed]
     else:changed[-1]=str(missing)
     build=subprocess.run(changed,capture_output=True,text=True);(out/'missing-service-build.log').write_text(build.stdout+build.stderr)
     assert build.returncode==0,build.stdout+build.stderr

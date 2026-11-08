@@ -2,9 +2,15 @@
 #include "ps3emu/guest_read_sync.h"
 #include "rsx_surface_readback.h"
 #include "rsx_cpu_surface_profile.h"
+#include "rsx_cpu_surface_snapshot.h"
+#include "rsx_fifo_boundary.h"
 typedef struct CpuSurfaceRequest {
     struct CpuSurfaceRequest *next;
     u32 address, bytes;
+    const VmReadSnapshotRange *snapshot_ranges;
+    void *snapshot_staging;
+    u32 snapshot_count, snapshot_output_bytes;
+    int snapshot_result;
     u32 client_thread;
     HANDLE done;
     int status;
@@ -148,18 +154,66 @@ static void cpu_surface_read(u32 address,u32 bytes) {
         }
     }
 }
-static void cpu_surface_service(void) {
+/* This runs only on the renderer owner.  A view is admitted only when every
+ * requested byte is uniquely owned by a live pitch-backed allocation.  The
+ * matching CPU copies establish texture visibility before staging from VM; no
+ * unsynchronized VM load is used as a substitute for a missing surface. */
+static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
+    void *staging,u32 output_bytes) {
+    extern uint8_t *vm_base;
+    if(!ranges || !staging || !count || count>VM_READ_SNAPSHOT_MAX_RANGES ||
+        !output_bytes || output_bytes>VM_READ_SNAPSHOT_MAX_BYTES)
+        return VM_READ_SNAPSHOT_INVALID;
+    RsxCpuSurfaceSnapshotView views[CPU_SURFACE_CAPACITY];
+    OffRT *targets[CPU_SURFACE_CAPACITY];
+    unsigned view_count=0;
+    for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
+        OffRT *r=&s_d3d.off_rt[i];
+        if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->h)continue;
+        views[view_count]=(RsxCpuSurfaceSnapshotView){r->cpu_address,r->cpu_pitch,r->h};
+        targets[view_count++]=r;
+    }
+    RsxCpuSurfaceSnapshotBinding bindings[VM_READ_SNAPSHOT_MAX_RANGES];
+    if(!rsx_cpu_surface_snapshot_bind(ranges,count,views,view_count,bindings))
+        return VM_READ_SNAPSHOT_UNAVAILABLE;
+    for(u32 i=0;i<count;i++) {
+        OffRT *r=targets[bindings[i].view_index];
+        if(s_cpu_surface_recording && r->gpu_generation && r->cpu_generation!=r->gpu_generation)
+            cpu_surface_fail("CPU snapshot requires pending recorded surface writes",E_FAIL);
+    }
+    for(u32 i=0;i<count;i++) {
+        int seen=0;for(u32 j=0;j<i;j++)if(bindings[j].view_index==bindings[i].view_index){seen=1;break;}
+        if(seen)continue;
+        if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->matched++;
+        cpu_surface_copy(targets[bindings[i].view_index]);
+    }
+    for(u32 i=0;i<count;i++)
+        memcpy((uint8_t *)staging+ranges[i].output_offset,vm_base+ranges[i].address,ranges[i].bytes);
+    return VM_READ_SNAPSHOT_OK;
+}
+static void cpu_surface_service(int snapshot_boundary) {
     LONG thread=(LONG)GetCurrentThreadId();
     LONG owner=InterlockedCompareExchange(&s_cpu_surface_thread,thread,0);
     if(owner && owner!=thread)cpu_surface_fail("renderer service thread changed",E_FAIL);
     AcquireSRWLockExclusive(&s_cpu_surface_lock);
-    CpuSurfaceRequest *request=s_cpu_surface_head;s_cpu_surface_head=s_cpu_surface_tail=NULL;
+    CpuSurfaceRequest *request=s_cpu_surface_head;
+    if(snapshot_boundary)s_cpu_surface_head=s_cpu_surface_tail=NULL;
+    else {
+        CpuSurfaceRequest *before=NULL,*cursor=request;
+        while(cursor && !cursor->snapshot_ranges){before=cursor;cursor=cursor->next;}
+        if(before){before->next=NULL;s_cpu_surface_head=cursor;if(!cursor)s_cpu_surface_tail=NULL;}
+        else request=NULL;
+    }
     ReleaseSRWLockExclusive(&s_cpu_surface_lock);
     while(request) {
         CpuSurfaceRequest *next=request->next;
         request->profile.started=cpu_surface_tick();
         s_cpu_surface_profile_active=s_cpu_surface_profile?&request->profile:NULL;
-        cpu_surface_read(request->address,request->bytes);request->status=0;
+        if(request->snapshot_ranges)
+            request->snapshot_result=cpu_surface_snapshot(request->snapshot_ranges,request->snapshot_count,
+                request->snapshot_staging,request->snapshot_output_bytes);
+        else cpu_surface_read(request->address,request->bytes);
+        request->status=0;
         s_cpu_surface_profile_active=NULL;
         request->profile.finished=cpu_surface_tick();
         u64 elapsed=GetTickCount64()-request->queued_ms;
@@ -174,7 +228,17 @@ static void cpu_surface_service(void) {
  * drain may render several batches before the outer message pump runs. */
 static void cpu_surface_frame_complete(void) {
     if(s_cpu_surface_recording)cpu_surface_fail("CPU service before command submission",E_FAIL);
-    cpu_surface_service();
+    cpu_surface_service(0);
+}
+static int cpu_surface_snapshot_boundary(void *opaque) {
+    (void)opaque;
+    if(s_cpu_surface_recording)cpu_surface_fail("CPU snapshot before command submission",E_FAIL);
+    cpu_surface_service(1);return 1;
+}
+static int cpu_surface_snapshot_pending(void) {
+    int pending=0;AcquireSRWLockShared(&s_cpu_surface_lock);
+    for(CpuSurfaceRequest *r=s_cpu_surface_head;r;r=r->next)if(r->snapshot_ranges){pending=1;break;}
+    ReleaseSRWLockShared(&s_cpu_surface_lock);return pending;
 }
 static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
     (void)opaque;
@@ -209,6 +273,27 @@ static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
     cpu_surface_profile_emit(&request);
     CloseHandle(request.done);
 }
+static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 count,
+    void *staging,u32 output_bytes,void *opaque) {
+    (void)opaque;
+    if((LONG)GetCurrentThreadId()==InterlockedCompareExchange(&s_cpu_surface_thread,0,0))
+        return VM_READ_SNAPSHOT_UNAVAILABLE;
+    CpuSurfaceRequest request={0};request.address=ranges&&count?ranges[0].address:0;request.bytes=output_bytes;
+    request.snapshot_ranges=ranges;request.snapshot_count=count;request.snapshot_staging=staging;
+    request.snapshot_output_bytes=output_bytes;request.snapshot_result=VM_READ_SNAPSHOT_FAILED;
+    request.status=-1;request.queued_ms=GetTickCount64();request.profile.queued=cpu_surface_tick();
+    request.done=CreateEventA(NULL,FALSE,FALSE,NULL);if(!request.done)cpu_surface_fail("CPU snapshot event creation",E_FAIL);
+    AcquireSRWLockExclusive(&s_cpu_surface_lock);
+    if(!s_cpu_surface_live){ReleaseSRWLockExclusive(&s_cpu_surface_lock);CloseHandle(request.done);return VM_READ_SNAPSHOT_UNAVAILABLE;}
+    if(s_cpu_surface_tail)s_cpu_surface_tail->next=&request;else s_cpu_surface_head=&request;
+    s_cpu_surface_tail=&request;ReleaseSRWLockExclusive(&s_cpu_surface_lock);
+    extern void *cellGcm_fifo_kick_event(void);HANDLE kick=(HANDLE)cellGcm_fifo_kick_event();
+    if(kick&&!SetEvent(kick))cpu_surface_fail("renderer snapshot kick",E_FAIL);
+    DWORD wait=WaitForSingleObject(request.done,30000);
+    if(wait!=WAIT_OBJECT_0 || request.status)cpu_surface_fail("CPU snapshot synchronization",E_FAIL);
+    request.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&request);CloseHandle(request.done);
+    return request.snapshot_result;
+}
 static void cpu_surface_init(void) {
     s_cpu_surface_thread=0;
     const char *profile=getenv("RSX_CPU_SURFACE_PROFILE");
@@ -225,7 +310,7 @@ static void cpu_surface_init(void) {
     CPU_SURFACE_HR(s_cpu_surface_list->lpVtbl->Close(s_cpu_surface_list));
     CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateFence(s_d3d.device,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void **)&s_cpu_surface_fence));
     s_cpu_surface_event=CreateEventA(NULL,FALSE,FALSE,NULL);if(!s_cpu_surface_event)cpu_surface_fail("GPU event creation",E_FAIL);
-    s_cpu_surface_live=1;vm_read_sync_set_handler(cpu_surface_request,NULL);
+    s_cpu_surface_live=1;vm_read_snapshot_set_handler(cpu_surface_snapshot_request,NULL);vm_read_sync_set_handler(cpu_surface_request,NULL);
 }
 static void cpu_surface_retire(OffRT *r) {
     cpu_surface_copy(r);
@@ -234,12 +319,13 @@ static void cpu_surface_retire(OffRT *r) {
 }
 static void cpu_surface_shutdown(void) {
     vm_read_sync_set_handler(NULL,NULL);
+    vm_read_snapshot_set_handler(NULL,NULL);
     AcquireSRWLockExclusive(&s_cpu_surface_lock);
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++)cpu_surface_retire(&s_d3d.off_rt[i]);
     s_cpu_surface_live=0;
     CpuSurfaceRequest *request=s_cpu_surface_head;s_cpu_surface_head=s_cpu_surface_tail=NULL;
     ReleaseSRWLockExclusive(&s_cpu_surface_lock);
-    while(request){CpuSurfaceRequest *next=request->next;request->status=0;request->profile.started=request->profile.finished=cpu_surface_tick();if(!SetEvent(request->done))cpu_surface_fail("shutdown CPU completion",E_FAIL);request=next;}
+    while(request){CpuSurfaceRequest *next=request->next;request->status=0;request->snapshot_result=VM_READ_SNAPSHOT_UNAVAILABLE;request->profile.started=request->profile.finished=cpu_surface_tick();if(!SetEvent(request->done))cpu_surface_fail("shutdown CPU completion",E_FAIL);request=next;}
     if(s_cpu_surface_list)s_cpu_surface_list->lpVtbl->Release(s_cpu_surface_list);
     if(s_cpu_surface_alloc)s_cpu_surface_alloc->lpVtbl->Release(s_cpu_surface_alloc);
     if(s_cpu_surface_fence)s_cpu_surface_fence->lpVtbl->Release(s_cpu_surface_fence);

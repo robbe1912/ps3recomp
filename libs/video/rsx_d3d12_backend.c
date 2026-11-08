@@ -7241,7 +7241,8 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
-    cpu_surface_service();
+    if(cpu_surface_snapshot_pending())(void)cellGcm_with_fifo_boundary(cpu_surface_snapshot_boundary,NULL);
+    cpu_surface_service(0);
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
