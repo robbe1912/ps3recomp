@@ -19,6 +19,10 @@ extern "C" {
 struct ppu_context;
 typedef void (*ps3emu_ppu_function)(struct ppu_context*);
 
+/* Replaces the entry for guest_addr. Installation and replacement must be
+ * quiescent with respect to guest dispatch. */
+void ppu_register_function(uint64_t guest_addr, ps3emu_ppu_function function);
+
 /* Returns 1 and writes the exact current entry when guest_addr is registered.
  * Returns 0 for a missing address or null output and leaves *out untouched.
  */

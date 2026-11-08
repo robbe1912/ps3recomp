@@ -43,7 +43,6 @@ void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 const func_entry function_table[1] = {{0, nullptr, nullptr}};   // no lifted program: registered by hand below
 const uint64_t function_table_count = 0;
 uint32_t ps3_hle_count(void) { return 0; }
-void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 void ps3_indirect_call(ppu_context* ctx);
 // The coroutine hook this test exercises. Weak, so the same test also builds
 // against a loader without it and shows what happens there.
