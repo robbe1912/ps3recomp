@@ -36,9 +36,9 @@ static inline int rsx_cpu_surface_snapshot_bind(const VmReadSnapshotRange *range
             const uint64_t view_end = view_begin + (uint64_t)views[j].pitch * views[j].height;
             if (!views[j].pitch || !views[j].height || view_end > UINT64_C(0x100000000))
                 continue;
-            if (begin >= view_begin && end <= view_end) {
-                if (matched != UINT32_MAX)
-                    return 0; /* aliases are not an authenticated view. */
+            if (begin < view_end && end > view_begin) {
+                if (begin < view_begin || end > view_end || matched != UINT32_MAX)
+                    return 0; /* Partial overlap also makes ownership ambiguous. */
                 matched = j;
             }
         }

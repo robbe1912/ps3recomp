@@ -7,7 +7,7 @@ OUT = ROOT / 'temp' / 'checks' / ('cpu-surface-snapshot-' + str(time.time_ns()))
 OUT.mkdir(parents=True)
 header = ROOT / 'libs/video/rsx_cpu_surface_snapshot.h'
 fixture = ROOT / 'libs/video/tests/rsx_cpu_surface_snapshot.c'
-compiler = os.environ.get('MV_CLANG') or shutil.which('clang-cl') or shutil.which('clang') or shutil.which('cc')
+compiler = os.environ.get('MV_CLANG') or shutil.which('clang-cl' if os.name == 'nt' else 'clang') or shutil.which('cc')
 assert compiler, 'Prepare the compiler environment first'
 msvc_style = Path(compiler).name.lower().startswith('clang-cl')
 report = {'qualification': __doc__, 'source_sha256': hashlib.sha256(header.read_bytes()).hexdigest(), 'commands': []}
@@ -27,12 +27,13 @@ def build_and_run(name, source, success):
 source = header.read_text()
 build_and_run('production', source, True)
 mutants = {
-    'alias-admission': source.replace('if (matched != UINT32_MAX)\n                    return 0;', 'if (matched != UINT32_MAX)\n                    break;'),
-    'edge-rejection': source.replace('end <= view_end', 'end < view_end'),
+    'alias-admission': source.replace('if (begin < view_begin || end > view_end || matched != UINT32_MAX)\n                    return 0;', 'if (begin < view_begin || end > view_end || matched != UINT32_MAX)\n                    break;'),
+    'partial-alias-admission': source.replace('begin < view_end && end > view_begin', 'begin >= view_begin && end <= view_end'),
+    'edge-rejection': source.replace('end > view_end || matched', 'end >= view_end || matched'),
     'view-overflow-admission': source.replace(' || view_end > UINT64_C(0x100000000)', ''),
     'mixed-view-admission': source.replace('if (i && matched != bindings[0].view_index)\n            return 0;', 'if (i && matched != bindings[0].view_index)\n            break;'),
 }
 for name, mutant in mutants.items():
     assert mutant != source
     build_and_run(name, mutant, False)
-print('PASS actual CPU-surface snapshot binding and four ownership mutants:', OUT)
+print('PASS actual CPU-surface snapshot binding and five ownership mutants:', OUT)

@@ -164,6 +164,13 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
     if(!ranges || !staging || !count || count>VM_READ_SNAPSHOT_MAX_RANGES ||
         !output_bytes || output_bytes>VM_READ_SNAPSHOT_MAX_BYTES)
         return VM_READ_SNAPSHOT_INVALID;
+    /* A consumed FIFO can still leave an open primitive or CPU draw records.
+     * Let the caller retain its reference path until normal rendering retires
+     * that work. Never stage a snapshot ahead of it. */
+    if (!s_d3d.current_rsx_state ||
+        s_d3d.current_rsx_state->in_begin_end ||
+        s_d3d.draw_count)
+        return VM_READ_SNAPSHOT_UNAVAILABLE;
     RsxCpuSurfaceSnapshotView views[CPU_SURFACE_CAPACITY];
     OffRT *targets[CPU_SURFACE_CAPACITY];
     unsigned view_count=0;

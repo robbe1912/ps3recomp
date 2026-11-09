@@ -23,6 +23,16 @@ int main(void) {
     assert(!rsx_cpu_surface_snapshot_bind(malformed_view_range, 1, overflowing_view, 1, bindings));
     const RsxCpuSurfaceSnapshotView aliases[] = {{0x1000, 8, 3}, {0x1000, 8, 3}};
     assert(!rsx_cpu_surface_snapshot_bind(neighbours, 1, aliases, 2, bindings));
+    const VmReadSnapshotRange spanning[] = {{0x1007, 2, 0}};
+    const RsxCpuSurfaceSnapshotView partial_aliases[][2] = {
+        {{0x1000, 8, 3}, {0x1008, 1, 1}},
+        {{0x1000, 8, 3}, {0x1006, 2, 1}},
+        {{0x1008, 1, 1}, {0x1000, 8, 3}},
+    };
+    for (unsigned i = 0; i < 3; ++i)
+        assert(!rsx_cpu_surface_snapshot_bind(spanning, 1, partial_aliases[i], 2, bindings));
+    const RsxCpuSurfaceSnapshotView adjacent[] = {{0x1007, 2, 1}, {0x1009, 1, 1}};
+    assert(rsx_cpu_surface_snapshot_bind(spanning, 1, adjacent, 2, bindings));
     const VmReadSnapshotRange gap[] = {{0x1800, 1, 0}};
     assert(!rsx_cpu_surface_snapshot_bind(gap, 1, views, 2, bindings));
     puts("PASS CPU-surface snapshot binding: pitch padding, ownership, aliases, bounds");
