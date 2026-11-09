@@ -40,6 +40,7 @@ static DWORD WaitForSingleObject(HANDLE h,DWORD deadline){
 }
 static void cpu_surface_fail(const char *operation,int result){fprintf(stderr,"FAIL: %s %d\n",operation,result);exit(2);}
 /* PRODUCTION_DECLARATIONS */
+static void cpu_surface_snapshot_trace(CpuSurfaceRequest *request){(void)request;cpu_surface_fail("unexpected snapshot trace in scalar fixture",E_FAIL);}
 /* PRODUCTION_HELPERS */
 static void cpu_surface_read(u32 address,u32 bytes){
     if(address!=0x20120 || bytes!=2)abort();
