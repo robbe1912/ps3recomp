@@ -273,6 +273,7 @@ static void cpu_surface_frame_complete(void) {
     if(s_cpu_surface_recording)cpu_surface_fail("CPU service before command submission",E_FAIL);
     cpu_surface_service(0);
 }
+static void submit_record_capacity(void* context, int present);
 static int cpu_surface_snapshot_boundary(void *opaque) {
     (void)opaque;
     if(s_cpu_surface_recording)cpu_surface_fail("CPU snapshot before command submission",E_FAIL);

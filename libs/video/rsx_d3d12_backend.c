@@ -3555,7 +3555,6 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
  * space; location bits differ but one title doesn't alias local vs main at
  * one offset), which sidesteps guessing the surface's context DMA location. */
 #define CPU_SURFACE_CAPACITY MAX_OFF_RTS
-static void submit_record_capacity(void* context, int present);
 #include "rsx_cpu_surface.inc"
 
 #include "rsx_surface_samples.h"
