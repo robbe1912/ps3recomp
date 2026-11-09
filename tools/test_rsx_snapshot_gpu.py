@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,8 +33,9 @@ report = dict(qualification=__doc__, adapter='warp' if args.warp else 'hardware'
                                     ROOT / 'libs/video/rsx_fifo_boundary.h',
                                     ROOT / 'libs/video/rsx_d3d12_fault.h']}, commands=[])
 
-def run(command):
-    result = subprocess.run(list(map(str, command)), capture_output=True, text=True, timeout=120)
+def run(command, profile=False):
+    env = dict(os.environ, RSX_CPU_SURFACE_PROFILE='1' if profile else '0')
+    result = subprocess.run(list(map(str, command)), env=env, capture_output=True, text=True, timeout=120)
     report['commands'].append(dict(command=list(map(str, command)), returncode=result.returncode,
                                    stdout=result.stdout, stderr=result.stderr))
     (OUT / 'result.json').write_text(json.dumps(report, indent=2))
@@ -60,9 +62,28 @@ def build(name, body):
 body = source.read_text()
 exe = build('production', body)
 adapter = 'warp' if args.warp else 'hardware'
+def verify_trace(stderr):
+    states = re.findall(r'^\[CPUSNAPSHOT_STATE\] seq=(\d+) .*$', stderr, re.M)
+    completed = re.findall(r'^\[CPUSNAPSHOT_RESULT\] seq=(\d+) .*$', stderr, re.M)
+    assert len(states) == 64 and sorted(states) == sorted(completed), (len(states), len(completed), OUT / 'result.json')
+    assert stderr.count('[CPUSNAPSHOT_CAP] limit=64') == 1
+    assert 'state=0 open=0 draws=0' in stderr
+    assert 'state=1 open=1 draws=0' in stderr
+    assert 'state=1 open=0 draws=1' in stderr
+    assert '[CPUSNAPSHOT_RANGE]' in stderr and '[CPUSNAPSHOT_VIEW]' in stderr
+    assert '[CPUSNAPSHOT_RANGE] seq=1 index=0 address=00001000 bytes=2 output=0' in stderr
+    assert '[CPUSNAPSHOT_VIEW] seq=1 slot=0 address=00001000 pitch=8 height=3 format=9 gpu=1 cpu=0' in stderr
+    assert '[CPUSNAPSHOT_VIEW] seq=2 slot=0 address=00001000 pitch=8 height=3 format=9 gpu=1 cpu=1' in stderr
+    for sequence in (3, 4, 5, 6):
+        assert f'[CPUSNAPSHOT_RESULT] seq={sequence} status=0 ' in stderr
+
 result = run([exe, adapter])
 assert result.returncode == 0, (result.stderr, OUT / 'result.json')
 assert 'zero validation messages' in result.stdout
+assert '[CPUSNAPSHOT_' not in result.stderr
+profiled = run([exe, adapter], profile=True)
+assert profiled.returncode == 0, (profiled.stderr, OUT / 'result.json')
+verify_trace(profiled.stderr)
 for mode, error in [(1, 'CPU snapshot before command submission'),
                     (2, '0x887A0005'), (3, 'unsupported guest surface layout')]:
     result = run([exe, adapter, str(mode)])
@@ -73,14 +94,28 @@ assert wrong_packing != packing
 (OUT / 'wrong-channel.h').write_text(wrong_packing)
 report['wrong_channel_header_sha256'] = hashlib.sha256((OUT / 'wrong-channel.h').read_bytes()).hexdigest()
 mutants = {
+    'missing-trace': body.replace('            cpu_surface_snapshot_trace(request);', '', 1),
+    'wrong-view-pitch': body.replace('target->cpu_address,target->cpu_pitch,target->h,target->cpu_format,', 'target->cpu_address,target->cpu_pitch+1,target->h,target->cpu_format,', 1),
+    'repeated-cap': body.replace('sequence>64)return;', 'sequence==UINT32_MAX)return;', 1),
     'skip-dirty-copy': body.replace('    unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);', '    return;\n    unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);'),
     'stale-clean-generation': body.replace('r->cpu_generation=r->gpu_generation;', 'r->cpu_generation=0;'),
     'wrong-byte-channel': body.replace('#include "rsx_surface_readback.h"', '#include "wrong-channel.h"'),
 }
 for name, mutated in mutants.items():
     assert mutated != body, name
-    result = run([build(name, mutated), adapter])
-    assert result.returncode != 0 and 'CHECK ' in result.stderr, ('Mutant accepted', name, OUT / 'result.json')
+    is_trace = name in ('missing-trace', 'wrong-view-pitch', 'repeated-cap')
+    result = run([build(name, mutated), adapter], profile=is_trace)
+    if is_trace:
+        assert result.returncode == 0, (name, result.stderr)
+        try:
+            verify_trace(result.stderr)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(('Trace mutant accepted', name, OUT / 'result.json'))
+    else:
+        assert result.returncode != 0 and 'CHECK ' in result.stderr, ('Mutant accepted', name, OUT / 'result.json')
+report['rejected_mutants'] = list(mutants)
 report['passed'] = True
 (OUT / 'result.json').write_text(json.dumps(report, indent=2))
-print('PASS actual D3D12 snapshot producer, visible errors and three source mutants;', OUT)
+print('PASS actual D3D12 snapshot producer, visible errors, bounded trace and six source mutants;', OUT)

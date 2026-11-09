@@ -11,6 +11,7 @@ typedef struct CpuSurfaceRequest {
     void *snapshot_staging;
     u32 snapshot_count, snapshot_output_bytes;
     int snapshot_result;
+    u32 snapshot_trace_sequence;
     u32 client_thread;
     HANDLE done;
     int status;
@@ -55,6 +56,11 @@ static void cpu_surface_profile_emit(CpuSurfaceRequest *request) {
         (unsigned long long)(p->finished-p->started-stages),(unsigned long long)p->matched,
         (unsigned long long)p->hits,(unsigned long long)p->copies,
         (unsigned long long)p->host_bytes,(unsigned long long)p->guest_bytes);
+    if(request->snapshot_trace_sequence)
+        fprintf(stderr,"[CPUSNAPSHOT_RESULT] seq=%u status=%d client=%u renderer=%lu queued_at=%llu started_at=%llu finished_at=%llu\n",
+            request->snapshot_trace_sequence,request->snapshot_result,request->client_thread,
+            (unsigned long)s_cpu_surface_thread,(unsigned long long)p->queued,
+            (unsigned long long)p->started,(unsigned long long)p->finished);
 }
 static void cpu_surface_fence_wait(void) {
     if(s_cpu_surface_fence_value==UINT64_MAX)cpu_surface_fail("GPU fence counter overflow",E_FAIL);
@@ -154,6 +160,35 @@ static void cpu_surface_read(u32 address,u32 bytes) {
         }
     }
 }
+/* Only the checked renderer owner calls this bounded, opt-in observation.
+ * All extents and state belong to the admission boundary being observed. */
+static void cpu_surface_snapshot_trace(CpuSurfaceRequest *request) {
+    static unsigned sequence;
+    if(!s_cpu_surface_profile || sequence>64)return;
+    unsigned current=++sequence;
+    if(current>64) {
+        fputs("[CPUSNAPSHOT_CAP] limit=64\n",stderr);
+        return;
+    }
+    request->snapshot_trace_sequence=current;
+    fprintf(stderr,"[CPUSNAPSHOT_STATE] seq=%u client=%u renderer=%lu state=%u open=%u draws=%u recording=%u ranges=%u\n",
+        current,request->client_thread,(unsigned long)GetCurrentThreadId(),
+        s_d3d.current_rsx_state!=NULL,
+        s_d3d.current_rsx_state?s_d3d.current_rsx_state->in_begin_end:0,
+        s_d3d.draw_count,s_cpu_surface_recording,request->snapshot_count);
+    for(u32 i=0;i<request->snapshot_count;i++) {
+        const VmReadSnapshotRange *range=&request->snapshot_ranges[i];
+        fprintf(stderr,"[CPUSNAPSHOT_RANGE] seq=%u index=%u address=%08X bytes=%u output=%u\n",
+            current,i,range->address,range->bytes,range->output_offset);
+    }
+    for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
+        const OffRT *target=&s_d3d.off_rt[i];
+        if(!target->res || !target->cpu_address || !target->cpu_pitch || !target->h)continue;
+        fprintf(stderr,"[CPUSNAPSHOT_VIEW] seq=%u slot=%d address=%08X pitch=%u height=%u format=%u gpu=%llu cpu=%llu\n",
+            current,i,target->cpu_address,target->cpu_pitch,target->h,target->cpu_format,
+            (unsigned long long)target->gpu_generation,(unsigned long long)target->cpu_generation);
+    }
+}
 /* This runs only on the renderer owner.  A view is admitted only when every
  * requested byte is uniquely owned by a live pitch-backed allocation.  The
  * matching CPU copies establish texture visibility before staging from VM; no
@@ -216,10 +251,11 @@ static void cpu_surface_service(int snapshot_boundary) {
         CpuSurfaceRequest *next=request->next;
         request->profile.started=cpu_surface_tick();
         s_cpu_surface_profile_active=s_cpu_surface_profile?&request->profile:NULL;
-        if(request->snapshot_ranges)
+        if(request->snapshot_ranges) {
+            cpu_surface_snapshot_trace(request);
             request->snapshot_result=cpu_surface_snapshot(request->snapshot_ranges,request->snapshot_count,
                 request->snapshot_staging,request->snapshot_output_bytes);
-        else cpu_surface_read(request->address,request->bytes);
+        } else cpu_surface_read(request->address,request->bytes);
         request->status=0;
         s_cpu_surface_profile_active=NULL;
         request->profile.finished=cpu_surface_tick();
