@@ -276,6 +276,11 @@ static void cpu_surface_frame_complete(void) {
 static int cpu_surface_snapshot_boundary(void *opaque) {
     (void)opaque;
     if(s_cpu_surface_recording)cpu_surface_fail("CPU snapshot before command submission",E_FAIL);
+    /* Completed records use normal nonpresenting capacity submission after
+     * primitive closure. */
+    if(s_d3d.current_rsx_state &&
+        !s_d3d.current_rsx_state->in_begin_end && s_d3d.draw_count)
+        submit_record_capacity(NULL, 0);
     cpu_surface_service(1);return 1;
 }
 static int cpu_surface_snapshot_pending(void) {
@@ -324,6 +329,7 @@ static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 co
     CpuSurfaceRequest request={0};request.address=ranges&&count?ranges[0].address:0;request.bytes=output_bytes;
     request.snapshot_ranges=ranges;request.snapshot_count=count;request.snapshot_staging=staging;
     request.snapshot_output_bytes=output_bytes;request.snapshot_result=VM_READ_SNAPSHOT_FAILED;
+    request.client_thread=GetCurrentThreadId();
     request.status=-1;request.queued_ms=GetTickCount64();request.profile.queued=cpu_surface_tick();
     request.done=CreateEventA(NULL,FALSE,FALSE,NULL);if(!request.done)cpu_surface_fail("CPU snapshot event creation",E_FAIL);
     AcquireSRWLockExclusive(&s_cpu_surface_lock);

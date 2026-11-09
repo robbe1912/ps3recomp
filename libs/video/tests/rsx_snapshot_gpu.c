@@ -40,6 +40,9 @@ static struct {
     OffRT off_rt[CPU_SURFACE_CAPACITY];
     const rsx_state *current_rsx_state;
     u32 draw_count;
+    ID3D12Fence *fence;
+    u64 fence_values[2];
+    u32 frame_index;
 } s_d3d;
 static uint8_t memory[0x10000];
 uint8_t *vm_base = memory;
@@ -48,7 +51,15 @@ static void (*operation)(void);
 void *cellGcm_fifo_kick_event(void) { return kick; }
 u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
 #include "rsx_d3d12_fault.h"
+static int s_present_this_frame = 1;
+static u64 s_record_capacity_drains;
+static unsigned submitted_batches;
+static int vp_upload_retire(void *context);
+static int wait_for_gpu(void);
+static void render_frame(void);
+static void submit_record_capacity(void *context, int present);
 // PRODUCTION_SURFACE
+// PRODUCTION_SUBMIT_RECORDS
 
 static ID3D12CommandAllocator *producer_alloc;
 static ID3D12GraphicsCommandList *producer_list;
@@ -56,6 +67,7 @@ static ID3D12Resource *upload;
 static ID3D12Fence *gate;
 static u32 width = 4, height = 3, pitch = 8, pattern = 1;
 static int change_kind, failure_kind;
+static int pending_production;
 static struct { u64 gpu, cpu, fence; } observed;
 static uint8_t blue(u32 x, u32 y) { return (uint8_t)(pattern * 17 + x * 3 + y * 29); }
 
@@ -115,6 +127,32 @@ static void probe(void) {
     observed.cpu = s_d3d.off_rt[0].cpu_generation;
     observed.fence = s_cpu_surface_fence_value;
 }
+static int wait_for_gpu(void) {
+    cpu_surface_fence_wait();
+    s_d3d.fence = s_cpu_surface_fence;
+    s_d3d.fence_values[s_d3d.frame_index] = s_cpu_surface_fence_value;
+    return 1;
+}
+static int vp_upload_retire(void *context) {
+    (void)context;
+    cpu_surface_fence_wait();
+    return 1;
+}
+static void render_frame(void) {
+    CHECK(!s_present_this_frame && !state.in_begin_end && s_d3d.draw_count == 1 && pending_production);
+    produce();
+    ++submitted_batches;
+    pending_production = 0;
+    s_d3d.draw_count = 0;
+    cpu_surface_frame_complete();
+}
+static void queue_production(void) {
+    CHECK(!s_d3d.draw_count && !pending_production && !upload);
+    pending_production = 1;
+    s_d3d.draw_count = 1;
+    state.in_begin_end = 1;
+}
+static void close_primitive(void) { state.in_begin_end = 0; }
 static void change(void) {
     OffRT *r = &s_d3d.off_rt[0];
     switch (change_kind) {
@@ -240,7 +278,7 @@ int main(int argc, char **argv) {
     invoke(direct_rejection);
     pattern = 2; invoke(produce);
     const VmReadSnapshotRange range = {0x1000, 2, 0};
-    const int rejected_states[] = {1, 2, 3, 8};
+    const int rejected_states[] = {1, 3, 8};
     for (unsigned i = 0; i < sizeof(rejected_states) / sizeof(rejected_states[0]); ++i) {
         int kind = rejected_states[i];
         change_kind = kind; invoke(change); rejected(&range, 1);
@@ -255,6 +293,11 @@ int main(int argc, char **argv) {
     const VmReadSnapshotRange outside = {0x1000 + pitch * height, 1, 0}; rejected(&outside, 1);
     uint8_t retained[2]; CHECK(vm_read_snapshot(&range, 1, retained, 2) == VM_READ_SNAPSHOT_OK);
     uint8_t retained_first = blue(0, 0), retained_second = blue(1, 0);
+    invoke(release_upload); pattern = 5; invoke(queue_production);
+    rejected(&range, 1);
+    CHECK(!submitted_batches && pending_production && s_d3d.draw_count == 1);
+    invoke(close_primitive); query(); invoke(probe);
+    CHECK(submitted_batches == 1 && !pending_production && !s_d3d.draw_count && s_present_this_frame == 1);
     u64 concurrent_fence = observed.fence;
     HANDLE readers[4];
     for (int i = 0; i < 4; ++i) { readers[i] = CreateThread(NULL, 0, reader, NULL, 0, NULL); CHECK(readers[i]); }
