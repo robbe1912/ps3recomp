@@ -44,8 +44,8 @@ static struct {
     u64 fence_values[2];
     u32 frame_index;
 } s_d3d;
-static uint8_t memory[0x10000];
-uint8_t *vm_base = memory;
+static uint8_t *memory;
+uint8_t *vm_base;
 static HANDLE kick, control, controlled, ready, stopping, paused, resume;
 static void (*operation)(void);
 void *cellGcm_fifo_kick_event(void) { return kick; }
@@ -65,7 +65,7 @@ static ID3D12CommandAllocator *producer_alloc;
 static ID3D12GraphicsCommandList *producer_list;
 static ID3D12Resource *upload;
 static ID3D12Fence *gate;
-static u32 width = 4, height = 3, pitch = 8, pattern = 1;
+static u32 width = 4, height = 3, pitch = 8, pattern = 1, target_address = 0x1000;
 static int change_kind, failure_kind;
 static int pending_production;
 static struct { u64 gpu, cpu, fence; } observed;
@@ -87,7 +87,7 @@ static void make_target(void) {
     HR(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &heap, D3D12_HEAP_FLAG_NONE,
         &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&r->res));
     r->w = width; r->h = height; r->dxgi = desc.Format; r->st = D3D12_RESOURCE_STATE_COPY_DEST;
-    D3D12DrawRecord draw = {0}; draw.cpu_address[0] = 0x1000; draw.cpu_pitch[0] = pitch; draw.rt_fmt = 9;
+    D3D12DrawRecord draw = {0}; draw.cpu_address[0] = target_address; draw.cpu_pitch[0] = pitch; draw.rt_fmt = 9;
     cpu_surface_bind(0, &draw, 0);
 }
 static void produce(void) {
@@ -121,6 +121,27 @@ static void produce(void) {
     ID3D12CommandList *lists[] = {(ID3D12CommandList *)producer_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
     const int secondary[3] = {-1, -1, -1}; cpu_surface_written(0, secondary);
+}
+static void produce_second_view(void) {
+    OffRT first = s_d3d.off_rt[0];
+    u32 first_pattern = pattern;
+    memset(&s_d3d.off_rt[0], 0, sizeof(OffRT));
+    target_address = 0x3000;
+    make_target();
+    pattern = 7;
+    produce();
+    cpu_surface_fence_wait();
+    release_upload();
+    s_d3d.off_rt[2] = s_d3d.off_rt[0];
+    s_d3d.off_rt[0] = first;
+    pattern = first_pattern;
+    target_address = 0x1000;
+}
+static void retire_second_view(void) {
+    OffRT *target = &s_d3d.off_rt[2];
+    cpu_surface_retire(target);
+    target->res->lpVtbl->Release(target->res);
+    memset(target, 0, sizeof(*target));
 }
 static void probe(void) {
     observed.gpu = s_d3d.off_rt[0].gpu_generation;
@@ -225,7 +246,7 @@ static void query(void) {
 }
 static DWORD WINAPI reader(void *unused) { (void)unused; for (int i = 0; i < 32; ++i) query(); return 0; }
 static DWORD WINAPI retired_reader(void *unused) {
-    (void)unused; const VmReadSnapshotRange range = {0x1000, 2, 0}; rejected(&range, 1); return 0;
+    (void)unused; query(); return 0;
 }
 static DWORD WINAPI release_gate(void *unused) {
     (void)unused; Sleep(100); return FAILED(gate->lpVtbl->Signal(gate, 1));
@@ -236,7 +257,9 @@ int main(int argc, char **argv) {
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     CHECK(argc >= 2); int warp = !strcmp(argv[1], "warp");
     if (argc > 2) failure_kind = atoi(argv[2]);
-    memset(memory, 0xcc, sizeof(memory));
+    memory = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(memory); vm_base = memory;
+    memset(memory, 0xcc, 0x10000);
     ID3D12Debug *debug = NULL;
     HR(D3D12GetDebugInterface(&IID_ID3D12Debug, (void **)&debug));
     debug->lpVtbl->EnableDebugLayer(debug); debug->lpVtbl->Release(debug);
@@ -290,7 +313,25 @@ int main(int argc, char **argv) {
     const VmReadSnapshotRange padding = {0x1000 + width - 1, 2, 0}; uint8_t padded[2] = {0};
     CHECK(vm_read_snapshot(&padding, 1, padded, 2) == VM_READ_SNAPSHOT_OK);
     CHECK(padded[0] == blue(width - 1, 0) && padded[1] == 0xcc);
-    const VmReadSnapshotRange outside = {0x1000 + pitch * height, 1, 0}; rejected(&outside, 1);
+    const VmReadSnapshotRange outside = {0x1000 + pitch * height, 1, 0};
+    uint8_t cpu_only = 0;
+    CHECK(vm_read_snapshot(&outside, 1, &cpu_only, 1) == VM_READ_SNAPSHOT_OK);
+    CHECK(cpu_only == 0xcc);
+    memory[0xffe] = 0x21; memory[0xfff] = 0x7e;
+    const VmReadSnapshotRange mixed[] = {{0xffe, 2, 0}, {0x1000, 2, 2}};
+    uint8_t mixed_output[4] = {0};
+    CHECK(vm_read_snapshot(mixed, 2, mixed_output, 4) == VM_READ_SNAPSHOT_OK);
+    CHECK(mixed_output[0] == 0x21 && mixed_output[1] == 0x7e &&
+          mixed_output[2] == blue(0, 0) && mixed_output[3] == blue(1, 0));
+    const VmReadSnapshotRange crossing = {0xfff, 2, 0};
+    rejected(&crossing, 1);
+    DWORD old_protection = 0;
+    CHECK(VirtualProtect(memory + 0xf000, 0x1000, PAGE_NOACCESS, &old_protection));
+    const VmReadSnapshotRange inaccessible[] = {{0x1000, 1, 0}, {0xf000, 1, 1}};
+    rejected(inaccessible, 2);
+    const VmReadSnapshotRange partial_read = {0xefff, 2, 0};
+    rejected(&partial_read, 1);
+    CHECK(VirtualProtect(memory + 0xf000, 0x1000, old_protection, &old_protection));
     uint8_t retained[2]; CHECK(vm_read_snapshot(&range, 1, retained, 2) == VM_READ_SNAPSHOT_OK);
     uint8_t retained_first = blue(0, 0), retained_second = blue(1, 0);
     invoke(release_upload); pattern = 5; invoke(queue_production);
@@ -304,7 +345,14 @@ int main(int argc, char **argv) {
     CHECK(WaitForMultipleObjects(4, readers, TRUE, 10000) == WAIT_OBJECT_0);
     for (int i = 0; i < 4; ++i) { CHECK(GetExitCodeThread(readers[i], &exit_code) && !exit_code); CloseHandle(readers[i]); }
     invoke(probe); CHECK(observed.fence == concurrent_fence);
-    invoke(release_upload); pattern = 4; invoke(produce);
+    invoke(release_upload);
+    invoke(produce_second_view);
+    const VmReadSnapshotRange independent[] = {{0x1000, 1, 0}, {0x3000, 1, 1}};
+    uint8_t independent_output[2] = {0};
+    CHECK(vm_read_snapshot(independent, 2, independent_output, 2) == VM_READ_SNAPSHOT_OK);
+    CHECK(independent_output[0] == blue(0, 0) && independent_output[1] == 7 * 17);
+    invoke(retire_second_view);
+    pattern = 4; invoke(produce);
     operation = retire_pending; CHECK(SetEvent(control));
     CHECK(WaitForSingleObject(paused, 10000) == WAIT_OBJECT_0);
     for (int i = 0; i < 4; ++i) {
@@ -322,7 +370,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; ++i) {
         CHECK(GetExitCodeThread(readers[i], &exit_code) && !exit_code); CloseHandle(readers[i]);
     }
-    rejected(&range, 1); CHECK(memory[0x1000] == blue(0, 0));
+    query(); CHECK(memory[0x1000] == blue(0, 0));
     CHECK(retained[0] == retained_first && retained[1] == retained_second);
     width = 8; height = 5; pitch = 12; pattern = 3;
     invoke(make_target); invoke(produce); query(); change_kind = 5; invoke(change);
@@ -344,6 +392,7 @@ int main(int argc, char **argv) {
     CloseHandle(paused); CloseHandle(resume);
     gate->lpVtbl->Release(gate); s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
     adapter->lpVtbl->Release(adapter); factory->lpVtbl->Release(factory); s_d3d.device->lpVtbl->Release(s_d3d.device);
+    CHECK(VirtualFree(memory, 0, MEM_RELEASE));
     puts("PASS actual snapshot GPU producer: dirty/clean, blocked queue, padding, alias, retirement, resize, 128 concurrent reads, zero validation messages");
     return 0;
 }

@@ -85,7 +85,7 @@ def verify_trace(stderr):
     assert '[CPUSNAPSHOT_RANGE] seq=1 index=0 address=00001000 bytes=2 output=0' in stderr
     assert '[CPUSNAPSHOT_VIEW] seq=1 slot=0 address=00001000 pitch=8 height=3 format=9 gpu=1 cpu=0' in stderr
     assert '[CPUSNAPSHOT_VIEW] seq=2 slot=0 address=00001000 pitch=8 height=3 format=9 gpu=1 cpu=1' in stderr
-    for sequence in (3, 4, 5, 8):
+    for sequence in (3, 4, 5):
         assert f'[CPUSNAPSHOT_RESULT] seq={sequence} status=0 ' in stderr
 
 result = run([exe, adapter])
@@ -105,6 +105,15 @@ assert wrong_packing != packing
 (OUT / 'wrong-channel.h').write_text(wrong_packing)
 report['wrong_channel_header_sha256'] = hashlib.sha256((OUT / 'wrong-channel.h').read_bytes()).hexdigest()
 mutants = {
+    'skip-retirement-flush': body.replace(
+        'static void cpu_surface_retire(OffRT *r) {\n    cpu_surface_copy(r);',
+        'static void cpu_surface_retire(OffRT *r) {\n    /* omitted flush */', 1),
+    'unreadable-commit': body.replace(
+        'copied!=ranges[i].bytes)\n            return VM_READ_SNAPSHOT_UNAVAILABLE;',
+        'copied!=ranges[i].bytes)\n            return VM_READ_SNAPSHOT_OK;', 1),
+    'one-view-only': body.replace(
+        'rsx_cpu_surface_snapshot_bind(&ranges[i],1,',
+        'rsx_cpu_surface_snapshot_bind(ranges,count,', 1),
     'missing-requester-identity': body.replace('    request.client_thread=GetCurrentThreadId();', '    request.client_thread=0;', 1),
     'missing-record-submission': body.replace('        submit_record_capacity(NULL, 0);', '        ; /* omitted submission */', 1),
     'open-primitive-submission': body.replace('!s_d3d.current_rsx_state->in_begin_end && s_d3d.draw_count', 's_d3d.draw_count', 1),
@@ -136,4 +145,4 @@ assert result.returncode != 0 and 'CHECK ' in result.stderr, ('Presenting submis
 report['rejected_mutants'] = [*mutants, 'presenting-submission']
 report['passed'] = True
 (OUT / 'result.json').write_text(json.dumps(report, indent=2))
-print('PASS actual D3D12 snapshot producer, nonpresenting record submission, visible errors, bounded trace and ten source mutants;', OUT)
+print('PASS actual D3D12 snapshot producer, nonpresenting record submission, visible errors, bounded trace and thirteen source mutants;', OUT)

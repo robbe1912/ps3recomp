@@ -189,10 +189,9 @@ static void cpu_surface_snapshot_trace(CpuSurfaceRequest *request) {
             (unsigned long long)target->gpu_generation,(unsigned long long)target->cpu_generation);
     }
 }
-/* This runs only on the renderer owner.  A view is admitted only when every
- * requested byte is uniquely owned by a live pitch-backed allocation.  The
- * matching CPU copies establish texture visibility before staging from VM; no
- * unsynchronized VM load is used as a substitute for a missing surface. */
+/* The renderer owner synchronizes unique live GPU views before staging the
+ * complete batch. CPU ranges include memory flushed by normal target retirement.
+ * The caller keeps source allocations alive throughout the request. */
 static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
     void *staging,u32 output_bytes) {
     extern uint8_t *vm_base;
@@ -216,21 +215,43 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
         targets[view_count++]=r;
     }
     RsxCpuSurfaceSnapshotBinding bindings[VM_READ_SNAPSHOT_MAX_RANGES];
-    if(!rsx_cpu_surface_snapshot_bind(ranges,count,views,view_count,bindings))
-        return VM_READ_SNAPSHOT_UNAVAILABLE;
     for(u32 i=0;i<count;i++) {
+        const uint64_t begin=ranges[i].address;
+        const uint64_t end=begin+ranges[i].bytes;
+        if(!ranges[i].bytes || end>UINT64_C(0x100000000) ||
+            (uint64_t)ranges[i].output_offset+ranges[i].bytes>output_bytes)
+            return VM_READ_SNAPSHOT_INVALID;
+        int intersects=0;
+        for(unsigned j=0;j<view_count;j++) {
+            const uint64_t view_end=(uint64_t)views[j].address+
+                (uint64_t)views[j].pitch*views[j].height;
+            if(begin<view_end && end>views[j].address)intersects=1;
+        }
+        bindings[i].view_index=UINT32_MAX;
+        if(intersects && !rsx_cpu_surface_snapshot_bind(&ranges[i],1,
+            views,view_count,&bindings[i]))
+            return VM_READ_SNAPSHOT_UNAVAILABLE;
+    }
+    for(u32 i=0;i<count;i++) {
+        if(bindings[i].view_index==UINT32_MAX)continue;
         OffRT *r=targets[bindings[i].view_index];
         if(s_cpu_surface_recording && r->gpu_generation && r->cpu_generation!=r->gpu_generation)
             cpu_surface_fail("CPU snapshot requires pending recorded surface writes",E_FAIL);
     }
     for(u32 i=0;i<count;i++) {
+        if(bindings[i].view_index==UINT32_MAX)continue;
         int seen=0;for(u32 j=0;j<i;j++)if(bindings[j].view_index==bindings[i].view_index){seen=1;break;}
         if(seen)continue;
         if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->matched++;
         cpu_surface_copy(targets[bindings[i].view_index]);
     }
-    for(u32 i=0;i<count;i++)
-        memcpy((uint8_t *)staging+ranges[i].output_offset,vm_base+ranges[i].address,ranges[i].bytes);
+    for(u32 i=0;i<count;i++) {
+        SIZE_T copied=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),vm_base+ranges[i].address,
+            (uint8_t *)staging+ranges[i].output_offset,ranges[i].bytes,&copied) ||
+            copied!=ranges[i].bytes)
+            return VM_READ_SNAPSHOT_UNAVAILABLE;
+    }
     return VM_READ_SNAPSHOT_OK;
 }
 static void cpu_surface_service(int snapshot_boundary) {

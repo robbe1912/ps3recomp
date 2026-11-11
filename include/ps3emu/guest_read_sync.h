@@ -19,7 +19,8 @@ void vm_read_sync_dispatch(uint32_t address, uint32_t bytes);
  * this API never substitutes an unsynchronized guest-memory read.
  *
  * Installation/removal requires quiescent callers, as does handler lifetime.
- * Callers own the range descriptors and destination throughout the call.
+ * Callers keep guest source allocations alive and own the range descriptors
+ * and destination throughout the call.
  * Destination writes are transactional, including provider rejection/failure.
  */
 #define VM_READ_SNAPSHOT_MAX_RANGES 16u
