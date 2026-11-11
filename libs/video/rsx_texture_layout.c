@@ -25,6 +25,17 @@ u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h)
     return off;
 }
 
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d)
+{
+    u32 off = 0, shift = 0;
+    while (log2w || log2h || log2d) {
+        if (log2w) { off |= (x & 1u) << shift++; x >>= 1; log2w--; }
+        if (log2h) { off |= (y & 1u) << shift++; y >>= 1; log2h--; }
+        if (log2d) { off |= (z & 1u) << shift++; z >>= 1; log2d--; }
+    }
+    return off;
+}
+
 void rsx_texture_layout(u32 rsx_fmt, u32 w, u32 h, rsx_tex_layout* out)
 {
     rsx_texture_layout_pitched(rsx_fmt, w, h, 0, out);
@@ -303,6 +314,32 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
     }
 }
 
+int rsx_texture_decode_volume(void* dst, u32 dst_pitch, u32 dst_slice_pitch,
+                              const u8* src, u32 w, u32 h, u32 d,
+                              const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    if (!dst || !src || !tl || !w || !h || !d || tl->compressed) return -1;
+    /* A Morton volume interleaves whole power-of-two axes; an NPOT depth would
+     * leave gaps that read past the w*h*d source span. */
+    if (tl->swizzled && (d & (d - 1u))) return -1;
+    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h), l2d = rsx_log2_ceil(d);
+    const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
+    const size_t slice = (size_t)h * tl->row_bytes;
+    for (u32 z = 0; z < d; z++) {
+        u8* dslice = (u8*)dst + (size_t)z * dst_slice_pitch;
+        for (u32 y = 0; y < h; y++) {
+            u8* drow = dslice + (size_t)y * dst_pitch;
+            for (u32 x = 0; x < w; x++) {
+                const u8* s = tl->swizzled
+                    ? src + (size_t)rsx_swizzle_offset_3d(x, y, z, l2w, l2h, l2d) * sbpp
+                    : src + (size_t)z * slice + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
+                decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+            }
+        }
+    }
+    return 0;
+}
+
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
 {
     if (!out) return;
@@ -310,20 +347,10 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
     /* Source codes index the presented vector {A,R,G,B}. The uploaded resource
      * holds R,G,B,A at components 0..3, so A is component 3 and R,G,B are
      * 0,1,2 -- that is what lanes_argb says. G8B8 only has two real channels,
-     * and the sampler presents them as {G,R,G,R}. B8 decodes to a one-channel
-     * resource whose byte is presented as R, G and B with an opaque A, which
-     * is what the D3D12 live engine's CPU decode builds (decode_texel); read
-     * through lanes_argb its B source would be component 2, always zero. */
+     * and the sampler presents them as {G,R,G,R}. */
     static const u8 lanes_argb[4] = {3, 0, 1, 2};
     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    static const u8 lanes_b8[4]   = {RSX_REMAP_ONE, 0, 0, 0};
-    /* XY16F presents {R,G,R,G} in ARGB crossbar order, independently of
-     * the ordinary four-channel ARGB resource mapping. */
-    static const u8 lanes_xy16f[4] = {0, 1, 0, 1};
-    const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
-                      : (base == 0x81u) ? lanes_b8
-                      : (base == 0x9Fu) ? lanes_xy16f : lanes_argb;
+    const u8* src2res = ((rsx_fmt & 0x9Fu) == 0x8Bu) ? lanes_g8b8 : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 
@@ -335,27 +362,4 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
                : (op == 1) ? (u8)RSX_REMAP_ONE
                            : src2res[s];
     }
-}
-
-/* ADDRESS gamma flags name final RGBA lanes, after remapping. Signed input
- * interpretation wins; its FILTER ARGB flags follow the source crossbar. */
-u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address)
-{
-    switch (format & 0x9Fu) {
-    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
-    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
-    case 0x97: case 0x9D: case 0x9E: break;
-    default: return 0;
-    }
-    u8 gamma = (u8)((address >> 20) & 15u);
-    if (!gamma) return 0;
-    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
-    u8 remap[4]; rsx_texture_component_remap(control1, format, remap);
-    static const u8 rgba_lane[4] = {3, 0, 1, 2};
-    for (u32 i = 0; i < 4; ++i) {
-        const u32 source = (control1 >> (2u * i)) & 3u;
-        if (remap[i] < RSX_REMAP_ZERO && ((filter >> (28u + source)) & 1u))
-            gamma &= (u8)~(1u << rgba_lane[i]);
-    }
-    return gamma;
 }

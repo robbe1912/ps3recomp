@@ -77,10 +77,12 @@ static HRESULT rsx_d3d12_depth_prepare(rsx_d3d12_depth_cache* cache,
     description.Height = height;
     description.DepthOrArraySize = 1;
     description.MipLevels = 1;
-    description.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    /* Typeless so the attachment can also be read as R24_UNORM_X8 (native
+     * depth textures); the DSV and clear value name the typed format. */
+    description.Format = DXGI_FORMAT_R24G8_TYPELESS;
     description.SampleDesc.Count = 1;
     description.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    clear.Format = description.Format;
+    clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     clear.DepthStencil.Depth = 1.0f;
     result = device->lpVtbl->CreateCommittedResource(device, &properties,
         D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -90,7 +92,7 @@ static HRESULT rsx_d3d12_depth_prepare(rsx_d3d12_depth_cache* cache,
             offset, width, height, cache->count, *out_slot, (unsigned)result);
         return result;
     }
-    view.Format = description.Format;
+    view.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     handle = rsx_d3d12_depth_handle(heap, step, *out_slot);
     device->lpVtbl->CreateDepthStencilView(device, resource, &view, handle);

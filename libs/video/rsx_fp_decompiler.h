@@ -13,6 +13,7 @@
 #define PS3RECOMP_RSX_FP_DECOMPILER_H
 
 #include "ps3emu/ps3types.h"
+#include "rsx_depth_sample.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,11 +21,6 @@ extern "C" {
 
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
-
-/* Source capacity for native backends decoding up to 4096 bytecode bytes.
- * Predicated instructions can expand beyond 32 KiB of HLSL. This is a caller
- * allocation size, not a limit imposed by the decompiler API. */
-#define RSX_FP_HLSL_BUFFER_SIZE (256u * 1024u)
 
 /* Runtime payload for a structurally decompiled fragment program. Values are
  * retained as host-order IEEE-754 bit patterns so signed zero, infinities,
@@ -105,6 +101,9 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  *                   and a.xy sampling. Pass 0 for the legacy all-2D behavior
  *                   (rsx_fp_decompile forwards 0, so its output is unchanged
  *                   byte-for-byte).
+ *                   Bit 16+N set => unit N is a 3D volume: declared
+ *                   `Texture3D` and sampled with a.xyz (TXP divides all
+ *                   three by w). A unit may not be both cube and 3D.
  *
  * The mask must match what the backend actually binds: a cube unit needs a
  * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
@@ -119,28 +118,21 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
  * count and may be NULL. */
 int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    char* out, u32 out_size, u32* out_constant_count);
+    char* out, u32 out_size, u32* out_constant_count,
+    rsx_fp_constant_block* out_constants);
 
-/* Native depth texture comparison metadata. Disabled descriptors preserve the
- * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
- * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6
- * compare the source reference against stored depth. R32 color snapshots are
- * sampled explicitly, so no native depth texture/SampleCmp binding is needed.
- * Supported: decoded D24_D8/D16, 2D TEX/TXP, one level, matching nearest or
- * linear min/mag filters. Float-depth formats, cubes/3D, multiple levels and
- * other texture opcodes reject translation when comparison is active.
- * The shared engine and legacy Metal supply this state; other legacy backend
- * paths retain their existing behavior until they adopt the metadata API. */
-typedef struct rsx_fp_shadow_desc {
-    u8 enabled, func, linear, unnormalized;
-} rsx_fp_shadow_desc;
-void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
-    u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
+/* Texture units the program reads (TEX/TXP/TXB/TXL/TXD and the BEM forms). */
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
-int rsx_fp_decompile_buffered_shadow_ex(
+
+/* Buffered variant with native D24 depth units (rsx_depth_sample.h). Units
+ * with native_depth[u].enabled are declared individually and read through
+ * generated _rsx_depthN helpers: SampleCmpLevelZero with a comparison sampler
+ * at s<u> when the view compares, else the depth value. Returns -1 when a
+ * native unit is also a cube or is read with TXB/TXL. */
+int rsx_fp_decompile_buffered_native_depth(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    const rsx_fp_shadow_desc shadow[16],
-    char* out, u32 out_size, u32* out_constant_count);
+    const rsx_depth_sample_view native_depth[16], char* out, u32 out_size,
+    u32* out_constant_count, rsx_fp_constant_block* out_constants);
 
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */
@@ -177,31 +169,6 @@ int rsx_fp_constant_ring_plan(
  * draw would leave a multi-buffered display surface on an older generation. */
 int rsx_vertex_constant_ring_plan(
     u32 used, u32 capacity, u32 block_bytes, u32* out_offset);
-
-/* Integer framebuffer sRGB conversion (NV4097_SET_SHADER_PACKER / 0x1FEC).
- * Pass the decoded surface color format. Any nonzero packer enables it for
- * half exports; floating surfaces and 32-bit exports bypass conversion. */
-int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format);
-
-/* Apply RGB-only linear-to-sRGB conversion to all emitted color targets,
- * before output quantization. Alpha and optional depth exports are preserved.
- * Returns 1, or -1 without mutation for malformed source/insufficient space.
- * Apply before alpha-test wrapping; disabled draws should skip this helper. */
-int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
-
-/* Gamma metadata is a post-filter/post-remap RGBA lane mask, with formats
- * validated by rsx_texture_gamma_mask. EXP_TEX overrides gamma per fetch.
- * Old entry points pass NULL and preserve their source byte for byte. */
-u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
-                                const u8 gamma_masks[16]);
-int rsx_fp_decompile_buffered_color_ex(
-    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count);
-/* Both: depth comparison per unit and post-filter gamma per unit. */
-int rsx_fp_decompile_buffered_shadow_color_ex(
-    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
-    char* out, u32 out_size, u32* out_constant_count);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
