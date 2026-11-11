@@ -270,14 +270,17 @@ static void depth_alias_note_writes(const D3D12DrawRecord* dr, u32 index, u32* l
         last_user[dr->depth_slot] = index + 1;      /* the last record that changed it */
         s_alias_colour_last[dr->depth_slot] = 0;
     }
-    if (!dr->is_clear && dr->cmask) {
+    if (dr->is_clear || dr->cmask) {
         const u32 targets[4] = {dr->rt_off, dr->rt_mrt[0], dr->rt_mrt[1], dr->rt_mrt[2]};
         for (unsigned t = 0; t < 4; ++t)
-            if (((dr->cmask >> (4 * t)) & 15u) && targets[t]) {
+            if ((dr->is_clear || ((dr->cmask >> (4 * t)) & 15u)) && targets[t]) {
                 unsigned slot = native_depth_slot_at(targets[t]);
                 if (slot) s_alias_colour_last[slot] = 1;
             }
     }
+    /* ClearRenderTargetView precedes ClearDepthStencilView in this record. */
+    if (dr->is_clear && dr->depth_slot && (dr->clear_flags & 3u))
+        s_alias_colour_last[dr->depth_slot] = 0;
 }
 
 static void native_depth_prepare(D3D12DrawRecord* dr, u32 index, u8 written[RSX_D3D12_DEPTH_CAPACITY + 1],

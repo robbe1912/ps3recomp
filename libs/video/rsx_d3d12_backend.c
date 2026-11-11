@@ -2548,9 +2548,8 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
      * image) all six faces decode as clean environment art. */
     static int en = -1;
     if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
-    if (!en) return 0;
     u32 m = 0;
-    for (int u = 0; u < 16; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
+    for (int u = 0; u < 16; u++) if (en && dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
     for (int u = 0; u < 16; u++) if (tex_unit_volume(dr, u)) m |= 1u << (16 + u);
     return m;
 }
