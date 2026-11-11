@@ -208,6 +208,8 @@ static void change(void) {
 }
 static void retire_pending(void) {
     CHECK(SetEvent(paused)); CHECK(WaitForSingleObject(resume, 10000) == WAIT_OBJECT_0);
+    /* Match ordinary OffRT GPU retirement before releasing its resource. */
+    cpu_surface_fence_wait();
     change_kind = 5; change();
 }
 static void direct_rejection(void) {
@@ -246,7 +248,12 @@ static void query(void) {
 }
 static DWORD WINAPI reader(void *unused) { (void)unused; for (int i = 0; i < 32; ++i) query(); return 0; }
 static DWORD WINAPI retired_reader(void *unused) {
-    (void)unused; query(); return 0;
+    (void)unused;
+    const VmReadSnapshotRange range = {0x1000, 1, 0};
+    uint8_t output = 0xa5;
+    if (vm_read_snapshot(&range, 1, &output, 1) != VM_READ_SNAPSHOT_OK ||
+        output != blue(0, 0)) return 1;
+    return 0;
 }
 static DWORD WINAPI release_gate(void *unused) {
     (void)unused; Sleep(100); return FAILED(gate->lpVtbl->Signal(gate, 1));
