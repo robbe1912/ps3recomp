@@ -4284,6 +4284,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
  * space; location bits differ but one title doesn't alias local vs main at
  * one offset), which sidesteps guessing the surface's context DMA location. */
 #define CPU_SURFACE_CAPACITY s_d3d.off_rt_cap
+#include "rsx_d3d12_fault.h"
 #include "rsx_cpu_surface.inc"
 
 #include "rsx_surface_samples.h"
@@ -8679,7 +8680,9 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
-    cpu_surface_service();
+    if(cpu_surface_snapshot_pending())
+        cellGcm_with_fifo_boundary(cpu_surface_snapshot_boundary,NULL);
+    cpu_surface_service(0);
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
