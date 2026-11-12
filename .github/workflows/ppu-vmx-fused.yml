@@ -1,0 +1,37 @@
+name: PPU fused VMX
+on:
+  push:
+    paths:
+      - tools/ppu_lifter.py
+      - tools/ppu_disasm.py
+      - tools/test_ppu_vmx_fused.py
+      - runtime/ppu/ppu_vmx.h
+      - .github/workflows/ppu-vmx-fused.yml
+  pull_request:
+    paths:
+      - tools/ppu_lifter.py
+      - tools/ppu_disasm.py
+      - tools/test_ppu_vmx_fused.py
+      - runtime/ppu/ppu_vmx.h
+      - .github/workflows/ppu-vmx-fused.yml
+  workflow_dispatch:
+jobs:
+  fused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - run: python tools/test_ppu_vmx_fused.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fused-${{ matrix.os }}
+          path: temp/checks/ppu-vmx-fused-*/result.json
