@@ -28,6 +28,7 @@
  */
 
 #include <stdint.h>
+#include <stdatomic.h>
 
 #define SPU_ALIAS_MAX 32
 
@@ -37,24 +38,105 @@ typedef struct spu_alias_range {
 } spu_alias_range;
 
 static spu_alias_range s_alias[SPU_ALIAS_MAX];
-static int             s_alias_n;
+static _Atomic int     s_alias_n;
+
+static int spu_alias_in_table(uint32_t ea)
+{
+    const int count = atomic_load_explicit(&s_alias_n, memory_order_acquire);
+    for (int i = 0; i < count; i++)
+        if (ea >= s_alias[i].addr && ea < s_alias[i].addr + s_alias[i].size)
+            return 1;
+    return 0;
+}
+
+/* Per-page answers for the window the PPU fast path sends here.
+ *
+ * Every lifted guest access in [0x45000000, 0x50000000) calls
+ * sysmem_spu_alias_fixup, and a title's heap can live there, so the two
+ * linear scans above ran on ordinary loads and stores. The answer is a pure
+ * function of the recorded ranges, which change only in sysmem_alias_record
+ * (rare, under the sys_memory bump lock), so each 4 KiB page caches it:
+ *   IDENTITY  every EA in the page maps to itself
+ *   ALIAS     every EA in the page maps to EA - 0x05000000
+ *   MIXED     the page or its primary is partly covered: scan as before
+ * Zero (identity) is correct for an empty table. Atomic page publication
+ * lets concurrent readers see the old or new answer while registration is
+ * in progress. The atomic range count publishes fully initialized entries
+ * before a mixed-page reader can scan them. Writers remain serialized by
+ * the sys_memory bump lock; published range entries are immutable. */
+#define SPU_ALIAS_PAGE_SHIFT 12u
+#define SPU_ALIAS_WINDOW_LO  0x45000000u
+#define SPU_ALIAS_WINDOW_HI  0x50000000u
+#define SPU_ALIAS_PAGES      ((SPU_ALIAS_WINDOW_HI - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT)
+enum { SPU_ALIAS_PAGE_IDENTITY = 0, SPU_ALIAS_PAGE_ALIAS = 1, SPU_ALIAS_PAGE_MIXED = 2 };
+static _Atomic uint8_t s_alias_page[SPU_ALIAS_PAGES];
+
+/* How much of [lo, lo + 4 KiB) the recorded ranges cover, with the same
+ * 32-bit end arithmetic as spu_alias_in_table: 0 none, 1 partly, 2 all. */
+static int spu_alias_page_cover(uint32_t lo)
+{
+    const uint64_t page_end = (uint64_t)lo + (1u << SPU_ALIAS_PAGE_SHIFT);
+    uint64_t start[SPU_ALIAS_MAX], end[SPU_ALIAS_MAX];
+    int n = 0;
+    const int count = atomic_load_explicit(&s_alias_n, memory_order_acquire);
+    for (int i = 0; i < count; i++) {
+        uint64_t a = s_alias[i].addr, b = (uint32_t)(s_alias[i].addr + s_alias[i].size);
+        if (b <= a) continue;                        /* wrapped: matches nothing */
+        if (a < lo) a = lo;
+        if (b > page_end) b = page_end;
+        if (a >= b) continue;
+        int k = n++;                                 /* insertion sort by start */
+        while (k > 0 && start[k - 1] > a) { start[k] = start[k - 1]; end[k] = end[k - 1]; --k; }
+        start[k] = a; end[k] = b;
+    }
+    if (!n) return 0;
+    uint64_t reach = lo;
+    for (int k = 0; k < n; k++) {
+        if (start[k] > reach) return 1;              /* a hole */
+        if (end[k] > reach) reach = end[k];
+    }
+    return reach >= page_end ? 2 : 1;
+}
+
+static void spu_alias_page_update(uint32_t page)
+{
+    const uint32_t lo = SPU_ALIAS_WINDOW_LO + (page << SPU_ALIAS_PAGE_SHIFT);
+    const int self = spu_alias_page_cover(lo);
+    const int prim = spu_alias_page_cover(lo - 0x05000000u);
+    uint8_t state;
+    if (self == 2 || prim == 0) state = SPU_ALIAS_PAGE_IDENTITY;
+    else if (prim == 2 && self == 0) state = SPU_ALIAS_PAGE_ALIAS;
+    else state = SPU_ALIAS_PAGE_MIXED;
+    atomic_store_explicit(&s_alias_page[page], state, memory_order_release);
+}
+
+/* Refresh the pages whose answer [addr, addr + size) can change: the range
+ * itself (as EAs) and its +0x05000000 image (as aliases of it). */
+static void spu_alias_pages_refresh(uint32_t addr, uint32_t size)
+{
+    const uint64_t a0 = addr, a1 = (uint64_t)addr + size;
+    const uint64_t spans[2][2] = { { a0, a1 }, { a0 + 0x05000000u, a1 + 0x05000000u } };
+    for (int s = 0; s < 2; s++) {
+        uint64_t lo = spans[s][0], hi = spans[s][1];
+        if (lo < SPU_ALIAS_WINDOW_LO) lo = SPU_ALIAS_WINDOW_LO;
+        if (hi > SPU_ALIAS_WINDOW_HI) hi = SPU_ALIAS_WINDOW_HI;
+        if (lo >= hi) continue;
+        const uint32_t first = (uint32_t)((lo - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT);
+        const uint32_t last = (uint32_t)((hi - 1 - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT);
+        for (uint32_t p = first; p <= last; p++) spu_alias_page_update(p);
+    }
+}
 
 /* sys_memory.c records each handed-out allocation window here. */
 void sysmem_alias_record(uint32_t addr, uint32_t size)
 {
-    if (s_alias_n < SPU_ALIAS_MAX && size) {
-        s_alias[s_alias_n].addr = addr;
-        s_alias[s_alias_n].size = size;
-        s_alias_n++;
+    const int count = atomic_load_explicit(&s_alias_n, memory_order_relaxed);
+    if (count < SPU_ALIAS_MAX && size) {
+        s_alias[count].addr = addr;
+        s_alias[count].size = size;
+        atomic_store_explicit(&s_alias_n, count + 1, memory_order_release);
+        spu_alias_pages_refresh(addr, size);
     }
-}
-
-static int spu_alias_in_table(uint32_t ea)
-{
-    for (int i = 0; i < s_alias_n; i++)
-        if (ea >= s_alias[i].addr && ea < s_alias[i].addr + s_alias[i].size)
-            return 1;
-    return 0;
 }
 
 /* Normalize an SPU/PPU-side EA through the LV1 dual mapping. Returns the EA
@@ -91,6 +173,13 @@ uint32_t sysmem_spu_alias_fixup(uint32_t ea)
      * arenas may place a registered primary above the old 0x50000000 end. */
     if (ea < 0x45000000u) return ea;
     uint32_t prim = ea - 0x05000000u;
+    if (ea < SPU_ALIAS_WINDOW_HI) {
+        const uint8_t state = atomic_load_explicit(
+            &s_alias_page[(ea - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT],
+            memory_order_acquire);
+        if (state == SPU_ALIAS_PAGE_IDENTITY) return ea;
+        if (state == SPU_ALIAS_PAGE_ALIAS) return prim;
+    }
     if (spu_alias_in_table(prim) && !spu_alias_in_table(ea)) return prim;
     return ea;
 }
@@ -104,7 +193,8 @@ uint32_t sysmem_spu_alias_fixup(uint32_t ea)
  * block's image was an impossible layout and made every EA in it ambiguous. */
 int sysmem_alias_va_conflicts(uint32_t addr, uint32_t size)
 {
-    for (int i = 0; i < s_alias_n; i++) {
+    const int count = atomic_load_explicit(&s_alias_n, memory_order_acquire);
+    for (int i = 0; i < count; i++) {
         uint32_t a = s_alias[i].addr, b = a + s_alias[i].size;
         uint32_t ia = a + 0x05000000u, ib = b + 0x05000000u; /* its image */
         if (addr < ib && ia < addr + size) return 1; /* candidate on its image */

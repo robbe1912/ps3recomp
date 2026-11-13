@@ -1,0 +1,32 @@
+name: SPU EA alias page table
+on:
+  push:
+    branches: [master, main, combined, 'codex/**']
+    paths: ['runtime/syscalls/spu_ea_alias.c', 'runtime/syscalls/tests/test_spu_ea_alias.c', 'tools/test_spu_ea_alias.py', '.github/workflows/spu-ea-alias.yml']
+  pull_request:
+    paths: ['runtime/syscalls/spu_ea_alias.c', 'runtime/syscalls/tests/test_spu_ea_alias.c', 'tools/test_spu_ea_alias.py', '.github/workflows/spu-ea-alias.yml']
+  workflow_dispatch:
+jobs:
+  alias:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python tools/test_spu_ea_alias.py --mutants
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spu-ea-alias-${{ matrix.os }}
+          path: |
+            build/spu-ea-alias-tests/**/*.log
+            build/spu-ea-alias-tests/**/*.json
+          retention-days: 5
