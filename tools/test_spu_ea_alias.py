@@ -6,7 +6,8 @@ runtime/syscalls/spu_ea_alias.c, which must answer every probe exactly like
 the previous two-scan implementation. With --mutants, each mutated copy of
 the production file must build and then fail the contract. Concurrent readers
 also check completed full/mixed-page registrations, and type assertions reject
-non-atomic page/count publication. No game input; no
+non-atomic page/count publication. Four concurrent writers must respect the
+internal blocking lock and preserve every registration. No game input; no
 performance claim."""
 import argparse
 import json
@@ -21,6 +22,7 @@ FIXTURE = ROOT / 'runtime/syscalls/tests/test_spu_ea_alias.c'
 OUT = ROOT / 'build/spu-ea-alias-tests'
 
 MUTANTS = [
+    ('no-writer-lock', '    spu_alias_record_lock();', '    if (0) spu_alias_record_lock();'),
     ('tail-gap-as-full', '    return reach >= page_end ? 2 : 1;\n', '    return 2;\n'),
     ('hole-as-full', 'if (start[k] > reach) return 1;', 'if (start[k] > reach) return 2;'),
     ('unsorted-union', 'while (k > 0 && start[k - 1] > a)', 'while (0 && k > 0 && start[k - 1] > a)'),
@@ -73,7 +75,10 @@ def main():
         report['mutants'] = {}
         for name, before, after in MUTANTS:
             assert source.count(before) == 1, name
-            rec = build_and_run('mutant-' + name, source.replace(before, after), args.compiler)
+            mutated = source.replace(before, after)
+            if name == 'no-writer-lock':
+                mutated = mutated.replace('    spu_alias_record_unlock();', '    if (0) spu_alias_record_unlock();')
+            rec = build_and_run('mutant-' + name, mutated, args.compiler)
             killed = rec.get('build') == 0 and rec.get('returncode') not in (0, None)
             report['mutants'][name] = dict(killed=killed, record=rec)
             state = 'killed' if killed else 'BUILD FAILED' if rec.get('build') else 'SURVIVED'

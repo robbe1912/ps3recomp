@@ -17,10 +17,11 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
 #endif
 #include "../spu_ea_alias.c"
 
-/* Readers query while sys_memory appends under its writer lock. */
+/* Readers query while registration appends under its internal writer lock. */
 _Static_assert(_Generic(&s_alias_page[0], _Atomic uint8_t*: 1, default: 0),
                "Publish alias-page answers with C11 atomics");
 _Static_assert(_Generic(&s_alias_n, _Atomic int*: 1, default: 0),
@@ -187,8 +188,84 @@ static void check_concurrent_registration(void)
     puts("PASS concurrent full/mixed-page publication with four readers");
 }
 
+/* Hold the production writer mutex until all four callers have attempted
+ * registration. No caller may publish through that held lock. Then require
+ * every independent full/mixed-page registration to survive contention. */
+static atomic_int writers_ready, writers_go, writers_attempted, writers_completed;
+#ifdef _WIN32
+static DWORD WINAPI concurrent_writer(void* argument)
+#else
+static void* concurrent_writer(void* argument)
+#endif
+{
+    const int lane = (int)(uintptr_t)argument;
+    atomic_fetch_add(&writers_ready, 1);
+    while (!atomic_load(&writers_go)) {}
+    atomic_fetch_add(&writers_attempted, 1);
+    for (int range = lane; range < SPU_ALIAS_MAX; range += 4) {
+        const uint32_t address = 0x40000000u + (uint32_t)range * 0x2000u;
+        sysmem_alias_record(address + (range & 1 ? 1u : 0u), 0x1000u);
+    }
+    atomic_fetch_add(&writers_completed, 1);
+    return 0;
+}
+
+static void check_concurrent_writers(void)
+{
+    reset();
+    spu_alias_record_lock();
+#ifdef _WIN32
+    HANDLE writers[4];
+    for (int lane = 0; lane < 4; lane++) {
+        writers[lane] = CreateThread(NULL, 0, concurrent_writer, (void*)(uintptr_t)lane, 0, NULL);
+        if (!writers[lane]) exit(1);
+    }
+#else
+    pthread_t writers[4];
+    for (int lane = 0; lane < 4; lane++)
+        if (pthread_create(&writers[lane], NULL, concurrent_writer, (void*)(uintptr_t)lane)) exit(1);
+#endif
+    while (atomic_load(&writers_ready) != 4) {}
+    atomic_store(&writers_go, 1);
+    while (atomic_load(&writers_attempted) != 4) {}
+#ifdef _WIN32
+    Sleep(25);
+#else
+    const struct timespec pause = {0, 25000000};
+    nanosleep(&pause, NULL);
+#endif
+    if (atomic_load(&s_alias_n) || atomic_load(&writers_completed)) {
+        fprintf(stderr, "FAIL registration bypassed its held writer lock\n");
+        exit(1);
+    }
+    spu_alias_record_unlock();
+#ifdef _WIN32
+    for (int lane = 0; lane < 4; lane++) {
+        DWORD code;
+        if (WaitForSingleObject(writers[lane], 10000) != WAIT_OBJECT_0 ||
+            !GetExitCodeThread(writers[lane], &code) || code || !CloseHandle(writers[lane])) exit(1);
+    }
+#else
+    for (int lane = 0; lane < 4; lane++)
+        if (pthread_join(writers[lane], NULL)) exit(1);
+#endif
+    if (atomic_load(&s_alias_n) != SPU_ALIAS_MAX || atomic_load(&writers_completed) != 4) {
+        fprintf(stderr, "FAIL concurrent registration lost a range\n");
+        exit(1);
+    }
+    for (int range = 0; range < SPU_ALIAS_MAX; range++) {
+        const uint32_t ea = 0x45000010u + (uint32_t)range * 0x2000u;
+        if (sysmem_spu_alias_fixup(ea) != ea - 0x05000000u) {
+            fprintf(stderr, "FAIL concurrent writer alias answer\n");
+            exit(1);
+        }
+    }
+    puts("PASS four concurrent registration writers and held-lock negative control");
+}
+
 int main(void)
 {
+    check_concurrent_writers();
     check_concurrent_registration();
     s_rng = 0x9E3779B97F4A7C15ull;
     reset(); sweep("empty", 0);

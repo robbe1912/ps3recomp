@@ -30,6 +30,20 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+/* Allocation and mapper paths can register concurrently. Serialize writers
+ * here while leaving all guest-address readers lock-free. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_alias_writer_lock = SRWLOCK_INIT;
+static void spu_alias_record_lock(void) { AcquireSRWLockExclusive(&s_alias_writer_lock); }
+static void spu_alias_record_unlock(void) { ReleaseSRWLockExclusive(&s_alias_writer_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_alias_writer_lock = PTHREAD_MUTEX_INITIALIZER;
+static void spu_alias_record_lock(void) { pthread_mutex_lock(&s_alias_writer_lock); }
+static void spu_alias_record_unlock(void) { pthread_mutex_unlock(&s_alias_writer_lock); }
+#endif
+
 #define SPU_ALIAS_MAX 32
 
 typedef struct spu_alias_range {
@@ -55,15 +69,15 @@ static int spu_alias_in_table(uint32_t ea)
  * sysmem_spu_alias_fixup, and a title's heap can live there, so the two
  * linear scans above ran on ordinary loads and stores. The answer is a pure
  * function of the recorded ranges, which change only in sysmem_alias_record
- * (rare, under the sys_memory bump lock), so each 4 KiB page caches it:
+ * (rare, under the internal writer lock), so each 4 KiB page caches it:
  *   IDENTITY  every EA in the page maps to itself
  *   ALIAS     every EA in the page maps to EA - 0x05000000
  *   MIXED     the page or its primary is partly covered: scan as before
  * Zero (identity) is correct for an empty table. Atomic page publication
  * lets concurrent readers see the old or new answer while registration is
  * in progress. The atomic range count publishes fully initialized entries
- * before a mixed-page reader can scan them. Writers remain serialized by
- * the sys_memory bump lock; published range entries are immutable. */
+ * before a mixed-page reader can scan them. The internal blocking mutex
+ * serializes writers; published range entries are immutable. */
 #define SPU_ALIAS_PAGE_SHIFT 12u
 #define SPU_ALIAS_WINDOW_LO  0x45000000u
 #define SPU_ALIAS_WINDOW_HI  0x50000000u
@@ -130,6 +144,7 @@ static void spu_alias_pages_refresh(uint32_t addr, uint32_t size)
 /* sys_memory.c records each handed-out allocation window here. */
 void sysmem_alias_record(uint32_t addr, uint32_t size)
 {
+    spu_alias_record_lock();
     const int count = atomic_load_explicit(&s_alias_n, memory_order_relaxed);
     if (count < SPU_ALIAS_MAX && size) {
         s_alias[count].addr = addr;
@@ -137,6 +152,7 @@ void sysmem_alias_record(uint32_t addr, uint32_t size)
         atomic_store_explicit(&s_alias_n, count + 1, memory_order_release);
         spu_alias_pages_refresh(addr, size);
     }
+    spu_alias_record_unlock();
 }
 
 /* Normalize an SPU/PPU-side EA through the LV1 dual mapping. Returns the EA
