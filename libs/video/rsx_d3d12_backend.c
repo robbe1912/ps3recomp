@@ -246,6 +246,11 @@ static u32 scene_bound_shader(const char* source, ID3DBlob* binary, const D3D12_
  * metadata bound; capped FIFO replacement must not shift other entries. */
 #define VP_FP_CACHE_INITIAL 256
 #define VP_FP_CACHE_LIMIT 4096
+/* Upper bound on one fragment program (instructions plus inline-CONST
+ * slots, 16 bytes each). MotorStorm's deformable-mud terrain programs are
+ * 4112..4384 bytes; at a 4096-byte bound their END is never found, so the
+ * hash, decompile and constant reads all see a truncated program. */
+#define VP_FP_UCODE_MAX 16384u
 #include "rsx_pipeline_cache.h"
 
 /* ---------------------------------------------------------------------------
@@ -2201,7 +2206,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * so hashing them made the pipeline key move every draw. */
     u32 uhash;
     {
-        u32 usz = rsx_fp_program_size(vm_base + off, 4096);
+        u32 usz = rsx_fp_program_size(vm_base + off, VP_FP_UCODE_MAX);
         if (usz == 0) usz = 64;
         s_perf_pso_hashbytes += (int)usz;
         if (getenv("FP_CONSTBUF") && getenv("FP_CONSTBUF")[0] == '0') {
@@ -2209,7 +2214,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         } else {
-            uhash = rsx_fp_code_hash(vm_base + off, 4096);
+            uhash = rsx_fp_code_hash(vm_base + off, VP_FP_UCODE_MAX);
         }
     }
 
@@ -2230,7 +2235,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         memset(&recipe,0,sizeof(recipe));recipe.address=fp_addr;recipe.control=(u32)exp32;
         recipe.cube=cube_mask;recipe.mask=cmask;recipe.cull=cull;recipe.blend=blend;recipe.nrt=nrt;recipe.format=(u32)rtfmt;
         recipe.alias=alias_key;recipe.alias_mask=alias_mask;recipe.points=alias_points;memcpy(recipe.remap,alias_remap,sizeof(alias_remap));
-        u32 bytes=rsx_fp_program_size(vm_base+off,4096);
+        u32 bytes=rsx_fp_program_size(vm_base+off,VP_FP_UCODE_MAX);
         /* This fork still emits literal constants; include their exact payloads. */
         if(bytes && shader_prefetch_duplicate(&recipe,sizeof(recipe),vm_base+off,bytes))return NULL;
     }
@@ -2285,7 +2290,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
      * backend does not track that register, so let the decompiler infer it. */
     (void)exp32;
-    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+    int n = rsx_fp_decompile(vm_base + off, VP_FP_UCODE_MAX, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
@@ -3436,7 +3441,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+                rsx_fp_extract_consts(vm_base + foff, VP_FP_UCODE_MAX, &ts[20], 64);   /* fp_k[64] */
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
