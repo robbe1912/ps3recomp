@@ -1,0 +1,32 @@
+name: D3D12 fragment program bounds
+on:
+  push:
+    branches: [master, main, combined, 'codex/**']
+    paths: ['libs/video/rsx_d3d12_backend.c', 'libs/video/rsx_fp_decompiler.*', 'libs/video/tests/test_fp_program_bound.c', 'tools/test_fp_program_bound.py', '.github/workflows/fp-program-bound.yml']
+  pull_request:
+    paths: ['libs/video/rsx_d3d12_backend.c', 'libs/video/rsx_fp_decompiler.*', 'libs/video/tests/test_fp_program_bound.c', 'tools/test_fp_program_bound.py', '.github/workflows/fp-program-bound.yml']
+  workflow_dispatch:
+jobs:
+  program:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python tools/test_fp_program_bound.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fp-program-bound-${{ matrix.os }}
+          path: |
+            build/fp-program-bound-tests/**/*.log
+            build/fp-program-bound-tests/**/*.json
+          retention-days: 5
