@@ -67,7 +67,7 @@ void check_fp_program_bound(u32 bound)
 {
     static u8 program[16384 + 16];
     static u8 canonical[16384];
-    static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
+    static char hlsl[256u * 1024u];
     static rsx_fp_constant_block block;
     const unsigned counts[] = {193, 210, 1024};
     for (unsigned case_index = 0; case_index < 3; ++case_index) {
