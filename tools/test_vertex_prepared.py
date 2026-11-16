@@ -9,7 +9,7 @@ p.add_argument('--mutants',action='store_true');p.add_argument('--benchmark',act
 p.add_argument('--output',type=Path,default=root/'build/vertex-prepared-tests')
 a=p.parse_args();runtime=root
 tool_env=os.environ.copy()
-a.compiler=a.compiler or tool_env.get('MV_CLANG')or tool_env.get('CC')or shutil.which('cc')
+a.compiler=a.compiler or tool_env.get('MV_CLANG')or tool_env.get('CC')or shutil.which('clang-cl' if os.name=='nt' else 'cc')
 assert a.compiler,'Set CC or --compiler'
 out=a.output.resolve();out.mkdir(parents=True,exist_ok=True)
 fixture=root/'libs/video/tests/test_vertex_prepared.c';source=runtime/'libs/video/rsx_vertex_fetch.c'
@@ -30,7 +30,7 @@ def build(name,text=None,counts=True,threaded=False):
     src=folder/'rsx_vertex_fetch.c';src.write_text(text,encoding='utf-8')
     (folder/'compiled-source-hash.json').write_text(json.dumps({'sha256':hashlib.sha256(src.read_bytes()).hexdigest(),'call_count_instrumentation':counts}),encoding='utf-8')
     exe=folder/('test.exe'if os.name=='nt'else'test')
-    if os.name=='nt':
+    if Path(a.compiler).name.lower() in {'cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'}:
         cmd=[a.compiler,'/nologo','/TC','/std:c17','/O2','/Ob2','/MDd','/Zi','/UNDEBUG','/Gy','/Gw',str(active_fixture),str(src),'/I'+str(runtime/'libs/video'),'/I'+str(runtime/'include'),'/Fo'+str(folder)+'/', '/Fe:'+str(exe),'/link','/OPT:REF']
         if counts:cmd.insert(2,'/DVERTEX_VERIFY_COUNTS')
     else:
