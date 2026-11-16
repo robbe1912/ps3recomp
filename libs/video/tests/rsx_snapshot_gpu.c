@@ -32,7 +32,7 @@ typedef struct {
     int in_begin_end;
     u32 color_target, surface_color_dma[4], surface_color_offset[4], surface_color_pitch[4];
 } rsx_state;
-typedef struct { u32 cpu_address[4], cpu_pitch[4], rt_fmt; } D3D12DrawRecord;
+typedef struct { u32 cpu_address[4], cpu_pitch[4], rt_fmt, rt_h; } D3D12DrawRecord;
 static rsx_state state;
 static struct {
     ID3D12Device *device;
@@ -87,7 +87,11 @@ static void make_target(void) {
     HR(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &heap, D3D12_HEAP_FLAG_NONE,
         &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&r->res));
     r->w = width; r->h = height; r->dxgi = desc.Format; r->st = D3D12_RESOURCE_STATE_COPY_DEST;
-    D3D12DrawRecord draw = {0}; draw.cpu_address[0] = target_address; draw.cpu_pitch[0] = pitch; draw.rt_fmt = 9;
+    D3D12DrawRecord draw = {0};
+    draw.cpu_address[0] = target_address;
+    draw.cpu_pitch[0] = pitch;
+    draw.rt_fmt = 9;
+    draw.rt_h = height;
     cpu_surface_bind(0, &draw, 0);
 }
 static void produce(void) {

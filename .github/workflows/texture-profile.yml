@@ -1,15 +1,25 @@
 name: DX12 texture profile
 on:
   push:
-    branches: [master, main, combined, codex/dx12-texture-profile]
+    branches: [master, main, combined, 'codex/**']
     paths:
       - libs/video/rsx_texture_profile.h
+      - libs/video/rsx_texture_fingerprint.h
+      - libs/video/rsx_texture_layout.h
+      - libs/video/rsx_texture_layout.c
+      - libs/video/third_party/xxhash/**
+      - include/ps3emu/ps3types.h
       - libs/video/rsx_d3d12_backend.c
       - tools/test_rsx_texture_profile.py
       - .github/workflows/texture-profile.yml
   pull_request:
     paths:
       - libs/video/rsx_texture_profile.h
+      - libs/video/rsx_texture_fingerprint.h
+      - libs/video/rsx_texture_layout.h
+      - libs/video/rsx_texture_layout.c
+      - libs/video/third_party/xxhash/**
+      - include/ps3emu/ps3types.h
       - libs/video/rsx_d3d12_backend.c
       - tools/test_rsx_texture_profile.py
       - .github/workflows/texture-profile.yml

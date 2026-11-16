@@ -8,20 +8,26 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = r'''
 #include "rsx_texture_profile.h"
+#include "rsx_texture_fingerprint.h"
+#include <stdio.h>
+#include <string.h>
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
 /* Actual production lookup/checksum bodies with authored cache/memory inputs. */
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef uint8_t u8;
-typedef struct {void*res;u32 key,w,h,fmt,off,csum;int cube,used;} VPTexSlot;
-static struct {unsigned vp_tex_capacity;VPTexSlot vp_tex[4];} s_d3d;
+typedef struct {void*res;u32 key,w,h,fmt,off,mips;u64 csum;int cube,used;u64 last_use;} VPTexSlot;
+static struct {unsigned vp_tex_capacity;VPTexSlot vp_tex[4];u64 vp_tex_use_serial;} s_d3d;
 static u8 source_bytes[256];
 static u8* vm_base=source_bytes;
 @CHECKSUM@
 @PROFILE_CHECKSUM@
+@RETENTION@
+@SOURCE_CHECKSUM@
 static int production_lookup(u32 off,u32 w,u32 h,u32 fmt,int cube,rsx_texture_profile_call*profile){
-    u32 key_off=off,bpp=4,blkrow=0,blkrows=0;int dxt=0;
+    u32 key_off=off,bpp=4,blkrow=0,blkrows=0,mips=1;int dxt=0;
 @LOOKUP@
     return slot>=0?slot:-100;
 }
@@ -30,13 +36,13 @@ static double clock_read(void* p){test_clock*c=p;c->reads++;return c->t;}
 int main(void){
     rsx_texture_profile measured={0};rsx_texture_profile_call probe;test_clock fake={0};
     s_d3d.vp_tex_capacity=4;
-    s_d3d.vp_tex[1]=(VPTexSlot){(void*)1,64,2,2,0x85,64,0,0,1};
+    s_d3d.vp_tex[1]=(VPTexSlot){.res=(void*)1,.key=64,.w=2,.h=2,.fmt=0x85,.off=64,.mips=1,.used=1};
     rsx_texture_profile_begin(&probe,&measured,clock_read,&fake);
     int slot=production_lookup(64,2,2,0x85,0,&probe);
     rsx_texture_profile_finish(&probe,slot);
     assert(slot==1&&measured.outcomes[RSX_TEX_FRAME_HIT]==1&&measured.examined==2&&!measured.checksum_calls);
     s_d3d.vp_tex[1].used=0;
-    s_d3d.vp_tex[1].csum=tex_csum(source_bytes+64,16);
+    s_d3d.vp_tex[1].csum=texture_source_csum(NULL,source_bytes+64,16,2,2,0x85,0,1);
     rsx_texture_profile_begin(&probe,&measured,clock_read,&fake);
     slot=production_lookup(64,2,2,0x85,0,&probe);
     rsx_texture_profile_finish(&probe,slot);
@@ -96,7 +102,7 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         source = directory / 'profile.c'
-        backend = (ROOT / 'libs/video/rsx_d3d12_backend.c').read_text()
+        backend = (ROOT / 'libs/video/rsx_d3d12_backend.c').read_text(encoding='utf-8')
         def function(signature):
             start = backend.index(signature)
             return backend[start:backend.index('\n}', start) + 2]
@@ -107,15 +113,30 @@ if __name__ == '__main__':
         fixture = SOURCE.replace('@LOOKUP@', body[start:stop])
         fixture = fixture.replace('@CHECKSUM@', function('static u32 tex_csum('))
         fixture = fixture.replace('@PROFILE_CHECKSUM@', function('static u32 texture_profile_csum('))
-        source.write_text(fixture)
+        fixture = fixture.replace('@RETENTION@', function('static int texture_retention_on(void)\n{'))
+        fixture = fixture.replace('@SOURCE_CHECKSUM@', function('static u64 texture_source_csum('))
+        source.write_text(fixture, encoding='utf-8')
         binary = directory / ('profile.exe' if os.name == 'nt' else 'profile')
         include = str(ROOT / 'libs/video')
-        if 'clang-cl' in Path(compiler).name.lower() or Path(compiler).name.lower() == 'cl.exe':
-            command = [compiler, '/nologo', '/TC', '/O2', '/UNDEBUG', '/I', include, str(source), '/Fe:' + str(binary)]
+        sdk_include = str(ROOT / 'include')
+        layout_source = str(ROOT / 'libs/video/rsx_texture_layout.c')
+        if Path(compiler).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
+            command = [
+                compiler, '/nologo', '/TC', '/O2', '/UNDEBUG',
+                '/I', include, '/I', sdk_include,
+                str(source), layout_source, '/Fe:' + str(binary),
+            ]
         else:
-            command = [compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I', include, str(source), '-o', str(binary)]
+            command = [
+                compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                '-I', include, '-I', sdk_include,
+                str(source), layout_source, '-o', str(binary),
+            ]
         subprocess.run(command, cwd=directory, check=True)
         environment = os.environ.copy()
         environment.pop('TEX_NOCACHE', None)
-        subprocess.run([str(binary)], cwd=directory, env=environment, check=True)
+        for mode in ('0', '1'):
+            environment['RSX_TEXTURE_RETENTION'] = mode
+            subprocess.run([str(binary)], cwd=directory, env=environment, check=True)
+            print('PASS actual texture phase accounting, retention=' + mode)
     print('PASS: actual cache lookup/checksum, disjoint phase accounting, disabled clock and visible failure')

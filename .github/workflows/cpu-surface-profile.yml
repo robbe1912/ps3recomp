@@ -1,5 +1,6 @@
 name: CPU surface latency accounting
 on:
+  workflow_dispatch:
   push:
     branches: [combined, codex/d3d12-cpu-surface-profile, codex/d3d12-cpu-surface-boundary]
   pull_request:
