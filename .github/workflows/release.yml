@@ -111,6 +111,27 @@ jobs:
             esac
           done
 
+      # Keep native assertions enabled independently of the Release SDK bundle.
+      - name: Configure checked native tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S . -B build-checked -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
+              -DPS3RECOMP_BUILD_TESTS=ON
+          else
+            cmake -S . -B build-checked -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+              -DPS3RECOMP_BUILD_TESTS=ON
+          fi
+
+      - name: Build checked native tests
+        run: cmake --build build-checked --parallel 3
+
+      - name: Run checked native tests
+        env:
+          AUDIO_ENABLE: '0'
+        run: ctest --test-dir build-checked --output-on-failure --no-tests=error --timeout 120
+
       - name: Stage the bundle
         shell: bash
         run: |
