@@ -31,7 +31,7 @@ jobs:
           - platform: win-x64
             runs-on: windows-latest
           - platform: mac-arm64
-            runs-on: macos-14
+            runs-on: macos-latest
           # Linux ships as the toolkit and the runtime library, not a game
           # runner: it has no renderer (the null backend's headless software path
           # is a CI check, not a graphics backend) and the PPU boot scaffold does
@@ -92,7 +92,23 @@ jobs:
           set -e
           for t in tools/test_*.py; do
             echo "--- $t"
-            python "$t"
+            case "$t" in
+              tools/test_rsx_snapshot_gpu.py)
+                if [ "$RUNNER_OS" = "Windows" ]; then
+                  python "$t" --warp
+                else
+                  echo "D3D12 snapshot coverage runs on Windows"
+                fi
+                ;;
+              tools/test_rsx_texture_gpu.py)
+                if [ "$RUNNER_OS" = "Windows" ]; then
+                  python "$t" --adapter warp
+                else
+                  echo "D3D12 texture coverage runs on Windows"
+                fi
+                ;;
+              *) python "$t" ;;
+            esac
           done
 
       - name: Stage the bundle
