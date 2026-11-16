@@ -382,7 +382,19 @@ endif()
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
     if(UNIX AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-        add_executable(test_spu_dispatch_checks runtime/spu/tests/test_dispatch_checks.c runtime/diag/spu_execution_observer.c)
+        find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+        set(SPU_OWNED_OPTIONS "${CMAKE_CURRENT_BINARY_DIR}/spu_owned_options.c")
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_owned_options.py"
+                --output "${SPU_OWNED_OPTIONS}"
+            RESULT_VARIABLE SPU_OWNED_OPTIONS_RESULT)
+        if(NOT SPU_OWNED_OPTIONS_RESULT EQUAL 0)
+            message(FATAL_ERROR "Cannot extract production native-owned option readers")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            runtime/spu/spu_channels.c tools/spu_owned_options.py)
+        add_executable(test_spu_dispatch_checks runtime/spu/tests/test_dispatch_checks.c
+            runtime/diag/spu_execution_observer.c "${SPU_OWNED_OPTIONS}")
         target_compile_definitions(test_spu_dispatch_checks PRIVATE PS3_EXECUTION_OBSERVATION=1)
         target_include_directories(test_spu_dispatch_checks PRIVATE include runtime runtime/spu)
         target_compile_options(test_spu_dispatch_checks PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)

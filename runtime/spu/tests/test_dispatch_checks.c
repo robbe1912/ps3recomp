@@ -6,6 +6,7 @@
 #include <windows.h>
 #endif
 static unsigned indirect_calls, tick_calls;
+int g_spu_ls_watch_n;
 void spu_indirect_branch(spu_context* ctx) { ++indirect_calls; ctx->pc=0x400; }
 void yz_lockstep_tick(spu_context* ctx) { (void)ctx; ++tick_calls; }
 #ifdef _WIN32
@@ -74,6 +75,7 @@ static void scoped_test(int fast, int irq, int stack_reset)
 }
 int main(void)
 {
+    setenv("SPU_NATIVE_OWNED_JOBS", "0", 1);
     ps3_spu_execution_observer observer={0, test_clock, test_observe, 0};
     assert(ps3_spu_execution_observer_install(&observer));
     for(int fast=0;fast<=1;++fast) for(int irq=0;irq<=1;++irq)

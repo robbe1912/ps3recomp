@@ -35,3 +35,13 @@ def source(root):
             '#include "spu_native_owned.h"\n'
             '#include "ps3emu/native_atomic_observer.h"\n'
             '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n' + body + '\n')
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    args.output.write_text(source(root), encoding='utf-8')
