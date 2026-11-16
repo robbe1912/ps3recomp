@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the real interpreter's immediate-load vector semantics and existing self-test."""
 import os
+import spu_owned_options
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,10 +14,12 @@ spu = root / 'runtime/spu'
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
 with tempfile.TemporaryDirectory(prefix='spu-ilh-') as tmp:
+    readers = Path(tmp) / 'owned-options.c'
+    readers.write_text(spu_owned_options.source(root))
     for name in ['test_spu_interpreter_ilh', 'spu_interp_selftest']:
         binary = Path(tmp) / name
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                         '-I'+str(root/'include'), '-I'+str(spu),
-                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),str(spu/'spu_float_simd.c'),
+                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),str(spu/'spu_float_simd.c'), str(readers),
                         '-lm', '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)

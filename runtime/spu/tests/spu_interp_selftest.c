@@ -10,6 +10,7 @@
 #include "../spu_interp.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* This snippet issues no channel ops; stub the channel ABI so the test links
@@ -23,6 +24,13 @@ int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_
 spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(void)a; return 0; }
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
 void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
+
+/* These CPU-only programs do not inject interrupts. */
+void (*spu_take_interrupt(spu_context* ctx, void (*next)(spu_context*)))(spu_context*) {
+    (void)ctx;
+    (void)next;
+    abort();
+}
 
 /* .text of the assembled snippet (big-endian words, verbatim). */
 static const unsigned char PROG[] = {

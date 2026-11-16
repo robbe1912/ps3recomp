@@ -18,6 +18,13 @@ void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_
     (void)l; (void)w; (void)p; (void)pc; (void)lr; abort();
 }
 
+/* These CPU-only programs do not inject interrupts. */
+void (*spu_take_interrupt(spu_context* ctx, void (*next)(spu_context*)))(spu_context*) {
+    (void)ctx;
+    (void)next;
+    abort();
+}
+
 static void be32(uint8_t* p, uint32_t value) {
     p[0] = value >> 24; p[1] = value >> 16; p[2] = value >> 8; p[3] = value;
 }

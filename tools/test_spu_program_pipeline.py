@@ -163,7 +163,7 @@ class Pipeline(unittest.TestCase):
         struct.pack_into('>I', nonload, 84, 4)
         self.assertEqual(parse_spu_elf_size(nonload, 0), len(nonload))
 
-    def test_missing_lifted_entry_is_an_explicit_failure(self):
+    def test_entry_inside_symbol_is_generated(self):
         blob = bytearray(elf())
         symbol_offset = len(blob)
         blob.extend(struct.pack('>IIIBBH', 0, 0x100, 8, 2, 0, 0))
@@ -175,6 +175,23 @@ class Pipeline(unittest.TestCase):
         struct.pack_into('>H', blob, 46, 40)
         struct.pack_into('>H', blob, 48, 2)
         result = self.run_pipeline(('input.bin', blob))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'registered')
+        self.assertIn(0x104, {start for start, end in program['diagnostics']['functions']})
+        header = (self.output / program['name'] / 'spu_recomp.h').read_text()
+        self.assertIn(program['name'] + '_spu_func_00000104(', header)
+
+    def test_missing_lifted_entry_is_an_explicit_failure(self):
+        lifter = self.root / 'omit_entry.py'
+        lifter.write_text(
+            'import json, subprocess, sys\nfrom pathlib import Path\n'
+            f'subprocess.run([sys.executable, {str(TOOLS / "spu_lifter.py")!r}, *sys.argv[1:]], check=True)\n'
+            'report = Path(sys.argv[sys.argv.index("--report") + 1])\n'
+            'data = json.loads(report.read_text())\n'
+            'data["functions"] = []\n'
+            'report.write_text(json.dumps(data))\n')
+        result = self.run_pipeline(('input.bin', elf()), extra=('--lifter', str(lifter)))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('ELF entry', self.manifest()['programs'][0]['reason'])
         self.assertFalse((self.output / 'spu_workloads.c').exists())
