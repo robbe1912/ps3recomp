@@ -433,12 +433,40 @@ static void cpu_surface_service_ready(void) {
         ready=next;
     }
 }
+/* Early submission for reads that need a recorded write. A queued read that
+ * overlaps a pending colour target would otherwise wait while the renderer
+ * records the rest of the frame (~26 ms per MotorStorm deformation-depth
+ * read). Instead the renderer ends the batch at its next draw boundary, or at
+ * its idle pump, through the capacity-drain path; the read is then served at
+ * that batch's completion, after the write, with the bytes a coherent read
+ * gets anyway. RSX_CPU_SURFACE_FLUSH=0 keeps the frame-end wait. */
+static int s_cpu_surface_flush;
+static unsigned long long s_cpu_surface_flushes[2];
+static int cpu_surface_flush_wanted(int at_pump) {
+    if(!s_cpu_surface_flush)return 0;
+    if(!atomic_load_explicit(&s_cpu_surface_head,memory_order_acquire))return 0;   /* unlocked hint, as in service_ready */
+    if(InterlockedCompareExchange(&s_cpu_surface_thread,0,0)!=(LONG)GetCurrentThreadId())return 0;
+    if(s_cpu_surface_recording)return 0;
+    int wanted=0;
+    AcquireSRWLockExclusive(&s_cpu_surface_lock);
+    for(CpuSurfaceRequest *request=s_cpu_surface_head;request && !wanted;request=request->next) {
+        /* The snapshot and its suffix wait for their owned FIFO boundary. */
+        if(request->snapshot_ranges)break;
+        wanted=cpu_surface_pending_overlaps(request->address,request->bytes);
+    }
+    ReleaseSRWLockExclusive(&s_cpu_surface_lock);
+    if(wanted && s_cpu_surface_profile && !(++s_cpu_surface_flushes[at_pump?1:0]&63))
+        fprintf(stderr,"[CPUSURFACE_FLUSH] draw=%llu pump=%llu\n",s_cpu_surface_flushes[0],s_cpu_surface_flushes[1]);
+    return wanted;
+}
 static void cpu_surface_init(void) {
     s_cpu_surface_thread=0;
     const char *profile=getenv("RSX_CPU_SURFACE_PROFILE");
     s_cpu_surface_profile=profile&&profile[0]=='1'&&!profile[1];
     const char *prompt=getenv("RSX_CPU_SURFACE_PROMPT");
     s_cpu_surface_prompt=!(prompt&&prompt[0]=='0'&&!prompt[1]);
+    const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
+    s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
     cpu_surface_batch_submitted();
     if(s_cpu_surface_profile) {
         LARGE_INTEGER f;if(!QueryPerformanceFrequency(&f)||f.QuadPart<=0)cpu_surface_fail("profile frequency",E_FAIL);

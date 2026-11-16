@@ -5630,8 +5630,16 @@ static void submit_record_capacity(void* context, int present)
         fprintf(stderr, "[RSXBATCH] capacity drain %llu\n",
                 (unsigned long long)s_record_capacity_drains);
 }
+/* A queued CPU read needs a recorded, unsubmitted write: submit the batch now
+ * (same path as a capacity drain) so the read is served at its completion. */
+static void cpu_surface_flush_recorded(int at_pump)
+{
+    if (cpu_surface_flush_wanted(at_pump) && s_d3d.initialized && s_d3d.draw_count)
+        submit_record_capacity(NULL, 0);
+}
 static void ensure_draw_record_capacity(void)
 {
+    cpu_surface_flush_recorded(0);
     if (!rsx_record_batch_room(&s_d3d.draw_count, MAX_DRAWS, NULL, submit_record_capacity)) {
         fprintf(stderr, "[D3D12] Record capacity drain failed (count=%u)\n", s_d3d.draw_count);
         abort();
@@ -7282,6 +7290,7 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+    cpu_surface_flush_recorded(1);
     if(cpu_surface_snapshot_pending())(void)cellGcm_with_fifo_boundary(cpu_surface_snapshot_boundary,NULL);
     cpu_surface_service(0);
     MSG msg;

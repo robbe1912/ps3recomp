@@ -29,7 +29,32 @@ static void cpu_surface_read(u32 address,u32 bytes){
     if(s_cpu_surface_recording)cpu_surface_fail("surface copy during replay",0);
     reads++;if(served_count<16)served[served_count++]=address;
 }
+/* Instrument renderer-owned reads without changing their value. */
+static int recording_for_owner(void) {
+    if (GetCurrentThreadId() != InterlockedCompareExchange(&s_cpu_surface_thread, 0, 0))
+        cpu_surface_fail("renderer state read by another thread", 0);
+    return s_cpu_surface_recording;
+}
+#define s_cpu_surface_recording recording_for_owner()
 /* PRODUCTION_PROMPT */
+#undef s_cpu_surface_recording
+static struct {
+    int initialized;
+    u32 draw_count;
+} s_d3d = {1, 1};
+static unsigned forced_submits;
+static int initialized_for_owner(void) {
+    if (GetCurrentThreadId() != InterlockedCompareExchange(&s_cpu_surface_thread, 0, 0))
+        cpu_surface_fail("GPU state read by another thread", 0);
+    return s_d3d.initialized;
+}
+static void submit_record_capacity(void* context, int present) {
+    if (context || present || locks_held || s_cpu_surface_recording)
+        cpu_surface_fail("invalid early submission", 0);
+    ++forced_submits;
+}
+/* PRODUCTION_FLUSH */
+
 #define REQUIRE(x,message) do{if(!(x)){fprintf(stderr,"FAIL: %s\n",message);exit(1);}}while(0)
 static struct Event events[8];static CpuSurfaceRequest requests[8];
 static void queue(unsigned i,u32 address,u32 bytes){
@@ -41,13 +66,15 @@ static void queue(unsigned i,u32 address,u32 bytes){
 static unsigned queued(void){unsigned n=0;for(CpuSurfaceRequest *r=s_cpu_surface_head;r;r=r->next)n++;return n;}
 static void reset(void){
     s_cpu_surface_head=s_cpu_surface_tail=NULL;served_count=reads=0;s_cpu_surface_recording=0;
-    current_thread=2;s_cpu_surface_thread=2;s_cpu_surface_prompt=1;cpu_surface_batch_submitted();
+    current_thread=2;s_cpu_surface_thread=2;s_cpu_surface_prompt=1;s_cpu_surface_flush=1;cpu_surface_batch_submitted();
 }
 int main(void){
     reset();
     queue(0,0x20000,2);queue(1,0x21000,2);queue(2,0x22000,2);
     static VmReadSnapshotRange snapshot_range;
     requests[1].snapshot_ranges=&snapshot_range;
+    cpu_surface_pending_add(0x22000,0x100,4);
+    REQUIRE(!cpu_surface_flush_wanted(0),"snapshot barrier retains flush decisions for its queued suffix");
     cpu_surface_service_ready();
     REQUIRE(reads==1 && s_cpu_surface_head==&requests[1] && s_cpu_surface_tail==&requests[2] && !events[1].signaled && !events[2].signaled,"snapshot barrier retains queued suffix");
 
@@ -87,6 +114,28 @@ int main(void){
     REQUIRE(s_cpu_surface_pending_count==1,"contained ranges are not duplicated");
     cpu_surface_pending_add(0x70000,0x100,9);REQUIRE(s_cpu_surface_pending_count==2,"a larger range is recorded");
     reset();lock_calls=0;cpu_surface_service_ready();REQUIRE(!reads && !lock_calls,"empty queue takes no lock");
+    /* 4. Early submission: wanted exactly when a queued read needs a pending write. */
+    reset();lock_calls=0;cpu_surface_pending_add(0x10000,0x100,4);
+    REQUIRE(!cpu_surface_flush_wanted(0) && !lock_calls,"empty queue: no early submission, no lock");
+    queue(0,0x20000,2);queue(1,0x0FFFE,2);
+    REQUIRE(!cpu_surface_flush_wanted(0),"reads clear of (and adjacent to) pending writes need no submission");
+    queue(2,0x103FE,2);
+    REQUIRE(cpu_surface_flush_wanted(0) && cpu_surface_flush_wanted(1),"a read behind others that needs a pending write asks for submission");
+    REQUIRE(!reads && queued()==3 && s_cpu_surface_tail==&requests[2] && !locks_held,"asking serves and dequeues nothing");
+    cpu_surface_flush_recorded(0);
+    REQUIRE(forced_submits==1 && !reads && queued()==3,"overlapping read submits at a draw boundary without serving under the queue lock");
+    s_d3d.draw_count=0;
+    cpu_surface_flush_recorded(1);
+    REQUIRE(forced_submits==1,"empty recorded batch stays empty");
+    s_d3d.draw_count=1;
+    s_cpu_surface_recording=1;REQUIRE(!cpu_surface_flush_wanted(0),"never while render_frame replays");
+    s_cpu_surface_recording=0;current_thread=7;REQUIRE(!cpu_surface_flush_wanted(1),"only the renderer service thread submits");
+    cpu_surface_flush_recorded(1);
+    REQUIRE(forced_submits==1,"foreign thread never submits or reads GPU state");
+    current_thread=2;s_cpu_surface_flush=0;REQUIRE(!cpu_surface_flush_wanted(0),"RSX_CPU_SURFACE_FLUSH=0 keeps the frame-end wait");
+    s_cpu_surface_flush=1;cpu_surface_batch_submitted();REQUIRE(!cpu_surface_flush_wanted(0),"nothing pending after submission");
+    for(u32 i=0;i<=CPU_SURFACE_PENDING_MAX;i++)cpu_surface_pending_add(0x40000000u+i*0x1000u,0x100,4);
+    REQUIRE(cpu_surface_flush_wanted(0),"overflowed pending set submits");
     puts("PASS: prompt CPU surface service: disjoint reads early, overlapping reads queued in order, submit reset, guards");
     return 0;
 }
