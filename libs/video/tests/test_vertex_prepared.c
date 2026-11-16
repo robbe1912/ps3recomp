@@ -45,7 +45,12 @@ static void parity(rsx_vertex_fetch_batch* b,u32 vi,const char* why) {
     resolves=0;resolve_trace=0; test_fetch_calls=0; rsx_fetch_vertex_prepared(b,vi,c);rc=resolves;tc=resolve_trace;
     CHECK(memcmp(a,c,sizeof a)==0,why); CHECK(ra==rc && ta==tc,"per-element address resolution changed");
 #ifdef VERTEX_VERIFY_COUNTS
-    CHECK(test_fetch_calls==(b->count<=8?b->count:16),"constant-only slots fetched individually");
+    /* Prepared draws decode types 1..7 inline and call the scalar fetch only
+     * for other types; dense draws (>8 arrays) stay fully scalar. */
+    u64 scalar=0;
+    if(b->count>8)scalar=16;
+    else if(vm_base)for(u32 i=0;i<b->count;i++){u32 t=state.vertex_attribs[b->active[i]].type;scalar+=!(t>=1&&t<=7);}
+    CHECK(test_fetch_calls==scalar,"constant-only slots fetched individually");
 #endif
 }
 static double now(void) {
@@ -96,7 +101,9 @@ int main(int argc,char**argv) {
     parity(&b,0,"live vertex edits lost");
     const u32 indices[]={0,1,17,257,0xfffffffeu,0xffffffffu};
     unsigned cases=0;
-    for(unsigned type=0;type<9;type++)for(unsigned active=0;active<=16;active++) {
+    const u32 types[] = {0,1,2,3,4,5,6,7,8,0x101,0x102,0x103,0x104,0x105,0x106,0x107,0xffffff04u};
+    for(unsigned ti=0;ti<sizeof types/sizeof types[0];ti++)for(unsigned active=0;active<=16;active++) {
+        const u32 type = types[ti];
         setup(active,type);
         for(unsigned i=0;i<16;i++)if(i%7==0)state.vertex_attribs[i].stride=0;
         rsx_vertex_fetch_prepare(&b,&state);

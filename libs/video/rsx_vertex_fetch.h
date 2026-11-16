@@ -74,14 +74,33 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
  * output keeps all sixteen float4 slots and the scalar format/diagnostics.
  * Dense layouts (>8 arrays) retain scalar expansion to avoid redundant
  * constant copying. Reprepare after any declaration/current-register change.
- * No guest vertex data cache. */
+ * No guest vertex data cache.
+ *
+ * Each active array's declaration (offset, location, stride, size, type,
+ * frequency mode) is decoded once here as well, so the per-vertex loop only
+ * computes the element offset, resolves it and converts the components. The
+ * resolve itself stays per element and in the same order as the scalar path;
+ * an unrecognised type falls back to rsx_fetch_attrib for that slot. */
 typedef struct rsx_vertex_value { float v[4]; } rsx_vertex_value;
+
+typedef struct rsx_vertex_fetch_slot {
+    u32 offset;      /* array offset without the context-DMA bit */
+    u32 stride;
+    u32 frequency;   /* > 1: instanced (divide or modulo) */
+    u32 type;        /* preserve unknown types for scalar fallback */
+    u8 slot;         /* attribute index 0..15 */
+    u8 location;     /* cellGcmResolveLocated location: 1 LOCAL, 0 MAIN */
+    u8 n;            /* components read, 1..4 */
+    u8 modulo;       /* frequency divider operation bit for this slot */
+} rsx_vertex_fetch_slot;
 
 typedef struct rsx_vertex_fetch_batch {
     const rsx_state* state;
     rsx_vertex_value constants[16];
     u8 active[16];
     u32 count;
+    rsx_vertex_fetch_slot slots[8];   /* decoded when count <= 8 */
+    int nofreq;                       /* VP_NOFREQ instancing kill-switch */
 } rsx_vertex_fetch_batch;
 void rsx_vertex_fetch_prepare(rsx_vertex_fetch_batch* batch, const rsx_state* st);
 void rsx_fetch_vertex_prepared(const rsx_vertex_fetch_batch* batch, u32 vi,

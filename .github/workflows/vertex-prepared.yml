@@ -2,9 +2,9 @@ name: Native prepared vertex fetch
 on:
   push:
     branches: [master, main, combined, 'codex/**']
-    paths: ['libs/video/rsx_vertex_fetch.h', 'libs/video/rsx_vertex_fetch.c', 'libs/video/rsx_commands.h', 'libs/video/tests/test_vertex_prepared.c', 'tools/test_vertex_prepared.py', '.github/workflows/vertex-prepared.yml']
+    paths: ['libs/video/rsx_vertex_fetch.h', 'libs/video/rsx_vertex_fetch.c', 'libs/video/rsx_commands.h', 'libs/video/tests/test_vertex_prepared.c', 'libs/video/tests/test_vertex_prepared_threads.c', 'libs/video/tests/test_rsx_indexed_strip.c.in', 'tools/test_rsx_indexed_strip.py', 'libs/video/rsx_d3d12_backend.c', 'tools/test_vertex_prepared.py', '.github/workflows/vertex-prepared.yml']
   pull_request:
-    paths: ['libs/video/rsx_vertex_fetch.h', 'libs/video/rsx_vertex_fetch.c', 'libs/video/rsx_commands.h', 'libs/video/tests/test_vertex_prepared.c', 'tools/test_vertex_prepared.py', '.github/workflows/vertex-prepared.yml']
+    paths: ['libs/video/rsx_vertex_fetch.h', 'libs/video/rsx_vertex_fetch.c', 'libs/video/rsx_commands.h', 'libs/video/tests/test_vertex_prepared.c', 'libs/video/tests/test_vertex_prepared_threads.c', 'libs/video/tests/test_rsx_indexed_strip.c.in', 'tools/test_rsx_indexed_strip.py', 'libs/video/rsx_d3d12_backend.c', 'tools/test_vertex_prepared.py', '.github/workflows/vertex-prepared.yml']
   workflow_dispatch:
 jobs:
   vertex:
@@ -22,6 +22,7 @@ jobs:
         with:
           arch: x64
       - run: python tools/test_vertex_prepared.py --mutants
+      - run: python tools/test_rsx_indexed_strip.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -29,4 +30,6 @@ jobs:
           path: |
             build/vertex-prepared-tests/**/*.log
             build/vertex-prepared-tests/**/*.json
+            build/indexed-strip-tests/**/*.log
+            build/indexed-strip-tests/**/*.json
           retention-days: 5

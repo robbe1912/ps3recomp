@@ -1,0 +1,172 @@
+/* Production uploader, real shared attribute fetch, authored memory/index adapters. */
+#include "rsx_commands.h"
+#include "rsx_vertex_fetch.h"
+#include "rsx_index_strip.h"
+#include "rsx_upload_buffer.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#define VP_VERT_STRIDE 256u
+#define MAX_VERTICES 4096u
+typedef rsx_vertex_value VPSlot;
+static struct { void* vp_vb_mapped; u32 vp_vb_offset, vp_parity, vp_capacity; } s_d3d;
+static int upload_allocate(void* c,uint64_t bytes,rsx_upload_buffer* b)
+{(void)c;b->memory=malloc((size_t)bytes);b->resource=b->memory;if(b->memory)memset(b->memory,0xcd,(size_t)bytes);return b->memory!=NULL;}
+static int upload_retire(void* c){(void)c;return 1;}
+static void upload_dispose(void* c,rsx_upload_buffer* b){(void)c;free(b->memory);}
+static void vp_upload_reserve(u64 n)
+{
+    rsx_upload_buffer b={s_d3d.vp_vb_mapped,s_d3d.vp_vb_mapped,s_d3d.vp_capacity};
+    const rsx_upload_ops ops={NULL,upload_allocate,upload_retire,upload_dispose};
+    if(!rsx_upload_reserve(&b,s_d3d.vp_vb_offset,n,VP_VERT_STRIDE,&ops))abort();
+    s_d3d.vp_vb_mapped=b.memory;s_d3d.vp_capacity=b.capacity;
+}
+static u8 guest[16*1024*1024];
+uint8_t* vm_base=guest;
+static u32 indices[4096],fetches;
+static rsx_state state;
+u32 cellGcmResolveLocated(int location,u32 offset)
+{ if(offset>=0x800000) abort(); return offset+(location?0x800000:0); }
+static u32 read_guest_index(const rsx_state* s,u32 k)
+{ return ((s->index_array_dma>>4)&15)==1?indices[k]&65535u:indices[k]; }
+static void reference_vertex(const rsx_state* s,u32 i,VPSlot* out)
+{ for(int a=0;a<16;++a)rsx_fetch_attrib(s,a,i,out[a].v); }
+static void rsx_vtx_pos_dbg(const rsx_state* s,const float* v,u32 n)
+{ (void)s;(void)v;(void)n;++fetches; }
+@FETCH_VERTEX_FUNCTION@
+@INDEXED_STRIP_FUNCTION@
+#define CHECK(x) do{if(!(x)){fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#x);return 1;}}while(0)
+static void be32(u8* p,u32 w)
+{p[0]=(u8)(w>>24);p[1]=(u8)(w>>16);p[2]=(u8)(w>>8);p[3]=(u8)w;}
+static void setup(void)
+{
+    memset(&state,0,sizeof state);
+    for(int a=0;a<16;++a)for(int c=0;c<4;++c){
+        const u32 bits[]={0x80000000u,0x7fc12345u,0x3f800000u,0xdeadbeefu};
+        memcpy(&state.vertex_data4f[a][c],&bits[(a+c)%4],4);
+    }
+    const u32 type[]={2,4,3,1,6,5,7},size[]={4,3,2,4,3,2,4},stride[]={16,8,4,12,8,4,4};
+    for(u32 a=0;a<7;++a){
+        state.vertex_attribs[a].enabled=1;state.vertex_attribs[a].type=type[a];
+        state.vertex_attribs[a].size=size[a];state.vertex_attribs[a].stride=stride[a];
+        state.vertex_attribs[a].offset=a*0x10000+((a&1)?0:0x80000000u);
+        for(u32 v=0;v<512;++v){
+            u8* p=guest+a*0x10000+((a&1)?0x800000:0)+v*stride[a];
+            for(u32 k=0;k<stride[a];++k)p[k]=(u8)(v*17+k*29+a*37);
+            if(!a){float f[4]={(float)v,-(float)v,0,1};for(int k=0;k<4;++k){u32 b;memcpy(&b,&f[k],4);be32(p+k*4,b);}}
+        }
+    }
+    state.vertex_attribs[2].frequency=3;
+}
+/* Reference assembly retains the whole segment; it does not call the cursor helper. */
+static u32 segment[4096],segment_n;
+static int check_chunk(u32 first,u32 count,int fan)
+{
+    u32 expected_count=0;VPSlot* expected=malloc((size_t)count*3*VP_VERT_STRIDE);
+    CHECK(expected);
+    for(u32 k=0;k<count;++k){
+        u32 index=read_guest_index(&state,first+k);
+        if(state.restart_index_enable&&(((state.index_array_dma>>4)&15)!=1||state.restart_index<=65535)&&index==state.restart_index){segment_n=0;continue;}
+        CHECK(index<65536&&segment_n<4096);segment[segment_n++]=index;
+        if(segment_n<3)continue;
+        u32 odd=(segment_n-3)&1,tri[3];
+        tri[0]=fan?segment[0]:segment[segment_n-3+odd];
+        tri[1]=fan?segment[segment_n-2]:segment[segment_n-2-odd];tri[2]=index;
+        for(int v=0;v<3;++v)reference_vertex(&state,tri[v],expected+16*expected_count++);
+    }
+    u32 old=s_d3d.vp_vb_offset;u32 n=upload_strip_vp_indexed(&state,first,count,fan);
+    CHECK(n==expected_count);
+    u8* output=(u8*)s_d3d.vp_vb_mapped+(u64)s_d3d.vp_parity*s_d3d.vp_capacity*VP_VERT_STRIDE+old;
+    CHECK(!memcmp(output,expected,(size_t)n*VP_VERT_STRIDE));free(expected);return 0;
+}
+static void reset(void){++state.begin_epoch;segment_n=0;s_d3d.vp_vb_offset=0;fetches=0;}
+static int benchmark(u32 count,u32 repeats)
+{
+    for(u32 i=0;i<count;++i)indices[i]=i;reset();
+    upload_strip_vp_indexed(&state,0,count,0); /* allocate/warm outside timing */
+    fetches=0;clock_t start=clock();
+    for(u32 rep=0;rep<repeats;++rep){reset();state.vertex_data4f[15][0]=(float)(rep%37);upload_strip_vp_indexed(&state,0,count,0);}
+    double elapsed=(double)(clock()-start)/CLOCKS_PER_SEC;
+    const u8* b=s_d3d.vp_vb_mapped;u64 hash=14695981039346656037ull;
+    for(u32 i=0;i<s_d3d.vp_vb_offset;++i)hash=(hash^b[i])*1099511628211ull;
+    printf("BENCH seconds=%.6f checksum=%016llx last_fetches=%u\n",elapsed,(unsigned long long)hash,fetches);return 0;
+}
+int main(int argc,char** argv)
+{
+    setup();s_d3d.vp_capacity=MAX_VERTICES;s_d3d.vp_vb_mapped=malloc(2*MAX_VERTICES*VP_VERT_STRIDE);CHECK(s_d3d.vp_vb_mapped);
+    VPSlot probe[16];reference_vertex(&state,17,probe);
+    CHECK(probe[0].v[0]==17&&probe[0].v[1]==-17&&probe[0].v[3]==1);
+    CHECK(probe[1].v[0]>.27f&&probe[1].v[0]<.28f);
+    {u32 bits;memcpy(&bits,&probe[8].v[0],4);CHECK(bits==0x80000000u);}
+    if(argc>1&&!strcmp(argv[1],"--bench")){
+        u32 count=argc>2?(u32)strtoul(argv[2],NULL,10):512,repeats=argc>3?(u32)strtoul(argv[3],NULL,10):2000;
+        CHECK(count>=3&&count<=512&&repeats>=1&&repeats<=1000000);return benchmark(count,repeats);
+    }
+    for(int fan=0;fan<2;++fan){
+        reset();state.restart_index_enable=0;state.index_array_dma=0;
+        for(u32 i=0;i<8;++i)indices[i]=i;
+        CHECK(!check_chunk(0,2,fan));CHECK(fetches==0);
+        CHECK(!check_chunk(2,1,fan));CHECK(fetches==3);
+        state.vertex_data4f[15][0]=41.25f;
+        CHECK(!check_chunk(3,1,fan));CHECK(fetches==6);
+        CHECK(!check_chunk(4,4,fan));
+        reset();indices[0]=1;indices[1]=17;indices[2]=511;CHECK(!check_chunk(0,3,fan));CHECK(fetches==3);
+        reset();for(u32 i=0;i<8;++i)indices[i]=i*17+2;CHECK(!check_chunk(0,8,fan));CHECK(fetches==8);
+        reset();for(u32 i=0;i<512;++i)indices[i]=i;CHECK(!check_chunk(0,512,fan));CHECK(fetches==512);
+        /* Two grid rows sharing their middle row (8..15): the per-callback
+         * cache keeps it, so each of the 24 distinct vertices is fetched once
+         * (a 3-entry cache refetched the shared row: 32). */
+        reset();for(u32 i=0;i<8;++i){indices[2*i]=i;indices[2*i+1]=i+8;indices[16+2*i]=i+8;indices[17+2*i]=i+16;}
+        CHECK(!check_chunk(0,32,fan));CHECK(fetches==24);
+        for(int bits=0;bits<2;++bits){
+            state.index_array_dma=bits?16:0;state.restart_index_enable=1;state.restart_index=bits?65535:0xffffffffu;
+            const u32 values[]={0,1,2,2,1,7,0xffffffffu,8,9,10,12,0xffffffffu,30,31,32};
+            memcpy(indices,values,sizeof values);reset();CHECK(!check_chunk(0,15,fan));
+            reset();CHECK(!check_chunk(0,2,fan));CHECK(fetches==0);
+            state.frequency_divider_op^=1u<<2;state.vertex_data4f[15][0]=123.5f;
+            CHECK(!check_chunk(2,5,fan));state.vertex_data4f[15][0]=-37.25f;CHECK(!check_chunk(7,8,fan));
+        }
+        state.restart_index_enable=0;state.index_array_dma=16;state.restart_index=0x1ffff;
+        reset();for(u32 i=0;i<8;++i)indices[i]=511-i*47;CHECK(!check_chunk(0,8,fan));
+        reset();state.vertex_data4f[15][0]=-0.0f;CHECK(!check_chunk(0,8,fan));CHECK(fetches==8);
+    }
+    state.index_array_dma=16;state.restart_index_enable=1;state.restart_index=0x1ffff;
+    { const u32 values[]={0,1,65535,2,3,4};memcpy(indices,values,sizeof values);reset();CHECK(!check_chunk(0,6,0)); }
+    u32 seed=0x3b617a29u;
+    for(int trial=0;trial<100;++trial){
+        state.index_array_dma=(trial&1)?16:0;state.restart_index_enable=1;
+        state.restart_index=(trial&1)?65535:0xffffffffu;
+        state.frequency_divider_op=(u32)trial;
+        state.vertex_attribs[1].enabled=trial&1;
+        state.vertex_data4f[12][2]=(float)trial;
+        for(u32 i=0;i<128;++i){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;indices[i]=(seed%13==0)?state.restart_index:seed%512;}
+        reset();CHECK(!check_chunk(0,37,trial&1));
+        state.vertex_data4f[15][1]=(float)-trial;
+        be32(guest+(indices[36]%512)*16+4,0x3f400000u);
+        CHECK(!check_chunk(37,91,trial&1));
+    }
+    /* Complete the draw across the old boundary, retaining both parity regions. */
+    state.restart_index_enable=0;state.index_array_dma=0;
+    for(u32 parity=0;parity<2;++parity){
+        free(s_d3d.vp_vb_mapped);s_d3d.vp_capacity=MAX_VERTICES;
+        s_d3d.vp_vb_mapped=malloc(2*MAX_VERTICES*VP_VERT_STRIDE);CHECK(s_d3d.vp_vb_mapped);
+        reset();s_d3d.vp_parity=parity;
+        memset(s_d3d.vp_vb_mapped,0xa5,2*MAX_VERTICES*VP_VERT_STRIDE);
+        s_d3d.vp_vb_offset=(MAX_VERTICES-3)*VP_VERT_STRIDE;
+        for(u32 i=0;i<8;++i)indices[i]=i;
+        CHECK(upload_strip_vp_indexed(&state,0,8,0)==18);CHECK(fetches==8);
+        CHECK(s_d3d.vp_capacity>MAX_VERTICES);
+        CHECK(s_d3d.vp_vb_offset==(MAX_VERTICES-3+18)*VP_VERT_STRIDE);
+        const u32 order[]={0,1,2,2,1,3,2,3,4,4,3,5,4,5,6,6,5,7};
+        VPSlot expected[18*16];for(u32 i=0;i<18;++i)reference_vertex(&state,order[i],expected+i*16);
+        const size_t start=((size_t)parity*s_d3d.vp_capacity+MAX_VERTICES-3)*VP_VERT_STRIDE;
+        const u8* bytes=s_d3d.vp_vb_mapped;
+        CHECK(!memcmp(bytes+start,expected,sizeof expected));
+        for(u32 p=0;p<2;++p)for(size_t i=0;i<MAX_VERTICES*VP_VERT_STRIDE;++i){
+            if(p==parity&&i>=(MAX_VERTICES-3)*VP_VERT_STRIDE)continue;
+            CHECK(bytes[(size_t)p*s_d3d.vp_capacity*VP_VERT_STRIDE+i]==0xa5);
+        }
+    }
+    free(s_d3d.vp_vb_mapped);puts("PASS: exact production indexed strip/fan bytes; real attributes, restart, split/state changes and bounded fetch count");return 0;
+}

@@ -7,13 +7,38 @@
 #include <stdlib.h>
 #include <string.h>
 
-float rsx_rd_bef(const u8* p)
+static inline float rd_bef(const u8* p)
 {
     u32 w; memcpy(&w, p, 4);
     w = ((w >> 24) & 0xFFu) | ((w >> 8) & 0xFF00u) |
         ((w << 8) & 0xFF0000u) | ((w << 24) & 0xFF000000u);
     float f; memcpy(&f, &w, 4); return f;
 }
+
+static inline float rd_half_be(const u8* p)
+{
+    u16 h = (u16)((p[0] << 8) | p[1]);
+    u32 sgn = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
+    if (exp == 0)        f = sgn << 31;
+    else if (exp == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
+    else                 f = (sgn << 31) | ((exp - 15u + 127u) << 23) | (man << 13);
+    float o; memcpy(&o, &f, 4); return o;
+}
+
+float rsx_rd_bef(const u8* p) { return rd_bef(p); }
+float rsx_rd_half_be(const u8* p) { return rd_half_be(p); }
+
+/* VP_NOFREQ: immutable launch switch, cached once per calling thread. */
+static int vertex_nofreq(void)
+{
+    static _Thread_local int nofreq = -1;
+    if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
+    return nofreq;
+}
+
+/* Types the prepared loop decodes itself; any other type goes through
+ * rsx_fetch_attrib (which reads it as float32 and can log it). */
+static inline int prepared_type(u32 type) { return type >= 1 && type <= 7; }
 
 void rsx_vertex_fetch_prepare(rsx_vertex_fetch_batch* batch, const rsx_state* st)
 {
@@ -22,8 +47,22 @@ void rsx_vertex_fetch_prepare(rsx_vertex_fetch_batch* batch, const rsx_state* st
     for (u32 i = 0; i < 16; ++i)
         if (st->vertex_attribs[i].enabled && st->vertex_attribs[i].stride)
             batch->active[batch->count++] = (u8)i;
-    if (batch->count <= 8)
-        memcpy(batch->constants, st->vertex_data4f, sizeof(batch->constants));
+    if (batch->count > 8) return;
+    memcpy(batch->constants, st->vertex_data4f, sizeof(batch->constants));
+    batch->nofreq = vertex_nofreq();
+    for (u32 i = 0; i < batch->count; ++i) {
+        const rsx_vertex_attrib* a = &st->vertex_attribs[batch->active[i]];
+        rsx_vertex_fetch_slot* s = &batch->slots[i];
+        u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+        s->offset = a->offset & 0x7FFFFFFFu;
+        s->location = (a->offset & 0x80000000u) ? 0 : 1;   /* MAIN : LOCAL */
+        s->stride = a->stride;
+        s->frequency = a->frequency;
+        s->modulo = (st->frequency_divider_op & (1u << batch->active[i])) ? 1 : 0;
+        s->slot = batch->active[i];
+        s->type = a->type;
+        s->n = (u8)n;
+    }
 }
 
 void rsx_fetch_vertex_prepared(const rsx_vertex_fetch_batch* batch, u32 vi,
@@ -35,20 +74,42 @@ void rsx_fetch_vertex_prepared(const rsx_vertex_fetch_batch* batch, u32 vi,
         return;
     }
     memcpy(out, batch->constants, sizeof(batch->constants));
+    if (!vm_base) return;          /* every slot keeps its constant register */
     for (u32 i = 0; i < batch->count; ++i) {
-        u32 slot = batch->active[i];
-        rsx_fetch_attrib(batch->state, (int)slot, vi, out[slot].v);
+        const rsx_vertex_fetch_slot* s = &batch->slots[i];
+        float* o = out[s->slot].v;
+        if (!prepared_type(s->type)) {
+            rsx_fetch_attrib(batch->state, (int)s->slot, vi, o);
+            continue;
+        }
+        u32 ei = vi;
+        if (s->frequency > 1 && !batch->nofreq)
+            ei = s->modulo ? (vi % s->frequency) : (vi / s->frequency);
+        const u8* p = vm_base + cellGcmResolveLocated(s->location, s->offset + ei * s->stride);
+        u32 n = s->n;
+        switch (s->type) {
+        case 2: for (u32 k = 0; k < n; k++) o[k] = rd_bef(p + k * 4); break;
+        case 3: for (u32 k = 0; k < n; k++) o[k] = rd_half_be(p + k * 2); break;
+        case 4: for (u32 k = 0; k < n; k++) o[k] = p[k] / 255.0f; break;
+        case 1:
+            for (u32 k = 0; k < n; k++) {
+                s16 v = (s16)((p[k*2] << 8) | p[k*2+1]);
+                o[k] = (float)v / 32767.0f;
+            }
+            break;
+        case 5: for (u32 k = 0; k < n; k++) o[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
+        case 6: {
+            u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+            s32 x = (s32)(w & 0x7FFu), y = (s32)((w >> 11) & 0x7FFu), z = (s32)((w >> 22) & 0x3FFu);
+            if (x & 0x400) x -= 0x800;
+            if (y & 0x400) y -= 0x800;
+            if (z & 0x200) z -= 0x400;
+            o[0] = (float)x / 1023.0f; o[1] = (float)y / 1023.0f; o[2] = (float)z / 511.0f; o[3] = 1.0f;
+            break;
+        }
+        default: /* 7: UB256 */ for (u32 k = 0; k < n; k++) o[k] = (float)p[k]; break;
+        }
     }
-}
-
-float rsx_rd_half_be(const u8* p)
-{
-    u16 h = (u16)((p[0] << 8) | p[1]);
-    u32 sgn = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
-    if (exp == 0)        f = sgn << 31;
-    else if (exp == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
-    else                 f = (sgn << 31) | ((exp - 15u + 127u) << 23) | (man << 13);
-    float o; memcpy(&o, &f, 4); return o;
 }
 
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
@@ -77,9 +138,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
      * which isn't instanced, survived). */
     u32 ei = vi;
     if (a->frequency > 1) {
-        static int nofreq = -1;                 /* VP_NOFREQ: instancing kill-switch */
-        if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
-        if (!nofreq)
+        if (!vertex_nofreq())                   /* VP_NOFREQ: instancing kill-switch */
             ei = (st->frequency_divider_op & (1u << idx))
                      ? (vi % a->frequency)      /* MODULO: repeat mesh */
                      : (vi / a->frequency);     /* DIVIDE: per-instance */
