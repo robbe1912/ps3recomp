@@ -17,6 +17,7 @@ static void ensure_draw_record_capacity(void){if(s_d3d.draw_count==MAX_DRAWS){dr
 static u32 rsx_record_color_masks(const rsx_state*s){return s?s->color_mask:0;}
 static u32 rsx_blend_key(const rsx_state*s,int b){(void)s;return b;}
 static u32 rsx_cull_key(const rsx_state*s){(void)s;return 0;}
+static u64 rsx_polygon_offset_key(const rsx_state*s){(void)s;return 0;}
 static int vp_get_vs(const rsx_state*s){(void)s;return 0;}
 static void vp_record_cb(u32 i,int vs,D3D12DrawRecord*r){(void)i;(void)vs;(void)r;cb_calls++;}
 static u32 current_rt_off(u32*w,u32*h,u32*m){*w=*h=1;memset(m,0,12);return 0;}

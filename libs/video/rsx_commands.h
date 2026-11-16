@@ -190,6 +190,9 @@ extern "C" {
 #define NV4097_SET_DEPTH_TEST_ENABLE            0x00000A74
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
+#define NV4097_SET_POLY_OFFSET_FILL_ENABLE      0x00000A68
+#define NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR  0x00000A78
+#define NV4097_SET_POLYGON_OFFSET_BIAS          0x00000A7C
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
 #define NV4097_SET_STENCIL_FUNC                 0x00000330
 #define NV4097_SET_STENCIL_FUNC_REF             0x00000334
@@ -294,6 +297,10 @@ typedef struct rsx_state {
     int cull_face_enable;
     u32 cull_face;
     u32 front_face;
+
+    /* Polygon offset (NV4097 0x0A68 fill enable, 0x0A78 factor, 0x0A7C units) */
+    int poly_offset_fill;
+    float poly_offset_factor, poly_offset_units;
 
     /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
     u32 color_mask;

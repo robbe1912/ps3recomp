@@ -22,7 +22,7 @@ static HRESULT authored_compile(LPCVOID source,SIZE_T bytes,LPCSTR name,const D3
 #include "rsx_shader_bytecode_backend.h"
 #undef D3DCompile
 
-typedef struct {int vs_idx;u32 fp_addr,blend_key,rt_off,rt_fmt,fp_exp32,fp_ctrl,cmask,cull,fp_snap,fp_const_n,cb_slot;u64 ds_key;} D3D12DrawRecord;
+typedef struct {int vs_idx;u32 fp_addr,blend_key,rt_off,rt_fmt,fp_exp32,fp_ctrl,cmask,cull,fp_snap,fp_const_n,cb_slot;u64 ds_key,bias_key;} D3D12DrawRecord;
 #define DXGI_FORMAT_R8G8B8A8_UNORM 28
 @SINGLE_PSO@
 static int dr_num_rts(const D3D12DrawRecord*d){(void)d;return 1;}

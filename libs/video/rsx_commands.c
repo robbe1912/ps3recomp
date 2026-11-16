@@ -579,6 +579,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    /* Polygon offset: fill enable, then factor and units as raw floats. */
+    if (method == NV4097_SET_POLY_OFFSET_FILL_ENABLE) {
+        state->poly_offset_fill = data ? 1 : 0;
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR) {
+        memcpy(&state->poly_offset_factor, &data, sizeof data);
+        return 0;
+    }
+    if (method == NV4097_SET_POLYGON_OFFSET_BIAS) {
+        memcpy(&state->poly_offset_units, &data, sizeof data);
+        return 0;
+    }
+
     /* Shader programs */
     if (method == NV4097_SET_SHADER_PROGRAM) {
         /*

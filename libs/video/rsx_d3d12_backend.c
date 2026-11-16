@@ -95,6 +95,7 @@ typedef struct {
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
+    u64 bias_key;       /* raw polygon offset factor/units (PSO key) */
     u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
                          * (else BACK), bit2 front face is CCW. RSX culls back
                          * faces on most solid geometry; rendering everything
@@ -230,6 +231,7 @@ typedef struct {
                              * amplitude) -- address-only keying served the
                              * stale compile forever. */
     u32 cmask;              /* colour write mask (PSO key) */
+    u64 bias_key;       /* raw polygon offset factor/units (PSO key) */
     u32 cull;               /* packed face culling (PSO key) */
     u64 alias_key;          /* typed render-target sampling and remap identity */
     u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
@@ -2062,11 +2064,36 @@ static u8 gl_blend_op_d3d(u32 e)
  * plain 1/0 before any register arrives, so treat those defaults as BACK/CW. */
 static u32 rsx_cull_key(const rsx_state* st)
 {
-    if (!st || !st->cull_face_enable) return 0;
-    u32 k = 1u;
-    if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) k |= 2u;  /* FRONT */
-    if (st->front_face == 0x0901u) k |= 4u;                             /* CCW */
-    return k;
+    if (!st) return 0;
+    u32 key = st->front_face == 0x0901u ? 4u : 0u;
+    if (st->cull_face_enable) {
+        key |= 1u;
+        if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) key |= 2u;
+    }
+    return key;
+}
+/* Preserve both guest float bit patterns in draw, cache and prefetch identity.
+ * Only the D3D descriptor conversion rounds units to its integer API field. */
+static u64 rsx_polygon_offset_key(const rsx_state* st)
+{
+    if (!st || !st->poly_offset_fill) return 0;
+    u32 factor, units;
+    memcpy(&factor, &st->poly_offset_factor, sizeof factor);
+    memcpy(&units, &st->poly_offset_units, sizeof units);
+    return ((u64)factor << 32) | units;
+}
+static void rsx_polygon_depth_bias(u64 key, D3D12_RASTERIZER_DESC* rd)
+{
+    u32 factor_bits = (u32)(key >> 32), units_bits = (u32)key;
+    float units;
+    memcpy(&rd->SlopeScaledDepthBias, &factor_bits, sizeof factor_bits);
+    memcpy(&units, &units_bits, sizeof units);
+    const double value = (double)units;
+    if (!(value == value)) rd->DepthBias = 0;
+    else if (value <= -2147483648.0) rd->DepthBias = (-2147483647 - 1);
+    else if (value >= 2147483647.0) rd->DepthBias = 2147483647;
+    else rd->DepthBias = (INT)(value + (value < 0 ? -0.5 : 0.5));
+    rd->DepthBiasClamp = 0.0f;
 }
 
 static u32 rsx_blend_key(const rsx_state* st, int enable)
@@ -2156,7 +2183,7 @@ static VPFPEntry* vp_fp_cache_acquire(void)
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
+                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull, u64 bias_key,
                                           u32 cube_mask, const D3D12DrawRecord* dr)
 {
     u32 alias_mask = 0, alias_remap[16] = {0};
@@ -2224,14 +2251,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
-            s_d3d.vp_fp[i].cull == cull &&
+            s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].bias_key == bias_key &&
             s_d3d.vp_fp[i].cube_mask == cube_mask &&
             s_d3d.vp_fp[i].alias_key == alias_key)
             return s_d3d.vp_fp[i].pso;
     if(shader_prefetch_active){
-        struct {u32 address,control,cube,mask,cull,blend,alias_mask;int nrt;u32 format;u64 alias;u32 remap[16],points;} recipe;
+        struct {u32 address,control,cube,mask,cull,blend,alias_mask;int nrt;u32 format;u64 alias,bias;u32 remap[16],points;} recipe;
         memset(&recipe,0,sizeof(recipe));recipe.address=fp_addr;recipe.control=(u32)exp32;
-        recipe.cube=cube_mask;recipe.mask=cmask;recipe.cull=cull;recipe.blend=blend;recipe.nrt=nrt;recipe.format=(u32)rtfmt;
+        recipe.bias=bias_key;recipe.cube=cube_mask;recipe.mask=cmask;recipe.cull=cull;recipe.blend=blend;recipe.nrt=nrt;recipe.format=(u32)rtfmt;
         recipe.alias=alias_key;recipe.alias_mask=alias_mask;recipe.points=alias_points;memcpy(recipe.remap,alias_remap,sizeof(alias_remap));
         u32 bytes=rsx_fp_program_size(vm_base+off,VP_FP_UCODE_MAX);
         /* This fork still emits literal constants; include their exact payloads. */
@@ -2538,6 +2565,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       static int _cfl = -1; if (_cfl < 0) _cfl = getenv("CULL_FLIP") ? 1 : 0;
       pd.RasterizerState.FrontCounterClockwise =
           (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
+    rsx_polygon_depth_bias(bias_key, &pd.RasterizerState);
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
      * straight alpha; demosaic's effect passes blend OFF; DeferredShading's
      * light accumulation is additive ONE,ONE. */
@@ -2609,6 +2637,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     cached->ucode_hash = uhash;
     cached->cmask   = cmask;
     cached->cull    = cull;
+    cached->bias_key = bias_key;
     cached->cube_mask = cube_mask;
     cached->alias_key = alias_key;
     cached->sampler_mask = rsx_address_sampler_mask(hlsl);
@@ -4138,7 +4167,7 @@ static void shader_compile_draw(D3D12DrawRecord* dr)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr), dr);
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr->bias_key, dr_cube_mask(dr), dr);
 }
 
 static void shader_prepare_draw(D3D12DrawRecord* dr,int use_pool)
@@ -5023,7 +5052,7 @@ static void render_frame(void)
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask, dr->cull,
+                                                dr->fp_exp32, dr->cmask, dr->cull, dr->bias_key,
                                                 dr_cube_mask(dr), dr) : NULL;
                 ID3D12PipelineState* next_pso = rsx_d3d12_fallback_select(dpso, s_d3d.tex_ready, 1,
                     s_d3d.pipeline_state_vp, s_d3d.pipeline_state_vp_color,
@@ -6550,6 +6579,7 @@ static int vp_triangle_can_merge(u32 primitive, u32 first, u32 rec)
     return pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
         pv->fp_addr == (state ? state->shader_program : 0) &&
         pv->cmask == rsx_record_color_masks(state) &&
+        pv->cull == rsx_cull_key(state) && pv->bias_key == rsx_polygon_offset_key(state) &&
         pv->blend_key == rsx_blend_key(state, state ? state->blend_enable : 1) &&
         pv->begin_epoch == (state ? state->begin_epoch : 0) &&
         (u64)pv->vb_byte_offset + (u64)pv->vertex_count * VP_VERT_STRIDE == rec;
@@ -6605,6 +6635,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+                dr->bias_key = rsx_polygon_offset_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = rsx_record_color_masks(s_d3d.current_rsx_state);
@@ -6711,6 +6742,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+            dr->bias_key = rsx_polygon_offset_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = rsx_record_color_masks(s_d3d.current_rsx_state);
@@ -6841,6 +6873,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->bias_key = rsx_polygon_offset_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = rsx_record_color_masks(s_d3d.current_rsx_state);
         dr->alpha_ctl = 0;
