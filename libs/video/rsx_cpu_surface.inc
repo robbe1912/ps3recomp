@@ -2,6 +2,7 @@
 #include "ps3emu/guest_read_sync.h"
 #include "rsx_surface_readback.h"
 #include "rsx_cpu_surface_profile.h"
+#include <stdatomic.h>
 #include "rsx_cpu_surface_snapshot.h"
 #include "rsx_fifo_boundary.h"
 typedef struct CpuSurfaceRequest {
@@ -19,7 +20,8 @@ typedef struct CpuSurfaceRequest {
     RsxCpuSurfaceProfile profile;
 } CpuSurfaceRequest;
 static SRWLOCK s_cpu_surface_lock = SRWLOCK_INIT;
-static CpuSurfaceRequest *s_cpu_surface_head, *s_cpu_surface_tail;
+static _Atomic(CpuSurfaceRequest*) s_cpu_surface_head;
+static CpuSurfaceRequest *s_cpu_surface_tail;
 static volatile LONG s_cpu_surface_thread;
 static ID3D12CommandAllocator *s_cpu_surface_alloc;
 static ID3D12GraphicsCommandList *s_cpu_surface_list;
@@ -365,10 +367,79 @@ static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 co
     request.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&request);CloseHandle(request.done);
     return request.snapshot_result;
 }
+/* Prompt service between batches. A queued read is otherwise served at the
+ * end of the renderer's next batch or by its idle pump, so it also waits out
+ * whatever the renderer records and replays meanwhile (in MotorStorm races
+ * ~37 ms per read of a surface whose last write was submitted long before).
+ * While the renderer records, the GPU surfaces hold exactly the submitted
+ * batches; the only pending changes are the draws recorded since. A read that
+ * overlaps none of their colour targets sees the same bytes now as it would
+ * at the batch end, so the renderer serves it at its next recorded draw.
+ * Reads overlapping a pending write wait for the batch as before. Never runs
+ * inside render_frame (states and generations move there).
+ * RSX_CPU_SURFACE_PROMPT=0 keeps batch-end/idle service only. */
+#define CPU_SURFACE_PENDING_MAX 64
+typedef struct CpuSurfaceRange { u64 begin, end; } CpuSurfaceRange;
+static CpuSurfaceRange s_cpu_surface_pending[CPU_SURFACE_PENDING_MAX];
+static unsigned s_cpu_surface_pending_count;
+static int s_cpu_surface_pending_overflow;
+static int s_cpu_surface_prompt;
+static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+    if(!address || address==0xffffffffu || !pitch)return;
+    if(!height){s_cpu_surface_pending_overflow=1;return;}   /* unknown extent: serve nothing early */
+    u64 begin=address,end=begin+(u64)pitch*height;
+    for(unsigned i=0;i<s_cpu_surface_pending_count;i++)
+        if(s_cpu_surface_pending[i].begin<=begin && end<=s_cpu_surface_pending[i].end)return;
+    if(s_cpu_surface_pending_count==CPU_SURFACE_PENDING_MAX){s_cpu_surface_pending_overflow=1;return;}
+    s_cpu_surface_pending[s_cpu_surface_pending_count].begin=begin;
+    s_cpu_surface_pending[s_cpu_surface_pending_count++].end=end;
+}
+static int cpu_surface_pending_overlaps(u32 address,u32 bytes) {
+    if(s_cpu_surface_pending_overflow)return 1;
+    for(unsigned i=0;i<s_cpu_surface_pending_count;i++)
+        if((u64)address<s_cpu_surface_pending[i].end && (u64)address+bytes>s_cpu_surface_pending[i].begin)return 1;
+    return 0;
+}
+/* render_frame consumed and submitted every recorded draw. */
+static void cpu_surface_batch_submitted(void) {
+    s_cpu_surface_pending_count=0;s_cpu_surface_pending_overflow=0;
+}
+static void cpu_surface_service_ready(void) {
+    if(!s_cpu_surface_prompt)return;
+    if(!atomic_load_explicit(&s_cpu_surface_head,memory_order_acquire))return;
+    if(InterlockedCompareExchange(&s_cpu_surface_thread,0,0)!=(LONG)GetCurrentThreadId())return;
+    if(s_cpu_surface_recording)return;
+    CpuSurfaceRequest *ready=NULL,**ready_tail=&ready,*kept=NULL;
+    AcquireSRWLockExclusive(&s_cpu_surface_lock);
+    CpuSurfaceRequest *pending=s_cpu_surface_head;
+    for(CpuSurfaceRequest **link=&pending;*link;) {
+        CpuSurfaceRequest *request=*link;
+        /* Snapshot requests retain their existing owned FIFO-boundary barrier. */
+        if(request->snapshot_ranges){kept=s_cpu_surface_tail;break;}
+        if(cpu_surface_pending_overlaps(request->address,request->bytes)){kept=request;link=&request->next;continue;}
+        *link=request->next;request->next=NULL;*ready_tail=request;ready_tail=&request->next;
+    }
+    atomic_store_explicit(&s_cpu_surface_head,pending,memory_order_release);
+    s_cpu_surface_tail=kept;
+    ReleaseSRWLockExclusive(&s_cpu_surface_lock);
+    while(ready) {
+        CpuSurfaceRequest *next=ready->next;
+        ready->profile.started=cpu_surface_tick();
+        s_cpu_surface_profile_active=s_cpu_surface_profile?&ready->profile:NULL;
+        cpu_surface_read(ready->address,ready->bytes);ready->status=0;
+        s_cpu_surface_profile_active=NULL;
+        ready->profile.finished=cpu_surface_tick();
+        if(!SetEvent(ready->done))cpu_surface_fail("CPU completion event",E_FAIL);
+        ready=next;
+    }
+}
 static void cpu_surface_init(void) {
     s_cpu_surface_thread=0;
     const char *profile=getenv("RSX_CPU_SURFACE_PROFILE");
     s_cpu_surface_profile=profile&&profile[0]=='1'&&!profile[1];
+    const char *prompt=getenv("RSX_CPU_SURFACE_PROMPT");
+    s_cpu_surface_prompt=!(prompt&&prompt[0]=='0'&&!prompt[1]);
+    cpu_surface_batch_submitted();
     if(s_cpu_surface_profile) {
         LARGE_INTEGER f;if(!QueryPerformanceFrequency(&f)||f.QuadPart<=0)cpu_surface_fail("profile frequency",E_FAIL);
         s_cpu_surface_profile_frequency=(u64)f.QuadPart;
@@ -414,6 +485,8 @@ static void cpu_surface_capture(D3D12DrawRecord *draw) {
         draw->cpu_address[i]=cellGcmResolveLocated(dma==CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER,st->surface_color_offset[source]);
         draw->cpu_pitch[i]=st->surface_color_pitch[source];
     }
+    for(unsigned i=0;i<4;i++)cpu_surface_pending_add(draw->cpu_address[i],draw->cpu_pitch[i],draw->rt_h);
+    cpu_surface_service_ready();
 }
 static void cpu_surface_bind(int index,const D3D12DrawRecord *draw,unsigned target) {
     if(index<0)return;OffRT *r=&s_d3d.off_rt[index];
