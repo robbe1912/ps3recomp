@@ -1,5 +1,5 @@
-# Builds a downloadable SDK bundle for each supported platform and attaches it
-# to the GitHub release when a v* tag is pushed.
+# Validates SDK source changes on each supported platform and builds bundles.
+# A v* tag also attaches those bundles to the GitHub release.
 #
 # Why: a release with no binaries makes every would-be port author reproduce the
 # whole toolchain setup (clang-cl + Ninja under vcvars) before they can even try
@@ -14,7 +14,27 @@ name: Release
 
 on:
   push:
+    branches: [master, main, combined, 'codex/**']
     tags: [ 'v*' ]
+    paths:
+      - CMakeLists.txt
+      - cmake/**
+      - runtime/**
+      - libs/**
+      - include/**
+      - tools/**
+      - tests/**
+      - .github/workflows/release.yml
+  pull_request:
+    paths:
+      - CMakeLists.txt
+      - cmake/**
+      - runtime/**
+      - libs/**
+      - include/**
+      - tools/**
+      - tests/**
+      - .github/workflows/release.yml
   workflow_dispatch:      # dry run: builds and uploads to the run, publishes nothing
 
 permissions:
