@@ -84,9 +84,245 @@ static void cpu_surface_fence_wait(void) {
     }
 }
 
+/* GPU fence completion. A removed device reports UINT64_MAX as the completed
+ * value of every fence; that is a failure, never a completion. */
+static int cpu_surface_fence_reached(ID3D12Fence *fence,u64 value) {
+    u64 completed=fence->lpVtbl->GetCompletedValue(fence);
+    if(completed==UINT64_MAX) {
+        HRESULT reason=s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+        cpu_surface_fail("GPU fence (device removed)",FAILED(reason)?reason:E_FAIL);
+    }
+    return completed>=value;
+}
+static void cpu_surface_fence_block(ID3D12Fence *fence,HANDLE event,u64 value,const char *operation) {
+    if(cpu_surface_fence_reached(fence,value))return;
+    CPU_SURFACE_HR(fence->lpVtbl->SetEventOnCompletion(fence,value,event));
+    if(WaitForSingleObject(event,30000)!=WAIT_OBJECT_0 || !cpu_surface_fence_reached(fence,value))cpu_surface_fail(operation,E_FAIL);
+}
+/* Prefetched copies of opted-in surfaces. RSX_CPU_SURFACE_PREFETCH lists up
+ * to four RSX surface offsets (1-8 hex digits each, comma separated); none by
+ * default. Reads stay coherent: a CPU read sees the surface as of every write
+ * submitted before it is served (its current gpu_generation), exactly as with
+ * an empty list. Only the source of those bytes changes. After each submitted
+ * batch, a listed surface that the CPU has read since its last copy and that
+ * has a newer generation gets a copy queued behind that batch. When a read
+ * then needs exactly that generation, the renderer packs the prefetched copy,
+ * waiting only for that copy's own fence (usually already passed) instead of
+ * a fence behind all submitted work followed by a fresh copy. Anything else
+ * (no copy, an older generation, a changed layout) takes the coherent copy.
+ * In MotorStorm races the main thread reads the 2048x2048 deformation surface
+ * (offset 01A80500) hundreds of times a second, probes a 1280x720 surface
+ * (00A80500) and reads the 64x64 HDR exposure target (02A30480); the
+ * launcher's --surface-prefetch 1 lists those three.
+ * RSX_CPU_SURFACE_PREFETCH_LOG=1 prints used/waited/missed/copy counts. */
+#define CPU_SURFACE_PREFETCH_MAX 4
+typedef struct CpuSurfacePrefetch {
+    u32 off;
+    int slot;                     /* tracked OffRT index, -1 none */
+    int wanted;                   /* read since the last copy was queued */
+    u32 address, pitch, w, width, height, format;   /* layout of the queued copy */
+    u64 generation;               /* gpu_generation the queued copy holds, 0 none */
+    u64 fence;                    /* prefetch fence value that completes it */
+    ID3D12Resource *readback;
+    u64 readback_bytes;
+    u32 readback_pitch;
+    unsigned long long copies, used, waited, missed;
+} CpuSurfacePrefetch;
+static CpuSurfacePrefetch s_cpu_surface_prefetch[CPU_SURFACE_PREFETCH_MAX];
+static unsigned s_cpu_surface_prefetch_count;
+static int s_cpu_surface_prefetch_log;
+static ID3D12CommandAllocator *s_cpu_surface_prefetch_alloc;
+static ID3D12GraphicsCommandList *s_cpu_surface_prefetch_list;
+static ID3D12Fence *s_cpu_surface_prefetch_fence;
+static HANDLE s_cpu_surface_prefetch_event;
+static u64 s_cpu_surface_prefetch_fence_value;   /* last value signalled */
+static int cpu_surface_hex_digit(char c) {
+    return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;
+}
+static void cpu_surface_prefetch_configure(const char *list) {
+    s_cpu_surface_prefetch_count=0;
+    if(!list || !*list)return;
+    for(;;) {
+        u64 off=0;unsigned digits=0;int d;
+        while((d=cpu_surface_hex_digit(*list))>=0){off=off*16u+(u64)d;list++;
+            if(++digits>8)cpu_surface_fail("RSX_CPU_SURFACE_PREFETCH (offsets are 1-8 hex digits)",E_INVALIDARG);}
+        if(!digits || (*list && *list!=',') || s_cpu_surface_prefetch_count==CPU_SURFACE_PREFETCH_MAX)
+            cpu_surface_fail("RSX_CPU_SURFACE_PREFETCH (up to 4 comma-separated hex offsets)",E_INVALIDARG);
+        for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++)
+            if(s_cpu_surface_prefetch[i].off==(u32)off)cpu_surface_fail("RSX_CPU_SURFACE_PREFETCH (duplicate offset)",E_INVALIDARG);
+        CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[s_cpu_surface_prefetch_count++];
+        memset(e,0,sizeof *e);e->off=(u32)off;e->slot=-1;
+        if(!*list)return;
+        list++;
+    }
+}
+static void cpu_surface_prefetch_untrack(CpuSurfacePrefetch *e) {
+    e->slot=-1;e->wanted=0;e->generation=0;e->fence=0;
+    e->address=e->pitch=e->w=e->width=e->height=e->format=0;
+}
+/* Packed guest width of r's copy; 0 when r cannot be prefetched. */
+static u32 cpu_surface_prefetch_width(const OffRT *r) {
+    unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);
+    if(!bpp || !r->cpu_address || !r->cpu_pitch || r->cpu_pitch%bpp || !r->w || !r->h)return 0;
+    if((u64)r->cpu_address+(u64)r->cpu_pitch*r->h>0x100000000ull)return 0;
+    u32 width=r->w;if(width>r->cpu_pitch/bpp)width=r->cpu_pitch/bpp;
+    return width;
+}
+static CpuSurfacePrefetch *cpu_surface_prefetch_entry(const OffRT *r) {
+    for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
+        CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];
+        if(e->slot>=0 && &s_d3d.off_rt[e->slot]==r)return e;
+    }
+    return NULL;
+}
+/* A CPU read matched r: copy its next generation ahead. */
+static void cpu_surface_prefetch_note(const OffRT *r) {
+    CpuSurfacePrefetch *e=cpu_surface_prefetch_entry(r);
+    if(e)e->wanted=1;
+}
+/* Serve a read of r from its prefetched copy if that copy holds r's current
+ * generation in r's current layout. Returns 1 when vm_base now holds it. */
+static int cpu_surface_prefetch_take(OffRT *r) {
+    extern uint8_t *vm_base;
+    CpuSurfacePrefetch *e=cpu_surface_prefetch_entry(r);
+    if(!e)return 0;
+    u32 width=cpu_surface_prefetch_width(r);
+    if(!e->generation || e->generation!=r->gpu_generation || !width || width!=e->width || r->w!=e->w ||
+       r->cpu_address!=e->address || r->cpu_pitch!=e->pitch || r->h!=e->height || r->cpu_format!=e->format){e->missed++;return 0;}
+    if(!cpu_surface_fence_reached(s_cpu_surface_prefetch_fence,e->fence)) {
+        e->waited++;cpu_surface_fence_block(s_cpu_surface_prefetch_fence,s_cpu_surface_prefetch_event,e->fence,"prefetch GPU fence wait");
+    }
+    D3D12_RANGE range={0,(SIZE_T)e->readback_bytes};void *mapped=NULL;
+    CPU_SURFACE_HR(e->readback->lpVtbl->Map(e->readback,0,&range,&mapped));
+    if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)((u64)r->cpu_pitch*r->h),r->cpu_pitch,
+        mapped,(size_t)e->readback_bytes,e->readback_pitch,width,r->h,r->cpu_format))cpu_surface_fail("prefetched surface packing",E_INVALIDARG);
+    D3D12_RANGE empty={0,0};e->readback->lpVtbl->Unmap(e->readback,0,&empty);
+    r->cpu_generation=r->gpu_generation;e->used++;
+    return 1;
+}
+/* Follow the surface at e->off. Returns it, or NULL when it is not live. */
+static OffRT *cpu_surface_prefetch_track(CpuSurfacePrefetch *e) {
+    for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
+        OffRT *r=&s_d3d.off_rt[i];
+        if(r->res && r->off==e->off && r->cpu_address && r->cpu_pitch) {
+            if(e->slot!=i){cpu_surface_prefetch_untrack(e);e->slot=i;}
+            return r;
+        }
+    }
+    if(e->slot>=0)cpu_surface_prefetch_untrack(e);
+    return NULL;
+}
+/* Queue copies of the given surfaces behind every batch submitted so far. */
+static void cpu_surface_prefetch_issue(CpuSurfacePrefetch **entries,OffRT **surfaces,unsigned count) {
+    CPU_SURFACE_HR(s_cpu_surface_prefetch_alloc->lpVtbl->Reset(s_cpu_surface_prefetch_alloc));
+    CPU_SURFACE_HR(s_cpu_surface_prefetch_list->lpVtbl->Reset(s_cpu_surface_prefetch_list,s_cpu_surface_prefetch_alloc,NULL));
+    for(unsigned i=0;i<count;i++) {
+        CpuSurfacePrefetch *e=entries[i];OffRT *r=surfaces[i];
+        u32 pitch=rsx_surface_readback_host_pitch(r->w,r->cpu_format,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        u64 bytes=(u64)pitch*r->h;
+        if(!pitch || bytes>256u*1024u*1024u)cpu_surface_fail("prefetch surface copy bounds",E_INVALIDARG);
+        if(e->readback && e->readback_bytes!=bytes){e->readback->lpVtbl->Release(e->readback);e->readback=NULL;}
+        if(!e->readback) {
+            D3D12_HEAP_PROPERTIES hp={0};hp.Type=D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC desc={0};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width=bytes;desc.Height=1;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;
+            desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device,&hp,D3D12_HEAP_FLAG_NONE,&desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,NULL,&IID_ID3D12Resource,(void **)&e->readback));
+            e->readback_bytes=bytes;
+        }
+        e->readback_pitch=pitch;
+        D3D12_RESOURCE_BARRIER barrier={0};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource=r->res;barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore=r->st;barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        if(r->st!=D3D12_RESOURCE_STATE_COPY_SOURCE)s_cpu_surface_prefetch_list->lpVtbl->ResourceBarrier(s_cpu_surface_prefetch_list,1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src={0},dst={0};src.pResource=r->res;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=e->readback;dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint.Format=(DXGI_FORMAT)r->dxgi;
+        dst.PlacedFootprint.Footprint.Width=r->w;dst.PlacedFootprint.Footprint.Height=r->h;
+        dst.PlacedFootprint.Footprint.Depth=1;dst.PlacedFootprint.Footprint.RowPitch=pitch;
+        s_cpu_surface_prefetch_list->lpVtbl->CopyTextureRegion(s_cpu_surface_prefetch_list,&dst,0,0,0,&src,NULL);
+        if(r->st!=D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;barrier.Transition.StateAfter=r->st;
+            s_cpu_surface_prefetch_list->lpVtbl->ResourceBarrier(s_cpu_surface_prefetch_list,1,&barrier);
+        }
+    }
+    CPU_SURFACE_HR(s_cpu_surface_prefetch_list->lpVtbl->Close(s_cpu_surface_prefetch_list));
+    ID3D12CommandList *lists[]={(ID3D12CommandList *)s_cpu_surface_prefetch_list};
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue,1,lists);
+    CPU_SURFACE_HR(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue,s_cpu_surface_prefetch_fence,++s_cpu_surface_prefetch_fence_value));
+}
+static void cpu_surface_prefetch_print(void) {
+    for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
+        CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];
+        fprintf(stderr,"[CPUSURFACE_PREFETCH] offset=%08X used=%llu waited=%llu missed=%llu copies=%llu\n",
+            e->off,e->used,e->waited,e->missed,e->copies);
+    }
+}
+/* Prefetch refresh, once per submitted batch. */
+static void cpu_surface_prefetch_refresh(void) {
+    if(!s_cpu_surface_prefetch_count)return;
+    if(s_cpu_surface_recording)cpu_surface_fail("surface prefetch before command submission",E_FAIL);
+    CpuSurfacePrefetch *entries[CPU_SURFACE_PREFETCH_MAX];OffRT *surfaces[CPU_SURFACE_PREFETCH_MAX];unsigned count=0;
+    for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
+        CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];OffRT *r=cpu_surface_prefetch_track(e);
+        if(r && e->wanted && r->gpu_generation && r->gpu_generation!=e->generation && cpu_surface_prefetch_width(r)){entries[count]=e;surfaces[count++]=r;}
+    }
+    if(!count)return;
+    /* The allocator still backs the last copies until their fence passes. */
+    if(!cpu_surface_fence_reached(s_cpu_surface_prefetch_fence,s_cpu_surface_prefetch_fence_value))return;
+    cpu_surface_prefetch_issue(entries,surfaces,count);
+    for(unsigned i=0;i<count;i++) {
+        CpuSurfacePrefetch *e=entries[i];OffRT *r=surfaces[i];
+        e->generation=r->gpu_generation;e->fence=s_cpu_surface_prefetch_fence_value;e->wanted=0;e->copies++;
+        e->address=r->cpu_address;e->pitch=r->cpu_pitch;e->w=r->w;e->width=cpu_surface_prefetch_width(r);e->height=r->h;e->format=r->cpu_format;
+    }
+    static unsigned long long issues;
+    if(s_cpu_surface_prefetch_log && !(++issues%1000))cpu_surface_prefetch_print();
+}
+/* r is being retired: its copy must not outlive the resource or be reused. */
+static void cpu_surface_prefetch_retire(OffRT *r) {
+    CpuSurfacePrefetch *e=cpu_surface_prefetch_entry(r);
+    if(!e)return;
+    if(e->generation)cpu_surface_fence_block(s_cpu_surface_prefetch_fence,s_cpu_surface_prefetch_event,e->fence,"prefetch GPU fence wait");
+    cpu_surface_prefetch_untrack(e);
+}
+static void cpu_surface_prefetch_init(void) {
+    cpu_surface_prefetch_configure(getenv("RSX_CPU_SURFACE_PREFETCH"));
+    const char *log=getenv("RSX_CPU_SURFACE_PREFETCH_LOG");
+    s_cpu_surface_prefetch_log=log&&log[0]=='1'&&!log[1];
+    s_cpu_surface_prefetch_fence_value=0;
+    if(!s_cpu_surface_prefetch_count)return;
+    CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateCommandAllocator(s_d3d.device,D3D12_COMMAND_LIST_TYPE_DIRECT,
+        &IID_ID3D12CommandAllocator,(void **)&s_cpu_surface_prefetch_alloc));
+    CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateCommandList(s_d3d.device,0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+        s_cpu_surface_prefetch_alloc,NULL,&IID_ID3D12GraphicsCommandList,(void **)&s_cpu_surface_prefetch_list));
+    CPU_SURFACE_HR(s_cpu_surface_prefetch_list->lpVtbl->Close(s_cpu_surface_prefetch_list));
+    CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateFence(s_d3d.device,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void **)&s_cpu_surface_prefetch_fence));
+    s_cpu_surface_prefetch_event=CreateEventA(NULL,FALSE,FALSE,NULL);if(!s_cpu_surface_prefetch_event)cpu_surface_fail("prefetch GPU event creation",E_FAIL);
+    for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++)
+        fprintf(stderr,"[CPUSURFACE_PREFETCH] enabled offset=%08X\n",s_cpu_surface_prefetch[i].off);
+}
+static void cpu_surface_prefetch_shutdown(void) {
+    if(!s_cpu_surface_prefetch_count)return;
+    cpu_surface_fence_block(s_cpu_surface_prefetch_fence,s_cpu_surface_prefetch_event,s_cpu_surface_prefetch_fence_value,"prefetch GPU fence wait");
+    if(s_cpu_surface_prefetch_log)cpu_surface_prefetch_print();
+    for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
+        CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];
+        cpu_surface_prefetch_untrack(e);
+        if(e->readback){e->readback->lpVtbl->Release(e->readback);e->readback=NULL;}
+    }
+    s_cpu_surface_prefetch_count=0;
+    if(s_cpu_surface_prefetch_list)s_cpu_surface_prefetch_list->lpVtbl->Release(s_cpu_surface_prefetch_list);
+    if(s_cpu_surface_prefetch_alloc)s_cpu_surface_prefetch_alloc->lpVtbl->Release(s_cpu_surface_prefetch_alloc);
+    if(s_cpu_surface_prefetch_fence)s_cpu_surface_prefetch_fence->lpVtbl->Release(s_cpu_surface_prefetch_fence);
+    if(s_cpu_surface_prefetch_event)CloseHandle(s_cpu_surface_prefetch_event);
+    s_cpu_surface_prefetch_list=NULL;s_cpu_surface_prefetch_alloc=NULL;s_cpu_surface_prefetch_fence=NULL;s_cpu_surface_prefetch_event=NULL;
+}
 static void cpu_surface_copy(OffRT *r) {
     extern uint8_t *vm_base;
     if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation){if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->hits++;return;}
+    if(cpu_surface_prefetch_take(r))return;
     unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);
     if(!bpp || r->cpu_pitch%bpp)cpu_surface_fail("unsupported guest surface layout",E_INVALIDARG);
     u32 width=r->w;
@@ -158,6 +394,7 @@ static void cpu_surface_read(u32 address,u32 bytes) {
         if((u64)address<end && (u64)address+bytes>r->cpu_address){
             if(s_cpu_surface_recording && r->gpu_generation && r->cpu_generation!=r->gpu_generation)cpu_surface_fail("CPU load requires pending recorded surface writes",E_FAIL);
             if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->matched++;
+            cpu_surface_prefetch_note(r);
             cpu_surface_copy(r);
         }
     }
@@ -480,9 +717,11 @@ static void cpu_surface_init(void) {
     CPU_SURFACE_HR(s_cpu_surface_list->lpVtbl->Close(s_cpu_surface_list));
     CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateFence(s_d3d.device,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void **)&s_cpu_surface_fence));
     s_cpu_surface_event=CreateEventA(NULL,FALSE,FALSE,NULL);if(!s_cpu_surface_event)cpu_surface_fail("GPU event creation",E_FAIL);
+    cpu_surface_prefetch_init();
     s_cpu_surface_live=1;vm_read_snapshot_set_handler(cpu_surface_snapshot_request,NULL);vm_read_sync_set_handler(cpu_surface_request,NULL);
 }
 static void cpu_surface_retire(OffRT *r) {
+    cpu_surface_prefetch_retire(r);
     cpu_surface_copy(r);
     if(r->cpu_readback){r->cpu_readback->lpVtbl->Release(r->cpu_readback);r->cpu_readback=NULL;}
     r->cpu_address=r->cpu_pitch=0;r->gpu_generation=r->cpu_generation=0;
@@ -490,6 +729,7 @@ static void cpu_surface_retire(OffRT *r) {
 static void cpu_surface_shutdown(void) {
     vm_read_sync_set_handler(NULL,NULL);
     vm_read_snapshot_set_handler(NULL,NULL);
+    cpu_surface_prefetch_shutdown();
     AcquireSRWLockExclusive(&s_cpu_surface_lock);
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++)cpu_surface_retire(&s_d3d.off_rt[i]);
     s_cpu_surface_live=0;

@@ -120,11 +120,11 @@ jobs:
                   echo "D3D12 snapshot coverage runs on Windows"
                 fi
                 ;;
-              tools/test_rsx_texture_gpu.py)
+              tools/test_rsx_texture_gpu.py|tools/test_cpu_surface_prefetch_gpu.py)
                 if [ "$RUNNER_OS" = "Windows" ]; then
                   python "$t" --adapter warp
                 else
-                  echo "D3D12 texture coverage runs on Windows"
+                  echo "D3D12 texture and surface-prefetch coverage runs on Windows"
                 fi
                 ;;
               *) python "$t" ;;

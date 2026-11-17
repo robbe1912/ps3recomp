@@ -106,8 +106,8 @@ assert wrong_packing != packing
 report['wrong_channel_header_sha256'] = hashlib.sha256((OUT / 'wrong-channel.h').read_bytes()).hexdigest()
 mutants = {
     'skip-retirement-flush': body.replace(
-        'static void cpu_surface_retire(OffRT *r) {\n    cpu_surface_copy(r);',
-        'static void cpu_surface_retire(OffRT *r) {\n    /* omitted flush */', 1),
+        'static void cpu_surface_retire(OffRT *r) {\n    cpu_surface_prefetch_retire(r);\n    cpu_surface_copy(r);',
+        'static void cpu_surface_retire(OffRT *r) {\n    cpu_surface_prefetch_retire(r);\n    /* omitted flush */', 1),
     'unreadable-commit': body.replace(
         'copied!=ranges[i].bytes)\n            return VM_READ_SNAPSHOT_UNAVAILABLE;',
         'copied!=ranges[i].bytes)\n            return VM_READ_SNAPSHOT_OK;', 1),
@@ -120,7 +120,7 @@ mutants = {
     'missing-trace': body.replace('            cpu_surface_snapshot_trace(request);', '', 1),
     'wrong-view-pitch': body.replace('target->cpu_address,target->cpu_pitch,target->h,target->cpu_format,', 'target->cpu_address,target->cpu_pitch+1,target->h,target->cpu_format,', 1),
     'repeated-cap': body.replace('sequence>64)return;', 'sequence==UINT32_MAX)return;', 1),
-    'skip-dirty-copy': body.replace('    unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);', '    return;\n    unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);'),
+    'skip-dirty-copy': body.replace('static void cpu_surface_copy(OffRT *r) {', 'static void cpu_surface_copy(OffRT *r) {\n    return;', 1),
     'stale-clean-generation': body.replace('r->cpu_generation=r->gpu_generation;', 'r->cpu_generation=0;'),
     'wrong-byte-channel': body.replace('#include "rsx_surface_readback.h"', '#include "wrong-channel.h"'),
 }

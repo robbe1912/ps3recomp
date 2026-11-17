@@ -1,0 +1,36 @@
+name: Coherent CPU surface prefetch
+on:
+  push:
+    branches: [master, main, combined, 'codex/**']
+    paths: ['libs/video/rsx_cpu_surface.inc', 'libs/video/rsx_d3d12_backend.c', 'libs/video/rsx_surface_readback.h', 'libs/video/tests/*surface_prefetch*', 'tools/test_cpu_surface_prefetch*.py', '.github/workflows/cpu-surface-prefetch.yml']
+  pull_request:
+    paths: ['libs/video/rsx_cpu_surface.inc', 'libs/video/rsx_d3d12_backend.c', 'libs/video/rsx_surface_readback.h', 'libs/video/tests/*surface_prefetch*', 'tools/test_cpu_surface_prefetch*.py', '.github/workflows/cpu-surface-prefetch.yml']
+  workflow_dispatch:
+jobs:
+  prefetch:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python tools/test_cpu_surface_prefetch.py
+      - run: python tools/test_cpu_surface_prefetch_gpu.py --adapter warp
+        if: runner.os == 'Windows'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coherent-prefetch-${{ matrix.os }}
+          path: |
+            build/cpu-surface-prefetch-tests/**/*.log
+            build/cpu-surface-prefetch-tests/**/*.json
+            temp/checks/surface-prefetch-gpu-*/**/*.log
+            temp/checks/surface-prefetch-gpu-*/**/*.json
+          retention-days: 5

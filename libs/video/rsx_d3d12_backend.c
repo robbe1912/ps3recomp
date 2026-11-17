@@ -5606,6 +5606,7 @@ skip_dump_consider: ;
         }
     }
     cpu_surface_batch_submitted();
+    cpu_surface_prefetch_refresh();
     cpu_surface_frame_complete();
     if (perf_on()) perf_batch_finish(_rf0);
 }
