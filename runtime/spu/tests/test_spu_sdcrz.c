@@ -33,7 +33,51 @@ static void reserve(uint32_t ea) {
     assert(spu_mfc_atomic(&peer,MFC_GETLLAR_CMD));assert(peer.resv_valid);
     peer.event_status=0;
 }
-int main(void) {
+static int issue_repeat_get(spu_context* ctx, uint32_t size) {
+    ctx->mfc_eal = 0x20000;
+    ctx->mfc_eah = 0;
+    ctx->mfc_lsa = 0x1000;
+    ctx->mfc_size = size;
+    ctx->mfc_tag = 5;
+    if (setjmp(s_spu_halt_env)) return 1;
+    s_spu_halt_armed = 1;
+    mfc_engine* engine = mfc_for(ctx);
+    assert(mfc_submit(engine, ctx, 0x40) == 0);
+    s_spu_halt_armed = 0;
+    assert(!memcmp(ctx->ls + 0x1000, guest + 0x20000, size));
+    assert(engine->tag_completed & (1u << 5));
+    return 0;
+}
+
+static void check_repeat_ownership(void) {
+    /* Limit is four repetitions after the initial issue. */
+    spu_context_init(&writer, 0);
+    spu_context_init(&peer, 1);
+    memset(guest + 0x20000, 0x5a, 128);
+    for (unsigned i = 0; i < 4; ++i) {
+        assert(!issue_repeat_get(&writer, 128));
+        assert(!issue_repeat_get(&peer, 128));
+    }
+    assert(issue_repeat_get(&writer, 128));
+    assert(issue_repeat_get(&peer, 128));
+
+    for (unsigned i = 0; i < 8; ++i)
+        assert(!issue_repeat_get(&writer, i & 1 ? 64 : 128));
+    /* Bring the old engine one issue short of halting, then recycle it. */
+    for (unsigned i = 0; i < 4; ++i)
+        assert(!issue_repeat_get(&writer, 128));
+    spu_mfc_release(&writer);
+    assert(!issue_repeat_get(&writer, 128));
+    spu_mfc_release(&writer);
+    spu_mfc_release(&peer);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "repeat-ownership") == 0) {
+        check_repeat_ownership();
+        puts("PASS: MFC repeat counts follow engine ownership and transfer size");
+        return 0;
+    }
     const uint32_t ea=0x20000;
     spu_context_init(&writer,0);writer.image_id=-1;
     spu_context_init(&peer,0);peer.image_id=-1;

@@ -28,3 +28,5 @@ with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:
                     str(root / "runtime/memory/guest_read_sync.c"), "-lm",
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10, env=env, cwd=tmp)
+    subprocess.run([str(binary), "repeat-ownership"], check=True, timeout=10,
+                   env={**env, "SPU_DMA_REPEAT_LIMIT": "4"}, cwd=tmp)
