@@ -70,7 +70,8 @@ def build(out, label, mutations=()):
     target = out / label
     target.mkdir()
     header_text = lifted_header(target)
-    shutil.copy(HANDOFF, target / 'spu_interpreter_handoff.c')
+    handoff = HANDOFF.read_text(encoding='utf-8').replace('#include "../spu_', '#include "spu_')
+    (target / 'spu_interpreter_handoff.c').write_text(handoff, encoding='utf-8')
     sources = [FIXTURE, *[SPU / n for n in NAMES], *[SDK / p for p in EXTRA]]
     header = (SPU / 'spu_native_owned.h').read_text(encoding='utf-8')
     if mutations:
