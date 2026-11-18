@@ -604,6 +604,80 @@ static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 co
     request.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&request);CloseHandle(request.done);
     return request.snapshot_result;
 }
+/* Eager submission after writes to listed surfaces. RSX_CPU_SURFACE_EAGER
+ * lists up to four RSX surface offsets (1-8 hex digits, comma separated);
+ * none by default. When a recorded draw or clear writes a listed surface, the
+ * renderer submits the batch at the first later draw boundary whose draw no
+ * longer targets a listed surface, or at its idle pump, through the same
+ * nonpresenting capacity path as the early submission for pending reads. The
+ * GPU then starts on that write before the CPU asks for it, and the prefetch
+ * refresh at that batch's end can copy the new generation. Reads stay
+ * coherent: each still needs the surface's current generation; only the
+ * submission point moves earlier. In MotorStorm races the main thread reads
+ * the HDR exposure target (02A30480) 10-20 ms after the renderer records its
+ * write; the launcher's --eager-surface-submit 1 lists it. */
+#define CPU_SURFACE_EAGER_MAX 4
+static u32 s_cpu_surface_eager[CPU_SURFACE_EAGER_MAX];
+static unsigned s_cpu_surface_eager_count;
+static int s_cpu_surface_eager_dirty;   /* renderer-owned: a listed surface has unsubmitted writes */
+static unsigned long long s_cpu_surface_eager_submits[2];
+static void cpu_surface_eager_configure(const char *list) {
+    s_cpu_surface_eager_count=0;s_cpu_surface_eager_dirty=0;
+    if(!list || !*list)return;
+    for(;;) {
+        u64 off=0;unsigned digits=0;int d;
+        while((d=cpu_surface_hex_digit(*list))>=0){off=off*16u+(u64)d;list++;
+            if(++digits>8)cpu_surface_fail("RSX_CPU_SURFACE_EAGER (offsets are 1-8 hex digits)",E_INVALIDARG);}
+        if(!digits || (*list && *list!=',') || s_cpu_surface_eager_count==CPU_SURFACE_EAGER_MAX)
+            cpu_surface_fail("RSX_CPU_SURFACE_EAGER (up to 4 comma-separated hex offsets)",E_INVALIDARG);
+        for(unsigned i=0;i<s_cpu_surface_eager_count;i++)
+            if(s_cpu_surface_eager[i]==(u32)off)cpu_surface_fail("RSX_CPU_SURFACE_EAGER (duplicate offset)",E_INVALIDARG);
+        s_cpu_surface_eager[s_cpu_surface_eager_count++]=(u32)off;
+        fprintf(stderr,"[CPUSURFACE_EAGER] enabled offset=%08X\n",(unsigned)off);
+        if(!*list)return;
+        list++;
+    }
+}
+static int cpu_surface_eager_listed(u32 offset) {
+    for(unsigned i=0;i<s_cpu_surface_eager_count;i++)if(s_cpu_surface_eager[i]==offset)return 1;
+    return 0;
+}
+/* A recorded draw or clear wrote the colour target at RSX offset `offset`,
+ * bound at guest address `address` (0 when unbound). */
+static void cpu_surface_eager_note(u32 offset,u32 address) {
+    if(address && address!=0xffffffffu && cpu_surface_eager_listed(offset))s_cpu_surface_eager_dirty=1;
+}
+/* Colour targets of the draw about to be recorded, chosen as
+ * the backend chooses active targets: does it still write a listed surface? */
+static int cpu_surface_eager_state_writes(const rsx_state *st) {
+    if(!st)return 0;
+    unsigned targets = st->color_target >= 0x1F ? 4 :
+                       st->color_target >= 0x17 ? 3 :
+                       st->color_target >= 0x13 ? 2 : 1;
+    for(unsigned i=0;i<targets;i++) {
+        unsigned source=(!i&&st->color_target==2)?1:i;
+        u32 dma=st->surface_color_dma[source];
+        if(dma!=CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER && dma!=CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER)continue;
+        if(cpu_surface_eager_listed(st->surface_color_offset[source]))return 1;
+    }
+    return 0;
+}
+/* Renderer service thread only, outside render_frame; renderer state is read
+ * only after both checks. At a draw boundary the submission waits while the
+ * draw about to be recorded still writes a listed surface. */
+static int cpu_surface_eager_wanted(int at_pump) {
+    if(!s_cpu_surface_eager_count)return 0;
+    if(InterlockedCompareExchange(&s_cpu_surface_thread,0,0)!=(LONG)GetCurrentThreadId())return 0;
+    if(!s_cpu_surface_eager_dirty || s_cpu_surface_recording)return 0;
+    if(!at_pump && cpu_surface_eager_state_writes(s_d3d.current_rsx_state))return 0;
+    if(s_cpu_surface_profile && !(++s_cpu_surface_eager_submits[at_pump?1:0]&255))
+        fprintf(stderr,"[CPUSURFACE_EAGER] draw=%llu pump=%llu\n",s_cpu_surface_eager_submits[0],s_cpu_surface_eager_submits[1]);
+    return 1;
+}
+/* render_frame submitted every recorded draw. */
+static void cpu_surface_eager_submitted(void) {
+    s_cpu_surface_eager_dirty=0;
+}
 /* Prompt service between batches. A queued read is otherwise served at the
  * end of the renderer's next batch or by its idle pump, so it also waits out
  * whatever the renderer records and replays meanwhile (in MotorStorm races
@@ -705,6 +779,7 @@ static void cpu_surface_init(void) {
     const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
     s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
     cpu_surface_batch_submitted();
+    cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
     if(s_cpu_surface_profile) {
         LARGE_INTEGER f;if(!QueryPerformanceFrequency(&f)||f.QuadPart<=0)cpu_surface_fail("profile frequency",E_FAIL);
         s_cpu_surface_profile_frequency=(u64)f.QuadPart;
@@ -752,6 +827,9 @@ static void cpu_surface_capture(D3D12DrawRecord *draw) {
         extern u32 cellGcmResolveLocated(int local,u32 offset);
         draw->cpu_address[i]=cellGcmResolveLocated(dma==CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER,st->surface_color_offset[source]);
         draw->cpu_pitch[i]=st->surface_color_pitch[source];
+        u32 recorded_offset = i ? draw->rt_mrt[i - 1] : draw->rt_off;
+        if (recorded_offset && recorded_offset == st->surface_color_offset[source] && draw->cpu_pitch[i])
+            cpu_surface_eager_note(recorded_offset,draw->cpu_address[i]);
     }
     for(unsigned i=0;i<4;i++)cpu_surface_pending_add(draw->cpu_address[i],draw->cpu_pitch[i],draw->rt_h);
     cpu_surface_service_ready();

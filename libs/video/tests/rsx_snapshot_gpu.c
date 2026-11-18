@@ -32,7 +32,7 @@ typedef struct {
     int in_begin_end;
     u32 color_target, surface_color_dma[4], surface_color_offset[4], surface_color_pitch[4];
 } rsx_state;
-typedef struct { u32 cpu_address[4], cpu_pitch[4], rt_fmt, rt_h; } D3D12DrawRecord;
+typedef struct { u32 cpu_address[4], cpu_pitch[4], rt_fmt, rt_h, rt_off, rt_mrt[3]; } D3D12DrawRecord;
 static rsx_state state;
 static struct {
     ID3D12Device *device;

@@ -5606,6 +5606,7 @@ skip_dump_consider: ;
         }
     }
     cpu_surface_batch_submitted();
+    cpu_surface_eager_submitted();
     cpu_surface_prefetch_refresh();
     cpu_surface_frame_complete();
     if (perf_on()) perf_batch_finish(_rf0);
@@ -5635,7 +5636,8 @@ static void submit_record_capacity(void* context, int present)
  * (same path as a capacity drain) so the read is served at its completion. */
 static void cpu_surface_flush_recorded(int at_pump)
 {
-    if (cpu_surface_flush_wanted(at_pump) && s_d3d.initialized && s_d3d.draw_count)
+    if ((cpu_surface_flush_wanted(at_pump) || cpu_surface_eager_wanted(at_pump)) &&
+        s_d3d.initialized && s_d3d.draw_count)
         submit_record_capacity(NULL, 0);
 }
 static void ensure_draw_record_capacity(void)
