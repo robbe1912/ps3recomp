@@ -2500,7 +2500,7 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention â€” keep running".
+            /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
             if (n <= 4 || (n % 4096) == 0)
@@ -3094,7 +3094,7 @@ void spu_indirect_branch(spu_context* ctx)
 }
 
 /* ===========================================================================
- * Execution trace (for Â§3 validation: diff vs RPCS3 SPU interpreter)
+ * Execution trace (for §3 validation: diff vs RPCS3 SPU interpreter)
  *
  * When the lifter is invoked with --trace, every emitted instruction is
  * surrounded by spu_trace_pc(ctx, PC) before execution and spu_trace_rt(
