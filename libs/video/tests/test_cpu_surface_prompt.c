@@ -53,6 +53,14 @@ static void submit_record_capacity(void* context, int present) {
         cpu_surface_fail("invalid early submission", 0);
     ++forced_submits;
 }
+static int eager_answer;
+static unsigned eager_asks;
+static int cpu_surface_eager_wanted(int at_pump)
+{
+    (void)at_pump;
+    ++eager_asks;
+    return eager_answer;
+}
 /* PRODUCTION_FLUSH */
 
 #define REQUIRE(x,message) do{if(!(x)){fprintf(stderr,"FAIL: %s\n",message);exit(1);}}while(0)
@@ -136,6 +144,19 @@ int main(void){
     s_cpu_surface_flush=1;cpu_surface_batch_submitted();REQUIRE(!cpu_surface_flush_wanted(0),"nothing pending after submission");
     for(u32 i=0;i<=CPU_SURFACE_PENDING_MAX;i++)cpu_surface_pending_add(0x40000000u+i*0x1000u,0x100,4);
     REQUIRE(cpu_surface_flush_wanted(0),"overflowed pending set submits");
+    reset();
+    forced_submits=0;eager_asks=0;eager_answer=1;s_d3d.draw_count=1;
+    cpu_surface_flush_recorded(0);
+    REQUIRE(forced_submits==1 && eager_asks==1,"eager request submits at a draw boundary");
+    cpu_surface_flush_recorded(1);
+    REQUIRE(forced_submits==2,"eager request submits at the idle pump");
+    s_d3d.draw_count=0;cpu_surface_flush_recorded(1);
+    REQUIRE(forced_submits==2,"eager request with an empty batch submits nothing");
+    s_d3d.draw_count=1;eager_answer=0;cpu_surface_flush_recorded(0);
+    REQUIRE(forced_submits==2,"no read and no eager request: no submission");
+    queue(0,0x10000,2);cpu_surface_pending_add(0x10000,0x100,4);
+    eager_asks=0;cpu_surface_flush_recorded(0);
+    REQUIRE(forced_submits==3 && !eager_asks,"a pending read submits without asking the eager decision");
     puts("PASS: prompt CPU surface service: disjoint reads early, overlapping reads queued in order, submit reset, guards");
     return 0;
 }

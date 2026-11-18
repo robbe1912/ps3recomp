@@ -218,20 +218,24 @@ def main():
         print(
             "PASS mutant " + name + " rejected: " + bad.stderr.strip().splitlines()[-1]
         )
+    decision = "(cpu_surface_flush_wanted(at_pump) || cpu_surface_eager_wanted(at_pump))"
     bad_flush = flush.replace(
-        "cpu_surface_flush_wanted(at_pump) && s_d3d.initialized && s_d3d.draw_count",
-        "s_d3d.initialized && s_d3d.draw_count && cpu_surface_flush_wanted(at_pump)",
+        decision + " &&\n        s_d3d.initialized && s_d3d.draw_count",
+        "s_d3d.initialized && s_d3d.draw_count &&\n        " + decision,
     )
     assert bad_flush != flush
     bad = build("flush-state-before-owner", prompt, flush_block=bad_flush)
     assert bad.returncode != 0 and "GPU state read by another thread" in bad.stderr
     print("PASS mutant flush-state-before-owner rejected")
+    bad = build("flush-ignores-eager", prompt, flush_block=flush.replace(decision, "cpu_surface_flush_wanted(at_pump)"))
+    assert bad.returncode != 0 and "eager request submits" in bad.stderr
+    print("PASS mutant flush-ignores-eager rejected")
     assert "atomic_load_explicit(&s_cpu_surface_head,memory_order_acquire)" in prompt
     (out / "result.json").write_text(
         json.dumps(
             {
                 "commands": results,
-                "mutants": [m[0] for m in mutants] + ["flush-state-before-owner"],
+                "mutants": [m[0] for m in mutants] + ["flush-state-before-owner", "flush-ignores-eager"],
                 "concurrent_requests": 256,
                 "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
                 "backend_sha256": hashlib.sha256(backend.encode("utf-8")).hexdigest(),
@@ -241,7 +245,7 @@ def main():
     )
     print(
         "PASS: prompt CPU surface service, early submission and wiring ("
-        + str(len(mutants) + 1)
+        + str(len(mutants) + 2)
         + " mutants rejected)"
     )
     return 0
