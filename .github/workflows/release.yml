@@ -49,7 +49,8 @@ jobs:
       matrix:
         include:
           - platform: win-x64
-            runs-on: windows-latest
+            # VS 2022 provides headers compatible with the runner's clang-cl.
+            runs-on: windows-2022
           - platform: mac-arm64
             runs-on: macos-latest
           # Linux ships as the toolkit and the runtime library, not a game
