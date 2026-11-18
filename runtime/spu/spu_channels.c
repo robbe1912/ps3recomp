@@ -22,6 +22,7 @@ void spu_halt(spu_context*); /* Policy trampolines can precede its definition. *
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/spu_host_line_commit.h"
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -230,6 +231,24 @@ int spu_native_owned_observed(void) {
     }
     return observed;
 #endif
+}
+int spu_native_owned_image(void) {
+    static SPU_THREAD_LOCAL int image = -1;
+    if (image < 0) {
+        const char* value = getenv("SPU_NATIVE_OWNED_IMAGE");
+        if (!value) {
+            image = 0;
+        } else {
+            unsigned long id = strtoul(value, NULL, 10);
+            if (!id || id > INT_MAX ||
+                value[strspn(value, "0123456789")] != '\0') {
+                fprintf(stderr, "invalid SPU_NATIVE_OWNED_IMAGE: expected a positive decimal image ID\n");
+                abort();
+            }
+            image = (int)id;
+        }
+    }
+    return image;
 }
 void spu_native_owned_interpret(spu_context* ctx) {
     uint32_t stop=ctx->drain_ret_pc;

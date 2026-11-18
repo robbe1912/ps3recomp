@@ -31,6 +31,9 @@ def source(root):
     """C translation unit holding the production readers from spu_channels.c."""
     channels = (Path(root) / 'runtime/spu/spu_channels.c').read_text(encoding='utf-8')
     body = '\n'.join(function(channels, s) for s in READERS)
+    image_reader = 'int spu_native_owned_image(void)'
+    if image_reader in channels:
+        body += '\n' + function(channels, image_reader)
     if 'int g_spu_pm_svc_on;' in channels:
         # Isolated CPU fixtures never register a policy service.
         body += """
@@ -51,7 +54,7 @@ void spu_pm_svc_drain_done(spu_context *ctx, uint32_t return_pc)
     return ('/* Extracted verbatim from runtime/spu/spu_channels.c by tools/spu_owned_options.py. */\n'
             '#include "spu_native_owned.h"\n'
             '#include "ps3emu/native_atomic_observer.h"\n'
-            '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n' + body + '\n')
+            '#include <limits.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n' + body + '\n')
 
 
 if __name__ == '__main__':

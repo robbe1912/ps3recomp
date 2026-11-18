@@ -55,8 +55,10 @@ int main(int argc,char** argv) {
 #endif
         return 0;
     }
+    const int scoped_nested = !strcmp(mode, "scoped-nested");
+    const int scoped_overlap = !strcmp(mode, "scoped-overlap");
     nested_tail=!strcmp(mode,"nested-tail");
-    nested_owned=nested_tail || !strcmp(mode,"nested-owned");
+    nested_owned=nested_tail || !strcmp(mode,"nested-owned") || scoped_nested;
     call_policy=nested_owned || !strcmp(mode,"call-policy");queued_irq=!strcmp(mode,"queued-irq");
     spu_context_init(&ctx,0);ctx.image_id=77;ctx.policy_mode=1;
     ctx.pc=0x200;ctx.status=SPU_STATUS_RUNNING;
@@ -87,7 +89,7 @@ int main(int argc,char** argv) {
         ctx.resident_code[0].lsa=0x4000;ctx.resident_code[0].size=0x14;
         ctx.resident_code[0].image_id=25;
         if (!strcmp(mode,"invalid-range")) ctx.resident_code[0].size=SPU_LS_SIZE+1;
-        if (!strcmp(mode,"overlap")) {
+        if (!strcmp(mode,"overlap") || scoped_overlap) {
             ctx.resident_code[1]=ctx.resident_code[0];ctx.resident_code[0].image_id=26;
         }
     }
@@ -97,7 +99,7 @@ int main(int argc,char** argv) {
         word(0x5000,0x1C014183); /* ai r3,r3,5 */
         word(0x5004,nested_tail?0x327E0080:0x35000300); /* br native caller / bi r6 */
         ctx.resident_code[1].lsa=0x5000;ctx.resident_code[1].size=8;
-        ctx.resident_code[1].image_id=25;
+        ctx.resident_code[1].image_id=scoped_nested ? 26 : 25;
     }
     if (!strcmp(mode,"dma-invalidate")) {
         ppu_vm_size=0x20000;vm_base=calloc(1,ppu_vm_size);OWNED_CHECK(vm_base);
@@ -126,6 +128,11 @@ int main(int argc,char** argv) {
     spu_begin_image(25);
     spu_register_function(0x5000,owned_subjob);
     if (strcmp(mode,"owner-miss")) spu_register_function(0x4000,owned_job);
+    if (scoped_nested || scoped_overlap) {
+        spu_begin_image(26);
+        spu_register_function(scoped_nested ? 0x5000 : 0x4000,
+                              scoped_nested ? owned_subjob : owned_job);
+    }
 #ifndef OWNED_HISTORICAL
     if (!strcmp(mode,"admission")) {
         OWNED_CHECK(spu_native_owned_can_run(&ctx,0x4000));
@@ -206,6 +213,7 @@ int main(int argc,char** argv) {
     }
     OWNED_CHECK(ctx.gpr[3]._u32[0]==(nested_owned?17u:call_policy?12u:!strcmp(mode,"dma-invalidate")?11u:5u));
     unsigned expected=(!strcmp(mode,"owned")||!strcmp(mode,"irq")||queued_irq||!strcmp(mode,"musttail")||call_policy)?(nested_owned?2u:1u):0u;
+    if (scoped_nested) expected = 1;
     if (native_calls!=expected || native_in_irq) {
         fprintf(stderr,"FAIL native calls=%u expected=%u native_in_irq=%u\n",native_calls,expected,native_in_irq);exit(1);
     }

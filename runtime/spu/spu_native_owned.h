@@ -1,7 +1,8 @@
 /* Opt-in compatibility bridge: policy stays interpreted; only existing
  * resident-code owners may execute compiled jobs. The staging loader remains
  * responsible for code identity and invalidating overwritten owners. Configure
- * SPU_NATIVE_OWNED_JOBS=0|1 before workers start; unset preserves the runtime. */
+ * SPU_NATIVE_OWNED_JOBS=0|1 before workers start; unset preserves the runtime.
+ * SPU_NATIVE_OWNED_IMAGE optionally restricts admission to one resident image. */
 #ifndef SPU_NATIVE_OWNED_H
 #define SPU_NATIVE_OWNED_H
 #include "spu_context.h"
@@ -9,6 +10,7 @@
 extern "C" {
 #endif
 int spu_native_owned_enabled(void);
+int spu_native_owned_image(void); /* zero means unrestricted */
 int spu_native_owned_observed(void);
 void spu_native_owned_interpret(spu_context* ctx);
 /* Bounded native dispatcher call; ordinary stop/budget APIs stay reference. */
@@ -45,14 +47,18 @@ static inline int spu_native_owned_can_run(const spu_context* ctx, uint32_t pc) 
         (ctx->int_enable && (ctx->event_status & ctx->event_mask)) ||
         g_spu_ls_watch_n > 0 || g_spu_ls_probe > 0 || g_spu_smc_watch > 0 ||
         spu_native_owned_observed()) return 0;
+    const int image = spu_native_owned_image();
     for (unsigned i=0;i<sizeof(ctx->resident_code)/sizeof(ctx->resident_code[0]);++i) {
         if (!ctx->resident_code[i].image_id) continue;
         uint32_t base=ctx->resident_code[i].lsa, size=ctx->resident_code[i].size;
         if (pc < base || pc-base >= size) continue;
         /* First-containing-owner precedence matches the production resolver. */
-        return ctx->resident_code[i].image_id > 0 && base < SPU_LS_SIZE &&
+        return ctx->resident_code[i].image_id > 0 &&
+               (!image || image == ctx->resident_code[i].image_id) &&
+               base < SPU_LS_SIZE &&
                size <= SPU_LS_SIZE-base;
     }
+    if (image) return 0;
     return g_spu_pm_svc_on && spu_pm_svc_can_run(ctx,pc);
 }
 #ifdef __cplusplus

@@ -142,7 +142,8 @@ int main(int argc,char** argv) {
     else if (!strcmp(mode,"text-differs")) want[5]=1;
     else if (!strcmp(mode,"short-span")) want[6]=1;
     /* tail-jump: entered by a branch, not a call: refused before the counters */
-    else if (!strcmp(mode,"off") || !strcmp(mode,"gate") || !strcmp(mode,"fp-mismatch") || tail_jump) {}
+    else if (!strcmp(mode,"off") || !strcmp(mode,"gate") || !strcmp(mode,"fp-mismatch") ||
+             !strcmp(mode,"scoped-job") || tail_jump) {}
     else { fprintf(stderr,"unknown mode %s\n",mode); return 2; }
     PM_CHECK(job_calls==(!strcmp(mode,"scope")?2u:1u));
     if (svc_calls!=want_svc || memcmp(d,want,sizeof want)) {

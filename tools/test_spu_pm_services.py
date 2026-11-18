@@ -33,7 +33,7 @@ MODES = {
     'off': (None, None), 'native': ('1', None), 'verify': ('1', '1'), 'verify-mismatch': ('1', '1'),
     'text-differs': ('1', None), 'fp-mismatch': ('1', None), 'tail-jump': ('1', None), 'short-span': ('1', None),
     'scope': ('1', None), 'wrong-call-opcode': ('1', None),
-    'gate': ('1', None),
+    'gate': ('1', None), 'scoped-job': ('1', None),
 }
 # Each mutant must make at least one mode fail.
 MUTANTS = {
@@ -47,6 +47,8 @@ MUTANTS = {
     'verify-blind': [('if (!bad) InterlockedIncrement(&s_svc_vok);', 'bad = 0; if (!bad) InterlockedIncrement(&s_svc_vok);')],
     'replay-unfed': [('if (o) r = o->val; else memset(&r, 0, sizeof r);', 'memset(&r, 0, sizeof r);')],
     'registry-ignored': [('return g_spu_pm_svc_on && spu_pm_svc_can_run(ctx,pc);', 'return 0;')],
+    'service-ignores-image-scope': [('    if (image) return 0;\n    return g_spu_pm_svc_on',
+                                     '    return g_spu_pm_svc_on')],
 }
 
 
@@ -120,6 +122,8 @@ def run(binary, mode, native=None, verify=None):
     env['SPU_NATIVE_OWNED_JOBS'] = '1'
     env['SPU_INTERP_UNLIFTED'] = '1'
     env['SPU_PM_INTERP'] = '1'
+    if mode == 'scoped-job':
+        env['SPU_NATIVE_OWNED_IMAGE'] = '25'
     if native is not None:
         env['SPU_PM_NATIVE_SVC'] = native
     if verify is not None:
