@@ -103,7 +103,8 @@ int main(int argc, char **argv) {
     rt[r]=rtvheap->GetCPUDescriptorHandleForHeapStart();rt[r].ptr+=r*stride;
     device->CreateRenderTargetView(targets[r].Get(),nullptr,rt[r]);
   }
-  D3D12_RESOURCE_DESC bd={};bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;bd.Width=1024;
+  constexpr UINT64 target_stride = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+  D3D12_RESOURCE_DESC bd={};bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;bd.Width=4*target_stride;
   bd.Height=bd.DepthOrArraySize=bd.MipLevels=bd.SampleDesc.Count=1;bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   auto readback=resource(bd,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
   auto barrier=[&](unsigned r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
@@ -143,14 +144,14 @@ int main(int argc, char **argv) {
     for(unsigned r=0;r<c.nrt;r++){
       barrier(r,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
       D3D12_TEXTURE_COPY_LOCATION src={},dst={};src.pResource=targets[r].Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint.Offset=r*256;
-      dst.PlacedFootprint.Footprint={DXGI_FORMAT_R32G32B32A32_FLOAT,1,1,1,256};list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+      dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint.Offset=r*target_stride;
+      dst.PlacedFootprint.Footprint={DXGI_FORMAT_R32G32B32A32_FLOAT,1,1,1,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
       barrier(r,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     check(list->Close(),"close");ID3D12CommandList* commands[]={list.Get()};queue->ExecuteCommandLists(1,commands);wait();
     void* mapped=nullptr;check(readback->Map(0,nullptr,&mapped),"readback");bool ok=true;
     for(unsigned r=0;r<c.nrt;r++){
-      float got[4];memcpy(got,(char*)mapped+r*256,sizeof got);
+      float got[4];memcpy(got,(char*)mapped+r*target_stride,sizeof got);
       for(unsigned k=0;k<4;k++){
         float want=blend_policy ? draw[k]+((enables&(1u<<r))?clear[k]:0) : ((c.masks&(1u<<(r*4+k)))?draw[k]:clear[k]);
         if(!std::isfinite(got[k])||fabs(got[k]-want)>1e-5){ok=false;printf("target %u channel %u got %.6f want %.6f\n",r,k,got[k],want);}
