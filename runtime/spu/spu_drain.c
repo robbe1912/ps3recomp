@@ -513,4 +513,5 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc) {
     uint64_t saved=spu_sf_simd_enter();
     spu_drain_call_scoped_body(ctx,return_pc);
     spu_sf_simd_leave(saved);
+    if (g_spu_pm_svc_on) spu_pm_svc_drain_done(ctx,return_pc);
 }

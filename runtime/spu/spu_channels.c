@@ -820,7 +820,7 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
-void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+static void spu_wrch_channel(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1030,7 +1030,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
-u128 spu_rdch(spu_context* ctx, uint32_t channel)
+static u128 spu_rdch_channel(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -1122,7 +1122,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 /* ===========================================================================
  * Channel count (rchcnt) -- how many entries can be read/written right now
  * ===========================================================================*/
-uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+static uint32_t spu_rchcnt_channel(spu_context* ctx, uint32_t channel)
 {
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
@@ -2095,6 +2095,374 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+/* ---- Native policy-module services ----
+ * Under SPU_NATIVE_OWNED_JOBS=1 a resident job runs compiled while the policy
+ * module stays interpreted, so every service the job calls into the policy
+ * text (a bisl through a register) runs in the interpreter. A title may
+ * register those services (spu_pm_services_register): the policy image, where
+ * its text sits in LS, the guest EA and length of the pristine text with the
+ * FNV-1a of the whole registered text, the entry points, and the LS code
+ * ranges the services reach. The text range may also hold live data, so only
+ * the code ranges are compared and admitted.
+ *
+ * SPU_PM_NATIVE_SVC=1 (default 0): when compiled job code calls a registered
+ * entry -- the link register equals the call bracket's return pc and lies in a
+ * resident job span -- and every code range in LS still equals the pristine
+ * text (copied from guest memory once and checked against the fingerprint),
+ * the compiled entry runs. Until that bracket ends the owned gate also admits
+ * the code ranges; every other owned-gate condition still applies, and any
+ * other target is interpreted as before.
+ *
+ * SPU_PM_SVC_VERIFY=1 (diagnostic; needs SPU_PM_NATIVE_SVC=1): the call runs
+ * interpreted as without the switch while every channel operation and its LS
+ * effect is recorded. The compiled service is then replayed on a private
+ * context and LS that are fed the recorded results; the operation stream, all
+ * registers, pc, interrupt enable and the whole LS are compared and a mismatch
+ * is logged. The real context keeps the interpreted result. */
+static struct {
+    int registered, image_id, nentries, ncode;
+    uint32_t ls_base, text_len, tmpl_ea, tmpl_len;
+    uint64_t text_fnv;
+    uint32_t entries[SPU_PM_SERVICES_MAX_ENTRIES];
+    uint32_t code[SPU_PM_SERVICES_MAX_RANGES][2];
+    uint8_t* text;
+} s_svc;
+int g_spu_pm_svc_on;
+static int s_svc_verify;
+// 0 = uninitialized, 1 = copying, 2 = verified, -1 = rejected.
+static volatile LONG s_svc_once;
+static volatile LONG s_svc_native, s_svc_vok, s_svc_vbad, s_svc_vincomplete,
+                     s_svc_voverflow, s_svc_text_differs, s_svc_not_job_call;
+/* The bracket a native service was entered from: the caller's context, the
+ * job's return pc and the bracket depth. */
+typedef struct { const spu_context* ctx; uint32_t ret; int depth; } svc_scope;
+static SPU_THREAD_LOCAL svc_scope t_svc;
+
+static int pm_svc_ready(void);
+static int pm_svc_switch(const char* name)
+{
+    const char* value = getenv(name);
+    if (!value || !strcmp(value, "0")) return 0;
+    if (!strcmp(value, "1")) return 1;
+    fprintf(stderr, "invalid %s: expected 0 or 1\n", name);
+    abort();
+}
+void spu_pm_services_register(const spu_pm_services* d)
+{
+    int on = pm_svc_switch("SPU_PM_NATIVE_SVC");
+    int verify = pm_svc_switch("SPU_PM_SVC_VERIFY");
+    memset(&s_svc, 0, sizeof s_svc);
+    if (!d || d->nentries <= 0 || d->nentries > SPU_PM_SERVICES_MAX_ENTRIES ||
+        d->ncode <= 0 || d->ncode > SPU_PM_SERVICES_MAX_RANGES || !d->text_len ||
+        d->ls_base >= SPU_LS_SIZE || d->text_len > SPU_LS_SIZE - d->ls_base ||
+        !d->tmpl_len || d->tmpl_len > d->text_len) {
+        fprintf(stderr, "[pm-svc] invalid service registration: native services off\n");
+        g_spu_pm_svc_on = 0;
+        return;
+    }
+    for (int i = 0; i < d->ncode; ++i) {
+        uint32_t lo = d->code[i][0], hi = d->code[i][1];
+        if (lo < d->ls_base || hi <= lo || hi > d->ls_base + d->text_len || (lo & 3) || (hi & 3)) {
+            fprintf(stderr, "[pm-svc] code range %d outside the registered text: native services off\n", i);
+            g_spu_pm_svc_on = 0;
+            return;
+        }
+        s_svc.code[i][0] = lo; s_svc.code[i][1] = hi;
+    }
+    for (int i = 0; i < d->nentries; ++i) s_svc.entries[i] = d->entries[i] & SPU_LS_MASK;
+    s_svc.image_id = d->image_id; s_svc.nentries = d->nentries; s_svc.ncode = d->ncode;
+    s_svc.ls_base = d->ls_base; s_svc.text_len = d->text_len;
+    s_svc.tmpl_ea = d->tmpl_ea; s_svc.tmpl_len = d->tmpl_len; s_svc.text_fnv = d->text_fnv;
+    s_svc.registered = 1;
+    s_svc_verify = on && verify;
+    g_spu_pm_svc_on = on;
+    s_svc_once = 0;
+    if (on && vm_base) pm_svc_ready();   /* guest memory already loaded: copy now */
+}
+void spu_pm_services_counters(uint64_t out[SPU_PM_SERVICES_COUNTERS])
+{
+    out[0] = (uint64_t)s_svc_native; out[1] = (uint64_t)s_svc_vok; out[2] = (uint64_t)s_svc_vbad;
+    out[3] = (uint64_t)s_svc_vincomplete; out[4] = (uint64_t)s_svc_voverflow;
+    out[5] = (uint64_t)s_svc_text_differs; out[6] = (uint64_t)s_svc_not_job_call;
+}
+/* Registration with guest memory loaded, else the first call: copy the pristine
+ * text out of guest memory (zero beyond the template) and check it against the
+ * registered fingerprint. 1 = usable. */
+static int pm_svc_ready(void)
+{
+    LONG state = InterlockedCompareExchange(&s_svc_once, 1, 0);
+    if (state != 0) {
+        while (state == 1) {
+            Sleep(0);
+            state = InterlockedCompareExchange(&s_svc_once, 0, 0);
+        }
+        return state == 2;
+    }
+    int ok = 0;
+    uint64_t h = 1469598103934665603ULL;
+    uint8_t* t = NULL;
+    extern uint32_t ppu_vm_size;   /* 0: the whole 32-bit space is backed */
+    uint64_t end = (uint64_t)s_svc.tmpl_ea + s_svc.tmpl_len;
+    if (s_svc.registered && vm_base && end <= (ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull) &&
+        (t = (uint8_t*)calloc(1, s_svc.text_len)) != NULL) {
+        memcpy(t, vm_base + s_svc.tmpl_ea, s_svc.tmpl_len);
+        for (uint32_t i = 0; i < s_svc.text_len; ++i) h = (h ^ t[i]) * 1099511628211ULL;
+        ok = h == s_svc.text_fnv;
+        if (ok) s_svc.text = t; else free(t);
+    }
+    fprintf(stderr, "[pm-svc] image %d text ea=0x%08X len=0x%X fnv=%016llX expect=%016llX: native services %s%s\n",
+            s_svc.image_id, s_svc.tmpl_ea, s_svc.text_len, (unsigned long long)h,
+            (unsigned long long)s_svc.text_fnv, ok ? "on" : "off", ok && s_svc_verify ? " (verify)" : "");
+    InterlockedExchange(&s_svc_once, ok ? 2 : -1);
+    return ok;
+}
+/* A scope lasts while its bracket does: deeper brackets, or the same bracket
+ * still returning to the job. Anything else means the bracket ended. */
+static int pm_svc_active(const spu_context* ctx)
+{
+    if (t_svc.ctx != ctx) return 0;
+    if (ctx->host_depth > t_svc.depth ||
+        (ctx->host_depth == t_svc.depth && (ctx->drain_ret_pc & SPU_LS_MASK) == t_svc.ret)) return 1;
+    t_svc.ctx = NULL;
+    return 0;
+}
+int spu_pm_svc_can_run(const spu_context* ctx, uint32_t pc)
+{
+    if (!pm_svc_active(ctx)) return 0;
+    for (int i = 0; i < s_svc.ncode; ++i)
+        if (pc >= s_svc.code[i][0] && pc < s_svc.code[i][1]) return 1;
+    return 0;
+}
+void spu_pm_svc_drain_done(spu_context* ctx, uint32_t return_pc)
+{
+    if (t_svc.ctx == ctx && t_svc.ret == (return_pc & SPU_LS_MASK) && ctx->host_depth == t_svc.depth)
+        t_svc.ctx = NULL;
+}
+/* Is this indirect branch a compiled job's call into a registered entry, with
+ * the code ranges in LS equal to the pristine text? */
+static int pm_svc_call_ok(spu_context* ctx, uint32_t pc)
+{
+    if (ctx->image_id != s_svc.image_id || ctx->host_depth <= 0) return 0;
+    int entry = 0;
+    for (int i = 0; i < s_svc.nentries; ++i) entry |= s_svc.entries[i] == pc;
+    if (!entry || !pm_svc_ready()) return 0;
+    uint32_t ret = ctx->drain_ret_pc & SPU_LS_MASK;
+    int job_call = 0;
+    if (ret >= 4 && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) == ret) {
+        uint32_t call = ret - 4;
+        for (unsigned i = 0; i < sizeof(ctx->resident_code) / sizeof(ctx->resident_code[0]); ++i) {
+            uint32_t base = ctx->resident_code[i].lsa, size = ctx->resident_code[i].size;
+            int image = ctx->resident_code[i].image_id;
+            if (!image || call < base || call - base >= size) continue;
+            if (image > 0 && size <= SPU_LS_SIZE - base && ret - base < size) {
+                const uint8_t* bytes = ctx->ls + call;
+                uint32_t instruction = (uint32_t)bytes[0] << 24 | (uint32_t)bytes[1] << 16 |
+                                       (uint32_t)bytes[2] << 8 | (uint32_t)bytes[3];
+                job_call = (instruction & 0xffe0007fu) == 0x35200000u;
+            }
+            break;
+        }
+    }
+    if (!job_call) { InterlockedIncrement(&s_svc_not_job_call); return 0; }
+    for (int i = 0; i < s_svc.ncode; ++i) {
+        uint32_t lo = s_svc.code[i][0], n = s_svc.code[i][1] - lo;
+        if (memcmp(ctx->ls + lo, s_svc.text + (lo - s_svc.ls_base), n) != 0) {
+            if (InterlockedIncrement(&s_svc_text_differs) <= 8) {
+                uint32_t o = lo; while (ctx->ls[o] == s_svc.text[o - s_svc.ls_base]) ++o;
+                fprintf(stderr, "[pm-svc] LS 0x%05X differs from the registered text (entry 0x%05X): interpreted\n", o, pc);
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Verifier: record the interpreted call, replay the compiled one. */
+#define SV_MAXOP 512
+#define SV_MAXRUN 4096
+#define SV_MAXBYTES (256u * 1024u)
+enum { SV_WR, SV_RD, SV_CNT };
+typedef struct { uint8_t kind, ch; u128 val; uint32_t run0, nrun; } sv_op;
+typedef struct { uint32_t lsa, n, off; } sv_run;
+typedef struct {
+    spu_context* ctx; int overflow; unsigned nop, nrun; uint32_t nbytes; uint8_t* prev;
+    sv_op op[SV_MAXOP]; sv_run run[SV_MAXRUN]; uint8_t bytes[SV_MAXBYTES];
+} sv_log;
+static SPU_THREAD_LOCAL sv_log* t_rec;          /* recording the interpreted call */
+static SPU_THREAD_LOCAL sv_log* t_rp;           /* replaying into the private context */
+static SPU_THREAD_LOCAL spu_context* t_rp_ctx;
+static SPU_THREAD_LOCAL unsigned t_rp_i, t_rp_bad;
+/* Writes that only latch MFC parameters cannot change LS. */
+static int sv_ls_effect(int kind, uint32_t ch)
+{
+    return !(kind == SV_WR && (ch == MFC_LSA || ch == MFC_EAH || ch == MFC_EAL || ch == MFC_Size ||
+                               ch == MFC_TagID || ch == MFC_WrTagMask));
+}
+static sv_op* sv_rec_begin(sv_log* L, spu_context* ctx, int kind, uint32_t ch)
+{
+    if (L->nop >= SV_MAXOP) { L->overflow = 1; return NULL; }
+    sv_op* o = &L->op[L->nop++];
+    memset(o, 0, sizeof *o); o->kind = (uint8_t)kind; o->ch = (uint8_t)ch; o->run0 = L->nrun;
+    if (sv_ls_effect(kind, ch)) memcpy(L->prev, ctx->ls, SPU_LS_SIZE);
+    return o;
+}
+/* Keep the LS bytes this operation changed (DMA completion, atomics). */
+static void sv_rec_end(sv_log* L, spu_context* ctx, sv_op* o)
+{
+    if (!o || !sv_ls_effect(o->kind, o->ch)) return;
+    const uint8_t* a = L->prev; const uint8_t* b = ctx->ls;
+    for (uint32_t blk = 0; blk < SPU_LS_SIZE && !L->overflow; blk += 4096) {
+        if (!memcmp(a + blk, b + blk, 4096)) continue;
+        for (uint32_t i = blk, end = blk + 4096; i < end;) {
+            if (a[i] == b[i]) { ++i; continue; }
+            uint32_t s = i;
+            while (i < end && a[i] != b[i]) ++i;
+            if (L->nrun >= SV_MAXRUN || L->nbytes + (i - s) > SV_MAXBYTES) { L->overflow = 1; break; }
+            L->run[L->nrun].lsa = s; L->run[L->nrun].n = i - s; L->run[L->nrun].off = L->nbytes; L->nrun++;
+            memcpy(L->bytes + L->nbytes, b + s, i - s); L->nbytes += i - s;
+        }
+    }
+    o->nrun = L->nrun - o->run0;
+}
+/* Next recorded operation for the private context, with its LS effect applied. */
+static sv_op* sv_replay(spu_context* sh, int kind, uint32_t ch)
+{
+    sv_log* L = t_rp;
+    if (t_rp_i >= L->nop) { t_rp_bad |= 1; return NULL; }
+    sv_op* o = &L->op[t_rp_i++];
+    if (o->kind != kind || o->ch != ch) { t_rp_bad |= 2; return NULL; }
+    for (uint32_t r = o->run0; r < o->run0 + o->nrun; ++r)
+        memcpy(sh->ls + L->run[r].lsa, L->bytes + L->run[r].off, L->run[r].n);
+    return o;
+}
+static void pm_svc_verify_call(spu_context* ctx, uint32_t pc)
+{
+    static SPU_THREAD_LOCAL sv_log* L;
+    static SPU_THREAD_LOCAL uint8_t *sls, *prev;
+    static SPU_THREAD_LOCAL spu_context* sh;
+    if (!L) {
+        L = (sv_log*)malloc(sizeof *L); sls = (uint8_t*)malloc(SPU_LS_SIZE);
+        prev = (uint8_t*)malloc(SPU_LS_SIZE); sh = (spu_context*)malloc(sizeof *sh);
+    }
+    if (!L || !sls || !prev || !sh) { spu_native_owned_interpret(ctx); return; }
+    *sh = *ctx; memcpy(sls, ctx->ls, SPU_LS_SIZE);
+    uint32_t stop = ctx->drain_ret_pc & SPU_LS_MASK;
+    L->ctx = ctx; L->overflow = 0; L->nop = L->nrun = 0; L->nbytes = 0; L->prev = prev;
+    t_rec = L;
+    spu_native_owned_interpret(ctx);
+    /* A service that yields to a kernel vector returns with a trampoline
+     * pending; finish it in the caller's drain, still recording. */
+    if ((ctx->pc & SPU_LS_MASK) != stop && g_spu_trampoline_fn &&
+        !(ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)))
+        spu_drain_call(ctx, stop);
+    t_rec = NULL;
+    if ((ctx->pc & SPU_LS_MASK) != stop || g_spu_trampoline_fn ||
+        (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))) {
+        InterlockedIncrement(&s_svc_vincomplete);
+        return;
+    }
+    if (L->overflow) { InterlockedIncrement(&s_svc_voverflow); return; }
+    void (*saved_tf)(spu_context*) = g_spu_trampoline_fn;
+    svc_scope saved_scope = t_svc;
+    sh->ls = sls;
+    t_rp = L; t_rp_ctx = sh; t_rp_i = 0; t_rp_bad = 0;
+    t_svc.ctx = sh; t_svc.ret = stop; t_svc.depth = sh->host_depth;
+    spu_lifted_fn fn = spu_lifted_lookup(sh, pc);
+    if (fn) {
+        sh->pc = pc; g_spu_trampoline_fn = 0;
+        fn(sh);
+        spu_drain_call(sh, stop);
+    } else t_rp_bad |= 8;
+    t_rp = NULL; t_rp_ctx = NULL; t_svc = saved_scope; g_spu_trampoline_fn = saved_tf;
+    unsigned bad = t_rp_bad;
+    if (t_rp_i != L->nop) bad |= 16;
+    if ((sh->pc & SPU_LS_MASK) != (ctx->pc & SPU_LS_MASK)) bad |= 32;
+    int reg = -1;
+    for (int r = 0; r < 128 && reg < 0; ++r) if (memcmp(&sh->gpr[r], &ctx->gpr[r], sizeof(u128))) reg = r;
+    if (reg >= 0) bad |= 64;
+    if (sh->int_enable != ctx->int_enable) bad |= 128;
+    uint32_t lsd = SPU_LS_SIZE;
+    if (memcmp(sh->ls, ctx->ls, SPU_LS_SIZE)) { lsd = 0; while (sh->ls[lsd] == ctx->ls[lsd]) ++lsd; bad |= 256; }
+    if (!bad) InterlockedIncrement(&s_svc_vok);
+    else if (InterlockedIncrement(&s_svc_vbad) <= 16)
+        fprintf(stderr, "[pm-svc] VERIFY MISMATCH entry=0x%05X flags=0x%X ops=%u/%u first_reg=%d ls=0x%05X pc=0x%05X/0x%05X\n",
+                pc, bad, t_rp_i, L->nop, reg, lsd, sh->pc & SPU_LS_MASK, ctx->pc & SPU_LS_MASK);
+    if (((s_svc_vok + s_svc_vbad) & 0xFFFF) == 0)
+        fprintf(stderr, "[pm-svc] verify ok=%ld bad=%ld incomplete=%ld overflow=%ld\n", (long)s_svc_vok,
+                (long)s_svc_vbad, (long)s_svc_vincomplete, (long)s_svc_voverflow);
+}
+/* spu_indirect_branch: 1 = the call was run here. */
+static int pm_svc_branch(spu_context* ctx)
+{
+    uint32_t pc = ctx->pc & SPU_LS_MASK;
+    if (!pm_svc_call_ok(ctx, pc)) return 0;
+    spu_lifted_fn fn = spu_lifted_lookup(ctx, pc);
+    if (!fn) return 0;
+    svc_scope saved = t_svc;
+    t_svc.ctx = ctx; t_svc.ret = ctx->drain_ret_pc & SPU_LS_MASK; t_svc.depth = ctx->host_depth;
+    if (!spu_native_owned_can_run(ctx, pc)) { t_svc = saved; return 0; }   /* IRQ, watches, observers */
+    if (s_svc_verify) { t_svc = saved; pm_svc_verify_call(ctx, pc); return 1; }
+    InterlockedIncrement(&s_svc_native);
+    ctx->pc = pc;
+    fn(ctx);
+    return 1;
+}
+/* Channel entry points: the verifier's replay and recording, then the channel. */
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (s_svc_verify) {
+        if (t_rp_ctx == ctx) {
+            sv_op* o = sv_replay(ctx, SV_WR, channel);
+            if (o && memcmp(&o->val, &value, sizeof value)) t_rp_bad |= 4;
+            return;
+        }
+        if (t_rec && t_rec->ctx == ctx) {
+            sv_op* o = sv_rec_begin(t_rec, ctx, SV_WR, channel);
+            if (o) o->val = value;
+            spu_wrch_channel(ctx, channel, value);
+            sv_rec_end(t_rec, ctx, o);
+            return;
+        }
+    }
+    spu_wrch_channel(ctx, channel, value);
+}
+u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (s_svc_verify) {
+        if (t_rp_ctx == ctx) {
+            u128 r; sv_op* o = sv_replay(ctx, SV_RD, channel);
+            if (o) r = o->val; else memset(&r, 0, sizeof r);
+            return r;
+        }
+        if (t_rec && t_rec->ctx == ctx) {
+            sv_op* o = sv_rec_begin(t_rec, ctx, SV_RD, channel);
+            u128 r = spu_rdch_channel(ctx, channel);
+            if (o) o->val = r;
+            sv_rec_end(t_rec, ctx, o);
+            return r;
+        }
+    }
+    return spu_rdch_channel(ctx, channel);
+}
+uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+{
+    if (s_svc_verify) {
+        if (t_rp_ctx == ctx) {
+            sv_op* o = sv_replay(ctx, SV_CNT, channel);
+            return o ? o->val._u32[0] : 0;
+        }
+        if (t_rec && t_rec->ctx == ctx) {
+            sv_op* o = sv_rec_begin(t_rec, ctx, SV_CNT, channel);
+            uint32_t r = spu_rchcnt_channel(ctx, channel);
+            if (o) o->val._u32[0] = r;
+            sv_rec_end(t_rec, ctx, o);
+            return r;
+        }
+    }
+    return spu_rchcnt_channel(ctx, channel);
+}
+/* ---- end native policy-module services ---- */
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -2132,7 +2500,7 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
+            /* cellSpursModulePoll: report "no contention â€” keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
             if (n <= 4 || (n % 4096) == 0)
@@ -2552,6 +2920,7 @@ void spu_indirect_branch(spu_context* ctx)
                       fprintf(stderr, "[jobexec] dumped LS at job entry -> %s\n", dp); }
                   s_dumped = 1; } } }
     }
+    if (g_spu_pm_svc_on && spu_native_owned_policy(ctx) && pm_svc_branch(ctx)) return;
     if (spu_native_owned_policy(ctx) && !spu_native_owned_can_run(ctx,ctx->pc)) {
         spu_native_owned_interpret(ctx); return;
     }
@@ -2725,7 +3094,7 @@ void spu_indirect_branch(spu_context* ctx)
 }
 
 /* ===========================================================================
- * Execution trace (for §3 validation: diff vs RPCS3 SPU interpreter)
+ * Execution trace (for Â§3 validation: diff vs RPCS3 SPU interpreter)
  *
  * When the lifter is invoked with --trace, every emitted instruction is
  * surrounded by spu_trace_pc(ctx, PC) before execution and spu_trace_rt(
