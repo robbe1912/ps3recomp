@@ -110,6 +110,21 @@ static int also_prepare(const spu_context* c,uint64_t r,spu_native_leaf_plan* p)
     if(c->pc!=0x200) return 0; /* distinct accepting guard, including under ICF */
     return prepare(c,r,p);
 }
+static uint32_t last_before_original_continuation;
+static int observe_original_continuation(const spu_context* context, uint64_t remaining,
+                                         spu_native_leaf_plan* plan) {
+    (void)context;
+    (void)remaining;
+    (void)plan;
+    last_before_original_continuation = g_spu_interp_last_pc;
+    return 0;
+}
+static int prepare_unbudgeted(const spu_context* c,uint64_t remaining,spu_native_leaf_plan* p) {
+    if (!prepare(c,remaining,p)) return 0;
+    p->instructions=0;
+    p->last_pc=0;
+    return 1;
+}
 static void compare(unsigned value,uint32_t stop,uint64_t budget,int expected_calls) {
     spu_context* ref=program(value),*actual=program(value);
     HostFP csr=get_fp();
@@ -151,6 +166,20 @@ int main(int argc,char** argv) {
     signal(SIGABRT,aborted);
     const char* mode=argc>1 ? argv[1] : "normal";
     if (!strcmp(mode,"empty")) { compare(42,0,0,0);puts("PASS empty registry unchanged");return 0; }
+    if (!strcmp(mode,"unbudgeted")) {
+        const spu_native_leaf operation={0x200,0x208,prepare_unbudgeted};
+        const spu_native_leaf continuation={0x104,0x108,observe_original_continuation};
+        require(!spu_native_leaf_register_unbudgeted(&operation),"unbudgeted registration");
+        require(!spu_native_leaf_register(&continuation),"continuation observer registration");
+        compare(42,0x104,0,0);
+        compare(42,0,2,0);
+        spu_context* c=program(42);
+        require(spu_interp_run(c,0x100)==0x2000,"unbudgeted stop");
+        require(atomic_load(&calls)==1 && c->gpr[3]._u32[0]==42,"real unbudgeted operation");
+        require(g_spu_interp_steps==2,"only interpreted instructions counted");
+        require(last_before_original_continuation==0x100,"last report names actual instruction");
+        free(c);return 0;
+    }
     if(!strcmp(mode,"prefreeze_trace")) {
         option("SPU_CALLTRACE","0");spu_trace_dump(0x200);
     }

@@ -70,7 +70,7 @@ production.write_text(instrument(source))
 r=build('missing-owned-readers',production,readers=False,expect_link=False)
 assert r.returncode!=0 and 'spu_native_owned_enabled' in r.stdout+r.stderr,r.stdout+r.stderr
 exe=build('production',production)
-for mode in ['normal','empty','lookups','cold_workers','prefreeze_trace']:
+for mode in ['normal','empty','lookups','cold_workers','prefreeze_trace','unbudgeted']:
     r=run(exe,mode);assert r.returncode==0,r.stdout+r.stderr
 for mode,message in [('bad','continuation/status'),('plan','invalid plan'),('ambiguous','ambiguous guards')]:
     r=run(exe,mode)

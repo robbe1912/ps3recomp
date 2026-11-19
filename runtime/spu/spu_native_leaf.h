@@ -36,6 +36,12 @@ typedef struct {
 /* 0 success, -1 visible invalid/conflicting/full/late registration. Different
  * guards may share an extent; more than one accepting guard is a fatal error. */
 int spu_native_leaf_register(const spu_native_leaf* leaf);
+/* A channel-free native operation without an instruction count. Only a
+ * full interpreter invocation with no step budget or stop PC may use it.
+ * Set instructions and last_pc to zero. Observer records identify the entry
+ * and resume PCs with a zero instruction count. The caller must also exclude
+ * asynchronous unmasked interrupts across the operation. */
+int spu_native_leaf_register_unbudgeted(const spu_native_leaf* leaf);
 #ifdef __cplusplus
 }
 #endif

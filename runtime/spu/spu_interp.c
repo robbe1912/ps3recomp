@@ -29,6 +29,7 @@ int      g_spu_pending_evt_valid;
 
 enum { NATIVE_LEAVES = 32 };
 static spu_native_leaf native_leaves[NATIVE_LEAVES];
+static unsigned char native_unbudgeted[NATIVE_LEAVES];
 static unsigned native_count;
 static uint32_t native_entries[0x40000 / 128];
 static atomic_flag native_lock = ATOMIC_FLAG_INIT;
@@ -41,7 +42,7 @@ static void native_lock_enter(void) {
 static void native_lock_leave(void) {
     atomic_flag_clear_explicit(&native_lock,memory_order_release);
 }
-int spu_native_leaf_register(const spu_native_leaf* leaf) {
+static int native_register(const spu_native_leaf* leaf,int unbudgeted) {
     const char* error=NULL;
     native_lock_enter();
     if (atomic_load_explicit(&native_frozen,memory_order_relaxed)) error="registry frozen";
@@ -53,13 +54,20 @@ int spu_native_leaf_register(const spu_native_leaf* leaf) {
             if (native_leaves[i].begin==leaf->begin && native_leaves[i].prepare==leaf->prepare)
                 error="duplicate entry/callback";
         if (!error) {
-            native_leaves[native_count++]=*leaf;
+            native_leaves[native_count]=*leaf;
+            native_unbudgeted[native_count++]=(unsigned char)unbudgeted;
             native_entries[leaf->begin>>7] |= 1u<<((leaf->begin>>2)&31);
         }
     }
     native_lock_leave();
     if (error) fprintf(stderr,"[spu-native-leaf] registration rejected: %s\n",error);
     return error ? -1 : 0;
+}
+int spu_native_leaf_register(const spu_native_leaf* leaf) {
+    return native_register(leaf,0);
+}
+int spu_native_leaf_register_unbudgeted(const spu_native_leaf* leaf) {
+    return native_register(leaf,1);
 }
 static void native_freeze(void) {
     if (atomic_load_explicit(&native_frozen,memory_order_acquire)) return;
@@ -85,8 +93,8 @@ static int native_ready(const spu_context* ctx) {
         !ctx->list_stall_mask &&
         !(ctx->int_enable && (__atomic_load_n(&ctx->event_status,__ATOMIC_ACQUIRE)&ctx->event_mask));
 }
-static uint64_t native_try(spu_context* ctx,uint32_t stop,uint64_t remaining,
-                           uint32_t* last) {
+static int native_try(spu_context* ctx,uint32_t stop,uint64_t remaining,int has_budget,
+                      uint32_t* last,uint64_t* steps) {
     if (native_busy || !native_ready(ctx)) return 0;
     const uint32_t pc=ctx->pc;
     const uint32_t interrupt_enable=ctx->int_enable, event_mask=ctx->event_mask;
@@ -96,16 +104,19 @@ static uint64_t native_try(spu_context* ctx,uint32_t stop,uint64_t remaining,
     native_busy=1;
     for (unsigned i=0;i<native_count;i++) {
         const spu_native_leaf* leaf=&native_leaves[i];
+        const int unbudgeted=native_unbudgeted[i];
         if (leaf->begin!=pc || (stop && stop>=leaf->begin && stop<leaf->end)) continue;
+        if (unbudgeted && (has_budget || stop)) continue;
         spu_native_leaf_plan plan={0};
         int result=leaf->prepare(ctx,remaining,&plan);
         if (result<0 || result>1) native_error("prepare result");
         if (ctx->pc!=pc) native_error("prepare changed entry PC");
         if (!native_ready(ctx)) { native_busy=0; return 0; }
         if (!result) continue;
-        if (!plan.execute || !plan.instructions || (plan.resume_pc&3) ||
+        if (!plan.execute || (plan.resume_pc&3) ||
             plan.resume_pc>=0x40000 || (plan.resume_pc>=leaf->begin && plan.resume_pc<leaf->end) ||
-            (plan.last_pc&3) || plan.last_pc<leaf->begin || plan.last_pc>=leaf->end)
+            (unbudgeted ? plan.instructions || plan.last_pc :
+             !plan.instructions || (plan.last_pc&3) || plan.last_pc<leaf->begin || plan.last_pc>=leaf->end))
             native_error("invalid plan");
         if (plan.instructions>remaining) continue;
         if (++accepted>1) native_error("ambiguous guards");
@@ -120,12 +131,13 @@ static uint64_t native_try(spu_context* ctx,uint32_t stop,uint64_t remaining,
             ctx->ls!=ctx->ls_store || ctx->list_stall_mask || ctx->host_depth!=depth ||
             ctx->int_enable!=interrupt_enable || ctx->event_mask!=event_mask)
             native_error("continuation/status");
-        PS3_SPU_EXECUTION(PS3_SPU_NATIVE_END, ctx, chosen.last_pc, ctx->pc,
+        PS3_SPU_EXECUTION(PS3_SPU_NATIVE_END, ctx, chosen.instructions ? chosen.last_pc : pc, ctx->pc,
             chosen.instructions, PS3_SPU_NATIVE_LOGICAL_PC, (uintptr_t)chosen.execute);
-        *last=chosen.last_pc;
+        if (chosen.instructions) *last=chosen.last_pc;
+        *steps+=chosen.instructions;
     }
     native_busy=0;
-    return accepted ? chosen.instructions : 0;
+    return accepted!=0;
 }
 
 /* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
@@ -565,9 +577,11 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
             !_tr && !_cap && !_g1 && !g_spu_ls_watch_n &&
             g_spu_ls_probe<=0 && g_spu_smc_watch<=0 &&
             !native_instrumented) {
-            uint32_t last=ctx->pc;
-            uint64_t used=native_try(ctx,stop_lsa,(budget ? budget : UINT64_MAX)-steps,&last);
-            if (used) { steps+=used; g_spu_interp_last_pc=last; continue; }
+            uint32_t last=g_spu_interp_last_pc;
+            if (native_try(ctx,stop_lsa,(budget ? budget : UINT64_MAX)-steps,budget!=0,&last,&steps)) {
+                g_spu_interp_last_pc=last;
+                continue;
+            }
         }
         int owned_mode=spu_native_owned_policy(ctx);
         int can_rejoin=!owned_mode || (!budget && (!stop_lsa || (native_call && ctx->host_depth>0 && stop_lsa==ctx->drain_ret_pc)) && !_tr && !_cap && !_g1 &&
