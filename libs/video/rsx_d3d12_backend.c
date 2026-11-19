@@ -1636,7 +1636,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     rb->lpVtbl->Release(rb);
 }
 
-static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx, int backbuffer_only)
 {
     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
     if (!base || !*base) base = "rsxcap";
@@ -1648,7 +1648,11 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
     /* Manifest: every op in submission order with full state. */
     snprintf(path, sizeof path, "%s/manifest.txt", dir);
     FILE* mf = fopen(path, "w");
-    if (mf) {
+    if (mf && backbuffer_only) {
+        fprintf(mf, "frame_count=%llu draws=%u backbuffer=%ux%u\npresenting=1\n",
+                (unsigned long long)s_d3d.frame_count, ndraws, s_d3d.width, s_d3d.height);
+        fclose(mf);
+    } else if (mf) {
         fprintf(mf, "frame_count=%llu draws=%u backbuffer=%ux%u\n",
                 (unsigned long long)s_d3d.frame_count, ndraws, s_d3d.width, s_d3d.height);
         for (int i = 0; i < MAX_OFF_RTS; i++)
@@ -1718,6 +1722,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
     snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
     cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
                        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
+    if (backbuffer_only) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!r->res || !r->used) continue;
@@ -5534,6 +5539,7 @@ skip_dump_consider: ;
       const char* presented_arm = getenv("RSX_CAP_PRESENT_ARM_FILE");
       if (cap || presented_arm) {
         static int parsed = 0;
+        static int backbuffer_only = 0;
         static rsx_capture_schedule s_cap;
         if (!parsed) {
             u32 a = 0, b = 1, c = 1;
@@ -5544,6 +5550,12 @@ skip_dump_consider: ;
                 fprintf(stderr, "[rsxcap] invalid RSX_CAP_SCREEN_ONLY (expected 0 or 1)\n");
                 abort();
             }
+            const char* mode = getenv("RSX_CAP_BACKBUFFER_ONLY");
+            if (mode && (strcmp(mode, "0") && (strcmp(mode, "1") || !s_cap.screen_only))) {
+                fprintf(stderr, "[rsxcap] RSX_CAP_BACKBUFFER_ONLY requires 0 or 1 with screen capture enabled\n");
+                abort();
+            }
+            backbuffer_only = mode && !strcmp(mode, "1");
             parsed = 1;
         }
         if (presented_arm && !s_cap.presented_mode) {
@@ -5565,9 +5577,11 @@ skip_dump_consider: ;
             }
         }
         u32 index;
-        if (rsx_capture_schedule_next(&s_cap, s_d3d.frame_count,
-                s_dbg_last_draws > 0, s_present_this_frame, &index))
-            rsx_capture_frame(fi, s_dbg_last_draws, index);
+        unsigned reason = rsx_capture_schedule_next(&s_cap, s_d3d.frame_count,
+            s_dbg_last_draws > 0, s_present_this_frame, &index);
+        if (reason)
+            rsx_capture_frame(fi, s_dbg_last_draws, index,
+                backbuffer_only && !s_cap.presented_mode && reason == RSX_CAPTURE_SCHEDULED);
       } }
 
     /* Present */
