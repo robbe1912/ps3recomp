@@ -64,6 +64,84 @@ static void cpu_surface_profile_emit(CpuSurfaceRequest *request) {
             (unsigned long)s_cpu_surface_thread,(unsigned long long)p->queued,
             (unsigned long long)p->started,(unsigned long long)p->finished);
 }
+/* Client-visible surface views. A client thread serves a read itself when
+ * guest memory already holds every write recorded for each surface the read
+ * touches. Any other read takes the queued path.
+ * The renderer owns one view for each slot of the surface pool. It is the
+ * only writer of a view, and only between two stores of an odd sequence
+ * number. A reader uses the fields only when it reads the same even sequence
+ * number before and after them (a seqlock). Stores are release and loads are
+ * acquire, so a reader that sees the new sequence number also sees the bytes
+ * the renderer packed into guest memory first. x86-64 keeps load-load and
+ * store-store order as other processors observe them. Every field is one
+ * aligned 64-bit word.
+ * The views form one table. s_cpu_surface_views holds the table address in
+ * bits 0 to 46 and the entry count in bits 48 to 63, so a reader gets both
+ * with one load. The renderer replaces the table only to add entries. It
+ * never frees a table, because a reader can still hold an older address, and
+ * it gives every entry of a replaced table an odd sequence number.
+ * The request profile check compiles this block without <stdatomic.h>, so it
+ * uses the C11 atomic builtins.
+ * The renderer packs bytes only while its view is not ready. The load that
+ * follows a served read is as current as the load that follows a queued hit:
+ * both loads run after the handler returns. */
+typedef struct CpuSurfaceView {
+    _Atomic u64 sequence;   /* odd while the renderer changes this view */
+    _Atomic u64 begin, end; /* guest byte range [begin, end), both 0: no surface */
+    _Atomic u64 ready;      /* 1: a renderer copy of this surface would be a hit */
+    _Atomic u64 noted;      /* 1 after a client read served this surface; the prefetch refresh takes it */
+} CpuSurfaceView;
+#define CPU_SURFACE_VIEW_ADDRESS 0x7FFFFFFFFFFFull   /* table address: bits 0 to 46 */
+#define CPU_SURFACE_VIEW_COUNT 48                    /* entry count: bits 48 to 63 */
+enum { CPU_SURFACE_VIEW_CHANGING, CPU_SURFACE_VIEW_CLEAR, CPU_SURFACE_VIEW_PENDING, CPU_SURFACE_VIEW_READY };
+static _Atomic u64 s_cpu_surface_views;
+static int s_cpu_surface_fast;      /* RSX_CPU_SURFACE_FAST=0 keeps every read queued */
+static _Atomic u64 s_cpu_surface_fast_served;
+static u64 cpu_surface_view_load(const _Atomic u64 *value) {
+    return __c11_atomic_load(value,__ATOMIC_ACQUIRE);
+}
+static void cpu_surface_view_store(_Atomic u64 *value,u64 next) {
+    __c11_atomic_store(value,next,__ATOMIC_RELEASE);
+}
+static u64 cpu_surface_view_exchange(_Atomic u64 *value,u64 next) {
+    return __c11_atomic_exchange(value,next,__ATOMIC_ACQ_REL);
+}
+static u64 cpu_surface_view_increase(_Atomic u64 *value) {
+    return __c11_atomic_fetch_add(value,1,__ATOMIC_RELAXED)+1;
+}
+/* One client read of guest bytes [address, address+bytes) against view v. */
+static int cpu_surface_view_probe(const CpuSurfaceView *v,u32 address,u32 bytes) {
+    u64 sequence=cpu_surface_view_load(&v->sequence);
+    if(sequence&1)return CPU_SURFACE_VIEW_CHANGING;
+    u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end),ready=cpu_surface_view_load(&v->ready);
+    if(cpu_surface_view_load(&v->sequence)!=sequence)return CPU_SURFACE_VIEW_CHANGING;
+    if((u64)address>=end || (u64)address+bytes<=begin)return CPU_SURFACE_VIEW_CLEAR;
+    return ready?CPU_SURFACE_VIEW_READY:CPU_SURFACE_VIEW_PENDING;
+}
+/* Client thread. Returns 1 when it served the read, so no request is queued.
+ * A view that changes or waits for a copy makes the read take the queued
+ * path. A read that touches no surface takes the queued path too. */
+static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
+    if(!s_cpu_surface_fast)return 0;
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views);
+    CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
+    u64 hits=0;
+    for(u64 i=views>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
+        int state=cpu_surface_view_probe(v,address,bytes);
+        if(state!=CPU_SURFACE_VIEW_CLEAR && state!=CPU_SURFACE_VIEW_READY)return 0;
+        if(state==CPU_SURFACE_VIEW_READY){
+            if(!cpu_surface_view_load(&v->noted))cpu_surface_view_store(&v->noted,1);
+            hits++;
+        }
+    }
+    if(!hits)return 0;
+    CpuSurfaceRequest fast={0};fast.address=address;fast.bytes=bytes;fast.client_thread=client_thread;
+    fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
+    fast.profile.matched=fast.profile.hits=hits;cpu_surface_profile_emit(&fast);
+    u64 served=cpu_surface_view_increase(&s_cpu_surface_fast_served);
+    if(s_cpu_surface_profile && !(served&1023))fprintf(stderr,"[CPUSURFACE_FAST] served=%llu\n",(unsigned long long)served);
+    return 1;
+}
 static void cpu_surface_fence_wait(void) {
     if(s_cpu_surface_fence_value==UINT64_MAX)cpu_surface_fail("GPU fence counter overflow",E_FAIL);
     u64 value=++s_cpu_surface_fence_value;
@@ -98,6 +176,67 @@ static void cpu_surface_fence_block(ID3D12Fence *fence,HANDLE event,u64 value,co
     if(cpu_surface_fence_reached(fence,value))return;
     CPU_SURFACE_HR(fence->lpVtbl->SetEventOnCompletion(fence,value,event));
     if(WaitForSingleObject(event,30000)!=WAIT_OBJECT_0 || !cpu_surface_fence_reached(fence,value))cpu_surface_fail(operation,E_FAIL);
+}
+/* Renderer thread only: one client-visible view for each slot of the surface
+ * pool. CPU_SURFACE_CAPACITY is the slot count of the pool. */
+static int cpu_surface_view_index(OffRT *r) {
+    int index=(int)(r-s_d3d.off_rt);
+    if(index<0 || index>=CPU_SURFACE_CAPACITY)cpu_surface_fail("surface view index",E_INVALIDARG);
+    return index;
+}
+/* Renderer thread. The view of slot `index`, or NULL when the table has no
+ * entry for it. */
+static CpuSurfaceView *cpu_surface_view_entry(int index) {
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views);
+    if((u64)index>=views>>CPU_SURFACE_VIEW_COUNT)return NULL;
+    return (CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS)+index;
+}
+/* Renderer thread. The view of slot `index`. A slot beyond the table adds
+ * entries: a table of twice the count (16 at first), then the old table
+ * retires. Returns NULL when the table cannot grow. That slot then has no
+ * view, and reads of it keep the queued path. */
+static CpuSurfaceView *cpu_surface_view_slot(int index) {
+    CpuSurfaceView *view=cpu_surface_view_entry(index);
+    if(view)return view;
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views),count=views>>CPU_SURFACE_VIEW_COUNT;
+    CpuSurfaceView *old=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
+    u64 next=count?count*2:16;
+    while(next<=(u64)index && next<=0x8000)next*=2;
+    if(next>0xFFFF)return NULL;
+    CpuSurfaceView *table=(CpuSurfaceView *)calloc((size_t)next,sizeof(CpuSurfaceView));
+    if(!table)return NULL;
+    if((uintptr_t)table&~CPU_SURFACE_VIEW_ADDRESS){free(table);return NULL;}
+    for(u64 i=0;i<count;i++) {
+        cpu_surface_view_store(&table[i].sequence,cpu_surface_view_load(&old[i].sequence));
+        cpu_surface_view_store(&table[i].begin,cpu_surface_view_load(&old[i].begin));
+        cpu_surface_view_store(&table[i].end,cpu_surface_view_load(&old[i].end));
+        cpu_surface_view_store(&table[i].ready,cpu_surface_view_load(&old[i].ready));
+        cpu_surface_view_store(&table[i].noted,cpu_surface_view_load(&old[i].noted));
+    }
+    cpu_surface_view_store(&s_cpu_surface_views,(uintptr_t)table|next<<CPU_SURFACE_VIEW_COUNT);
+    for(u64 i=0;i<count;i++)cpu_surface_view_store(&old[i].sequence,cpu_surface_view_load(&old[i].sequence)+1);
+    return table+index;
+}
+/* Renderer thread. Publishes r as cpu_surface_read and cpu_surface_copy see
+ * it now: the guest bytes r owns and whether a copy of r would be a hit. The
+ * new view is visible only after all four fields are stored. */
+static void cpu_surface_view_update(OffRT *r) {
+    CpuSurfaceView *v=cpu_surface_view_slot(cpu_surface_view_index(r));
+    if(!v)return;
+    int live=r->res && r->cpu_address;
+    u64 begin=live?(u64)r->cpu_address:0,end=live?begin+(u64)r->cpu_pitch*r->h:0;
+    u64 ready=!r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation;
+    u64 sequence=cpu_surface_view_load(&v->sequence);
+    cpu_surface_view_store(&v->sequence,sequence+1);
+    cpu_surface_view_store(&v->begin,begin);cpu_surface_view_store(&v->end,end);cpu_surface_view_store(&v->ready,ready);
+    cpu_surface_view_store(&v->sequence,sequence+2);
+}
+/* Renderer thread. r left its slot. No client may serve the old range, and a
+ * noted read must not reach the next surface of the slot. */
+static void cpu_surface_view_retire(OffRT *r) {
+    cpu_surface_view_update(r);
+    CpuSurfaceView *v=cpu_surface_view_entry(cpu_surface_view_index(r));
+    if(v)cpu_surface_view_exchange(&v->noted,0);
 }
 /* Prefetched copies of opted-in surfaces. RSX_CPU_SURFACE_PREFETCH lists up
  * to four RSX surface offsets (1-8 hex digits each, comma separated); none by
@@ -197,7 +336,7 @@ static int cpu_surface_prefetch_take(OffRT *r) {
     if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)((u64)r->cpu_pitch*r->h),r->cpu_pitch,
         mapped,(size_t)e->readback_bytes,e->readback_pitch,width,r->h,r->cpu_format))cpu_surface_fail("prefetched surface packing",E_INVALIDARG);
     D3D12_RANGE empty={0,0};e->readback->lpVtbl->Unmap(e->readback,0,&empty);
-    r->cpu_generation=r->gpu_generation;e->used++;
+    r->cpu_generation=r->gpu_generation;e->used++;cpu_surface_view_update(r);
     return 1;
 }
 /* Follow the surface at e->off. Returns it, or NULL when it is not live. */
@@ -266,6 +405,9 @@ static void cpu_surface_prefetch_refresh(void) {
     CpuSurfacePrefetch *entries[CPU_SURFACE_PREFETCH_MAX];OffRT *surfaces[CPU_SURFACE_PREFETCH_MAX];unsigned count=0;
     for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
         CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];OffRT *r=cpu_surface_prefetch_track(e);
+        /* A read a client thread served itself asks for the next copy as well. */
+        CpuSurfaceView *view=r?cpu_surface_view_entry(cpu_surface_view_index(r)):NULL;
+        if(view && cpu_surface_view_exchange(&view->noted,0))e->wanted=1;
         if(r && e->wanted && r->gpu_generation && r->gpu_generation!=e->generation && cpu_surface_prefetch_width(r)){entries[count]=e;surfaces[count++]=r;}
     }
     if(!count)return;
@@ -375,7 +517,7 @@ static void cpu_surface_copy(OffRT *r) {
     if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)guest_bytes,r->cpu_pitch,
         mapped,(size_t)bytes,pitch,width,r->h,r->cpu_format))cpu_surface_fail("guest surface packing",E_INVALIDARG);
     D3D12_RANGE empty={0,0};r->cpu_readback->lpVtbl->Unmap(r->cpu_readback,0,&empty);
-    r->cpu_generation=r->gpu_generation;
+    r->cpu_generation=r->gpu_generation;cpu_surface_view_update(r);
     if(s_cpu_surface_profile_active) {
         s_cpu_surface_profile_active->packing+=cpu_surface_tick()-profile_begin;
         s_cpu_surface_profile_active->copies++;
@@ -560,6 +702,7 @@ static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
         cpu_surface_read(address,bytes);s_cpu_surface_profile_active=previous;
         direct.profile.finished=direct.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&direct);return;
     }
+    if(cpu_surface_fast_request(address,bytes,client_thread))return;
     CpuSurfaceRequest request={0};request.address=address;request.bytes=bytes;request.client_thread=client_thread;request.status=-1;request.queued_ms=GetTickCount64();request.profile.queued=cpu_surface_tick();
     request.done=CreateEventA(NULL,FALSE,FALSE,NULL);
     if(!request.done)cpu_surface_fail("CPU read event creation",E_FAIL);
@@ -778,6 +921,7 @@ static void cpu_surface_init(void) {
     s_cpu_surface_prompt=!(prompt&&prompt[0]=='0'&&!prompt[1]);
     const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
     s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
+    const char *fast=getenv("RSX_CPU_SURFACE_FAST");s_cpu_surface_fast=!(fast&&fast[0]=='0'&&!fast[1]);
     cpu_surface_batch_submitted();
     cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
     if(s_cpu_surface_profile) {
@@ -799,7 +943,7 @@ static void cpu_surface_retire(OffRT *r) {
     cpu_surface_prefetch_retire(r);
     cpu_surface_copy(r);
     if(r->cpu_readback){r->cpu_readback->lpVtbl->Release(r->cpu_readback);r->cpu_readback=NULL;}
-    r->cpu_address=r->cpu_pitch=0;r->gpu_generation=r->cpu_generation=0;
+    r->cpu_address=r->cpu_pitch=0;r->gpu_generation=r->cpu_generation=0;cpu_surface_view_retire(r);
 }
 static void cpu_surface_shutdown(void) {
     vm_read_sync_set_handler(NULL,NULL);
@@ -842,9 +986,10 @@ static void cpu_surface_bind(int index,const D3D12DrawRecord *draw,unsigned targ
     if(r->cpu_pitch!=pitch)r->cpu_generation=0;
     r->cpu_address=address;r->cpu_pitch=pitch;r->cpu_format=draw->rt_fmt;
     if(address && vm_read_sync_mark_range(address,(u64)pitch*r->h))cpu_surface_fail("guest surface registration",E_INVALIDARG);
+    cpu_surface_view_update(r);
 }
 static void cpu_surface_written(int primary,const int secondary[3]) {
-    if(primary>=0)s_d3d.off_rt[primary].gpu_generation++;
-    for(int i=0;i<3;i++)if(secondary[i]>=0)s_d3d.off_rt[secondary[i]].gpu_generation++;
+    if(primary>=0){s_d3d.off_rt[primary].gpu_generation++;cpu_surface_view_update(&s_d3d.off_rt[primary]);}
+    for(int i=0;i<3;i++)if(secondary[i]>=0){s_d3d.off_rt[secondary[i]].gpu_generation++;cpu_surface_view_update(&s_d3d.off_rt[secondary[i]]);}
 }
 #undef CPU_SURFACE_HR
