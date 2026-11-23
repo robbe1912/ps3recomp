@@ -1,0 +1,224 @@
+/* Authored stand-ins for the D3D12 objects of the per-draw GPU record. The
+ * fake clock moves by `step` at each timestamp. ResolveQueryData counts the
+ * timestamps; Map returns them, or fails on request. No game bytes. */
+#define _CRT_SECURE_NO_WARNINGS
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+typedef size_t SIZE_T;
+typedef unsigned int UINT;
+typedef long HRESULT;
+#define FAILED(hr) ((hr) < 0)
+#define SUCCEEDED(hr) ((hr) >= 0)
+#define MAX_DRAWS 8
+#define QUERIES (MAX_DRAWS * 2u + 2u)
+#define PHASE_DRAW_ROWS_MAX @LIMIT@u
+#define D3D12_QUERY_TYPE_TIMESTAMP 2u
+#define D3D12_QUERY_HEAP_TYPE_TIMESTAMP 1u
+#define D3D12_RESOURCE_DIMENSION_BUFFER 1u
+#define D3D12_TEXTURE_LAYOUT_ROW_MAJOR 1u
+#define D3D12_HEAP_TYPE_READBACK 2u
+#define D3D12_HEAP_FLAG_NONE 0u
+#define D3D12_RESOURCE_STATE_COPY_DEST 8u
+typedef struct { SIZE_T Begin, End; } D3D12_RANGE;
+typedef struct { UINT Type, Count; } D3D12_QUERY_HEAP_DESC;
+typedef struct { UINT Type; } D3D12_HEAP_PROPERTIES;
+typedef struct { UINT Dimension; u64 Width; UINT Height, DepthOrArraySize, MipLevels, Layout;
+                 struct { UINT Count, Quality; } SampleDesc; } D3D12_RESOURCE_DESC;
+typedef struct device device; typedef device ID3D12Device;
+typedef struct queue queue; typedef queue ID3D12CommandQueue;
+typedef struct list list; typedef list ID3D12GraphicsCommandList;
+typedef struct heap heap; typedef heap ID3D12QueryHeap;
+typedef struct resource resource; typedef resource ID3D12Resource;
+struct device_vtable {
+    HRESULT (*CreateQueryHeap)(device*, const D3D12_QUERY_HEAP_DESC*, const void*, void**);
+    HRESULT (*CreateCommittedResource)(device*, const D3D12_HEAP_PROPERTIES*, UINT,
+        const D3D12_RESOURCE_DESC*, UINT, const void*, const void*, void**);
+};
+struct queue_vtable { HRESULT (*GetTimestampFrequency)(queue*, u64*); };
+struct list_vtable {
+    void (*EndQuery)(list*, heap*, UINT, UINT);
+    void (*ResolveQueryData)(list*, heap*, UINT, UINT, UINT, resource*, u64);
+};
+struct heap_vtable { u32 (*Release)(heap*); };
+struct resource_vtable {
+    HRESULT (*Map)(resource*, UINT, const D3D12_RANGE*, void**);
+    void (*Unmap)(resource*, UINT, const D3D12_RANGE*);
+    u32 (*Release)(resource*);
+};
+struct device { struct device_vtable* lpVtbl; };
+struct queue { struct queue_vtable* lpVtbl; };
+struct list { struct list_vtable* lpVtbl; };
+struct heap { struct heap_vtable* lpVtbl; };
+struct resource { struct resource_vtable* lpVtbl; };
+static const int IID_ID3D12QueryHeap = 1, IID_ID3D12Resource = 2;
+typedef struct {
+    u32 vertex_count, topology, rt_off, rt_mrt[3], vp_w, vp_h, fp_addr;
+    int vs_idx;
+} D3D12DrawRecord;
+typedef struct { u32 hash; } VPVSEntry;
+static struct {
+    device* device; queue* cmd_queue; list* cmd_list; u64 frame_count;
+    VPVSEntry vp_vs[3]; int vp_vs_n;
+} s_d3d;
+static u64 ticks[QUERIES];
+static u64 clock_tick, step, frequency = 1000000;
+static UINT resolved_n, end_queries;
+static int resolves, maps, map_fails, created;
+static int heap_released, readback_released;
+static int checks, failures;
+static void check(int good, const char* label)
+{
+    ++checks;
+    if (!good) { ++failures; fprintf(stderr, "FAIL %s\n", label); }
+}
+static u64 next_tick(void) { clock_tick += step; return clock_tick; }
+static heap query_heap;
+static resource readback;
+static HRESULT create_heap(device* d, const D3D12_QUERY_HEAP_DESC* q, const void* iid, void** out)
+{
+    (void)d; (void)iid;
+    check(q->Type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP && q->Count == QUERIES,
+          "one timestamp heap with a pair per draw and the batch ends");
+    *out = &query_heap; ++created;
+    return 0;
+}
+static HRESULT create_readback(device* d, const D3D12_HEAP_PROPERTIES* hp, UINT flags,
+                               const D3D12_RESOURCE_DESC* rd, UINT state, const void* clear,
+                               const void* iid, void** out)
+{
+    (void)d; (void)flags; (void)clear; (void)iid;
+    check(hp->Type == D3D12_HEAP_TYPE_READBACK && rd->Width == (u64)QUERIES * 8u &&
+          state == D3D12_RESOURCE_STATE_COPY_DEST, "a readback buffer of one u64 per timestamp");
+    *out = &readback; ++created;
+    return 0;
+}
+static HRESULT get_frequency(queue* q, u64* hz) { (void)q; *hz = frequency; return 0; }
+static void end_query(list* l, heap* h, UINT type, UINT index)
+{
+    (void)l; (void)h;
+    check(type == D3D12_QUERY_TYPE_TIMESTAMP && index < QUERIES, "timestamp index inside the heap");
+    ticks[index] = next_tick(); ++end_queries;
+}
+static void resolve(list* l, heap* h, UINT type, UINT first, UINT count, resource* dest, u64 aligned)
+{
+    (void)l; (void)h;
+    check(type == D3D12_QUERY_TYPE_TIMESTAMP && first == 0 && dest == &readback && aligned == 0 &&
+          count == end_queries, "the readback copy takes every timestamp of the batch");
+    resolved_n = count; end_queries = 0; ++resolves;
+}
+static HRESULT map(resource* r, UINT subresource, const D3D12_RANGE* range, void** data)
+{
+    (void)r;
+    check(subresource == 0 && range->Begin == 0 && range->End == (SIZE_T)resolved_n * 8,
+          "the map reads exactly the resolved timestamps");
+    ++maps;
+    if (map_fails) return (HRESULT)0x80004005u;
+    *data = ticks;
+    return 0;
+}
+static void unmap(resource* r, UINT subresource, const D3D12_RANGE* range) { (void)r; (void)subresource; (void)range; }
+static u32 release_heap(heap* h) { (void)h; ++heap_released; return 0; }
+static u32 release_readback(resource* r) { (void)r; ++readback_released; return 0; }
+static struct device_vtable device_ops = { create_heap, create_readback };
+static struct queue_vtable queue_ops = { get_frequency };
+static struct list_vtable list_ops = { end_query, resolve };
+static struct heap_vtable heap_ops = { release_heap };
+static struct resource_vtable resource_ops = { map, unmap, release_readback };
+static device fixture_device = { &device_ops };
+static queue fixture_queue = { &queue_ops };
+static list fixture_list = { &list_ops };
+/* The record block closes its file through this count. */
+static int closes;
+static int fixture_fclose(FILE* file) { ++closes; return fclose(file); }
+#define fclose fixture_fclose
+@BLOCK@
+#undef fclose
+/* One timestamped draw: the start timestamp at the current step, the row, and
+ * with end_step the end timestamp at that step. */
+static void draw(const D3D12DrawRecord* dr, u32 index, u32 flags, u32 barriers, u32 end_step)
+{
+    draw_csv_query();
+    draw_csv_row(dr, index, flags, barriers);
+    if (end_step) { step = end_step; draw_csv_query(); }
+}
+int main(int argc, char** argv)
+{
+    const char* mode = argc > 1 ? argv[1] : "off";
+    (void)fixture_fclose;   /* a fixture control removes the only call of it */
+    D3D12DrawRecord a = {0}, b = {0}, c = {0};
+    query_heap.lpVtbl = &heap_ops; readback.lpVtbl = &resource_ops;
+    s_d3d.device = &fixture_device; s_d3d.cmd_queue = &fixture_queue; s_d3d.cmd_list = &fixture_list;
+    a.vertex_count = 12; a.topology = 4; a.rt_off = 0x01A80500; a.rt_mrt[0] = 0xAB00;
+    a.vp_w = 1280; a.vp_h = 720; a.vs_idx = 2; a.fp_addr = 0x036CC2C1;
+    b.vertex_count = 300; b.topology = 4; b.vp_w = 320; b.vp_h = 180; b.vs_idx = -1; b.fp_addr = 0x10;
+    c.vertex_count = 6; c.topology = 4; c.vs_idx = 7;   /* slot 7 does not exist */
+    s_d3d.vp_vs[2].hash = 0x11223344; s_d3d.vp_vs_n = 3;
+    if (strcmp(mode, "off") == 0) {
+        check(draw_csv_on() == 0, "no record without RSX_DRAW_CSV");
+        draw_csv_batch_begin();
+        check(draw_csv_viewport(0, 0, 1, 1, 0, 0, 1, 1) == 0, "no viewport tracking when off");
+        draw(&a, 3, 0, 0, 1);
+        check(s_draw_rows_n == 0, "no row when off");
+        draw_csv_batch_end();
+        draw_csv_shutdown();
+        check(created == 0 && end_queries == 0 && s_draw_csv == NULL, "off creates nothing");
+    } else if (strcmp(mode, "noclock") == 0) {
+        frequency = 0;
+        check(draw_csv_on() == 0, "no record without a GPU timestamp frequency");
+        draw_csv_batch_begin();
+        check(s_draw_query_n == 0, "no timestamp without a frequency");
+        draw_csv_shutdown();
+        check(closes == 0 && heap_released == 1 && readback_released == 1,
+              "shutdown releases the created objects and closes no file");
+    } else {
+        check(draw_csv_on() == 1, "record with RSX_DRAW_CSV");
+        /* Batch 0: two draws with an end timestamp and one without. */
+        step = 40; draw_csv_batch_begin();                                   /* 40 */
+        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 1, "first viewport is a change");
+        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 0, "same viewport is no change");
+        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 640, 720) == 1, "scissor change is a change");
+        step = 60; draw_csv_query(); step = 20;                              /* 100 */
+        draw_csv_row(&a, 3, PHASE_DRAW_VIEWPORT, 0); draw_csv_query();       /* 120 */
+        step = 250; draw(&b, 4, PHASE_DRAW_TARGETS | PHASE_DRAW_PSO | PHASE_DRAW_SRV, 2, 30); /* 370, 400 */
+        step = 70; draw(&c, 5, 0, 0, 0);                                     /* 470 */
+        step = 30; draw_csv_batch_end();                                     /* 500 */
+        s_d3d.frame_count = 1;
+        check(resolved_n == 7 && s_draw_rows_n == 3, "batch 0 holds three rows and seven timestamps");
+        /* Batch 1 writes batch 0 at its start. */
+        step = 1000; draw_csv_batch_begin();                                 /* 1500 */
+        check(s_draw_csv_rows == 2 && s_draw_rows_n == 0,
+              "two rows of batch 0 written; the third has no end timestamp");
+        check(s_draw_query_n == 1 && ticks[0] == 1500, "batch 1 starts the timestamps again at index 0");
+        step = 100; draw(&a, 9, 0, 0, 1); step = 1; draw_csv_batch_end();
+        s_d3d.frame_count = 2;
+        /* Batch 2: the readback of batch 1 fails, so its rows are dropped. Two draws. */
+        map_fails = 1; step = 100; draw_csv_batch_begin();
+        check(s_draw_csv_rows == 2 && s_draw_rows_n == 0, "a failed readback drops the rows");
+        map_fails = 0;
+        step = 10; draw_csv_query(); step = 5;
+        draw_csv_row(&c, 20, 0, 0); draw_csv_query();
+        step = 7; draw(&b, 21, 0, 0, 0); step = 1; draw_csv_batch_end();
+        s_d3d.frame_count = 3;
+        /* Batch 3 writes the first row of batch 2. It is the last row below the limit. */
+        draw_csv_batch_begin();
+        check(s_draw_csv_rows == PHASE_DRAW_ROWS_MAX && s_draw_csv_stopped == 0,
+              "the last row below the limit is written");
+        draw(&a, 12, 0, 0, 1); draw_csv_batch_end();
+        s_d3d.frame_count = 4;
+        /* Batch 4 meets the limit with the row of batch 3. */
+        draw_csv_batch_begin();
+        check(s_draw_csv_rows == PHASE_DRAW_ROWS_MAX && s_draw_csv_stopped == 1 && s_draw_rows_n == 0,
+              "the file stops at the row limit and takes no row after it");
+        draw_csv_shutdown();
+        check(s_draw_csv == NULL && closes == 1 && heap_released == 1 && readback_released == 1,
+              "shutdown closes the file and releases the query objects");
+    }
+    printf("draw record checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
