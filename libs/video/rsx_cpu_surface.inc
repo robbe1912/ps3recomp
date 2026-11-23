@@ -142,6 +142,10 @@ static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
     if(s_cpu_surface_profile && !(served&1023))fprintf(stderr,"[CPUSURFACE_FAST] served=%llu\n",(unsigned long long)served);
     return 1;
 }
+/* Layout of the state that the snapshot range check reads twice: the view
+ * table, the sum of its sequence numbers, the sequence number of the recorded
+ * draws, and the number of surfaces that hold a range. */
+enum { CPU_SURFACE_SNAPSHOT_TABLE, CPU_SURFACE_SNAPSHOT_SEQUENCES, CPU_SURFACE_SNAPSHOT_PENDING, CPU_SURFACE_SNAPSHOT_MATCHED, CPU_SURFACE_SNAPSHOT_SEEN };
 static void cpu_surface_fence_wait(void) {
     if(s_cpu_surface_fence_value==UINT64_MAX)cpu_surface_fail("GPU fence counter overflow",E_FAIL);
     u64 value=++s_cpu_surface_fence_value;
@@ -725,11 +729,61 @@ static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
     cpu_surface_profile_emit(&request);
     CloseHandle(request.done);
 }
+/* Snapshot fast path, client thread. RSX_CPU_SURFACE_SNAPSHOT_FAST=1 enables
+ * it; by default every snapshot request takes the FIFO boundary path.
+ * A request is served on the calling thread when the renderer holds nothing
+ * for its bytes: no recorded draw targets a range, and every surface that
+ * meets a range is current and holds the whole range. The guest bytes are
+ * then the bytes a scalar read of the same addresses serves on its calling
+ * thread (cpu_surface_fast_request). The check does not consume the FIFO: a
+ * draw that the guest published and the renderer did not record yet is not
+ * seen, as for a scalar read.
+ * The client reads the bytes into its own buffer and then repeats the check.
+ * The renderer writes the guest bytes of a surface only while that surface
+ * is not current, and it changes a view or the recorded draws only between
+ * two steps of a sequence number. An equal second check proves that no such
+ * change fell between the first check and the end of the read, so the bytes
+ * are one state of the memory. A declined request leaves the staging buffer
+ * unchanged and takes the boundary path. */
+/* Defined with the recorded draws of the prompt service. */
+static int cpu_surface_snapshot_clear(const VmReadSnapshotRange *ranges,u32 count,u64 *seen);
+static int cpu_surface_snapshot_recheck(const VmReadSnapshotRange *ranges,u32 count,const u64 *seen);
+static int s_cpu_surface_snapshot_fast;   /* RSX_CPU_SURFACE_SNAPSHOT_FAST=1 */
+static _Atomic u64 s_cpu_surface_snapshot_served, s_cpu_surface_snapshot_queued;
+/* Returns 1 when it served the request and staging holds the bytes. Returns 0
+ * when the request takes the boundary path. */
+static int cpu_surface_snapshot_fast(const VmReadSnapshotRange *ranges,u32 count,void *staging,u32 output_bytes,u32 client_thread) {
+    extern uint8_t *vm_base;
+    if(!s_cpu_surface_snapshot_fast)return 0;
+    if(!ranges || !staging || !count || count>VM_READ_SNAPSHOT_MAX_RANGES || !output_bytes || output_bytes>VM_READ_SNAPSHOT_MAX_BYTES)return 0;
+    for(u32 i=0;i<count;i++)
+        if(!ranges[i].bytes || (u64)ranges[i].address+ranges[i].bytes>0x100000000ull || (u64)ranges[i].output_offset+ranges[i].bytes>output_bytes)return 0;
+    unsigned char bytes[VM_READ_SNAPSHOT_MAX_BYTES];
+    u64 seen[CPU_SURFACE_SNAPSHOT_SEEN];
+    if(!cpu_surface_snapshot_clear(ranges,count,seen))goto queued;
+    memcpy(bytes,staging,output_bytes);
+    for(u32 i=0;i<count;i++) {
+        SIZE_T copied=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),vm_base+ranges[i].address,bytes+ranges[i].output_offset,ranges[i].bytes,&copied) || copied!=ranges[i].bytes)goto queued;
+    }
+    if(!cpu_surface_snapshot_recheck(ranges,count,seen))goto queued;
+    memcpy(staging,bytes,output_bytes);
+    CpuSurfaceRequest fast={0};fast.address=ranges[0].address;fast.bytes=output_bytes;fast.client_thread=client_thread;
+    fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
+    fast.profile.matched=fast.profile.hits=seen[CPU_SURFACE_SNAPSHOT_MATCHED];cpu_surface_profile_emit(&fast);
+    u64 served=cpu_surface_view_increase(&s_cpu_surface_snapshot_served);
+    if(!(served&4095))fprintf(stderr,"[CPUSURFACE_SNAPSHOT_FAST] served=%llu queued=%llu\n",(unsigned long long)served,(unsigned long long)cpu_surface_view_load(&s_cpu_surface_snapshot_queued));
+    return 1;
+queued:
+    cpu_surface_view_increase(&s_cpu_surface_snapshot_queued);
+    return 0;
+}
 static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 count,
     void *staging,u32 output_bytes,void *opaque) {
     (void)opaque;
     if((LONG)GetCurrentThreadId()==InterlockedCompareExchange(&s_cpu_surface_thread,0,0))
         return VM_READ_SNAPSHOT_UNAVAILABLE;
+    if(cpu_surface_snapshot_fast(ranges,count,staging,output_bytes,(u32)GetCurrentThreadId()))return VM_READ_SNAPSHOT_OK;
     CpuSurfaceRequest request={0};request.address=ranges&&count?ranges[0].address:0;request.bytes=output_bytes;
     request.snapshot_ranges=ranges;request.snapshot_count=count;request.snapshot_staging=staging;
     request.snapshot_output_bytes=output_bytes;request.snapshot_result=VM_READ_SNAPSHOT_FAILED;
@@ -837,8 +891,13 @@ typedef struct CpuSurfaceRange { u64 begin, end; } CpuSurfaceRange;
 static CpuSurfaceRange s_cpu_surface_pending[CPU_SURFACE_PENDING_MAX];
 static unsigned s_cpu_surface_pending_count;
 static int s_cpu_surface_pending_overflow;
+/* The recorded draws of the current batch, visible to client threads. The
+ * renderer thread is the only writer. It changes the list only between two
+ * steps of this sequence number, so a client that reads the same even number
+ * before and after the list saw one state of the list. */
+static _Atomic u64 s_cpu_surface_pending_sequence;
 static int s_cpu_surface_prompt;
-static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+static void cpu_surface_pending_insert(u32 address,u32 pitch,u32 height) {
     if(!address || address==0xffffffffu || !pitch)return;
     if(!height){s_cpu_surface_pending_overflow=1;return;}   /* unknown extent: serve nothing early */
     u64 begin=address,end=begin+(u64)pitch*height;
@@ -848,15 +907,62 @@ static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
     s_cpu_surface_pending[s_cpu_surface_pending_count].begin=begin;
     s_cpu_surface_pending[s_cpu_surface_pending_count++].end=end;
 }
+/* Renderer thread. Each recorded draw or clear registers its targets here. */
+static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
+    cpu_surface_pending_insert(address,pitch,height);
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
+}
 static int cpu_surface_pending_overlaps(u32 address,u32 bytes) {
     if(s_cpu_surface_pending_overflow)return 1;
     for(unsigned i=0;i<s_cpu_surface_pending_count;i++)
         if((u64)address<s_cpu_surface_pending[i].end && (u64)address+bytes>s_cpu_surface_pending[i].begin)return 1;
     return 0;
 }
-/* render_frame consumed and submitted every recorded draw. */
+/* Client thread. 1 when the renderer holds nothing for the bytes of the
+ * ranges: no recorded draw targets a range, and the one surface that meets a
+ * range is current and holds the whole range. seen gets the view table, the
+ * sum of the sequence numbers of its entries, the sequence number of the
+ * recorded draws, and the number of surfaces that hold a range. */
+static int cpu_surface_snapshot_clear(const VmReadSnapshotRange *ranges,u32 count,u64 *seen) {
+    u64 table=cpu_surface_view_load(&s_cpu_surface_views),sequences=0,matched=0;
+    CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(table&CPU_SURFACE_VIEW_ADDRESS);
+    u32 owners[VM_READ_SNAPSHOT_MAX_RANGES]={0};
+    for(u64 i=table>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
+        u64 sequence=cpu_surface_view_load(&v->sequence);
+        sequences+=sequence;
+        if(sequence&1)return 0;
+        int holds=0;
+        for(u32 j=0;j<count;j++) {
+            u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end);
+            u64 first=ranges[j].address,last=first+ranges[j].bytes;
+            if(first>=end || last<=begin)continue;
+            /* The range meets this surface. The surface must be current and own every byte of the range. */
+            if(!cpu_surface_view_load(&v->ready) || first<begin || last>end || owners[j]++)return 0;
+            holds=1;
+        }
+        if(cpu_surface_view_load(&v->sequence)!=sequence)return 0;
+        matched+=holds;
+    }
+    u64 pending=cpu_surface_view_load(&s_cpu_surface_pending_sequence);
+    if(pending&1)return 0;
+    for(u32 j=0;j<count;j++)if(cpu_surface_pending_overlaps(ranges[j].address,ranges[j].bytes))return 0;
+    if(cpu_surface_view_load(&s_cpu_surface_pending_sequence)!=pending || cpu_surface_view_load(&s_cpu_surface_views)!=table)return 0;
+    seen[CPU_SURFACE_SNAPSHOT_TABLE]=table;seen[CPU_SURFACE_SNAPSHOT_SEQUENCES]=sequences;seen[CPU_SURFACE_SNAPSHOT_PENDING]=pending;seen[CPU_SURFACE_SNAPSHOT_MATCHED]=matched;
+    return 1;
+}
+/* Client thread. 1 when the renderer changed no view and no recorded draw
+ * since cpu_surface_snapshot_clear wrote seen. */
+static int cpu_surface_snapshot_recheck(const VmReadSnapshotRange *ranges,u32 count,const u64 *seen) {
+    u64 now[CPU_SURFACE_SNAPSHOT_SEEN];
+    return cpu_surface_snapshot_clear(ranges,count,now) && now[CPU_SURFACE_SNAPSHOT_TABLE]==seen[CPU_SURFACE_SNAPSHOT_TABLE] &&
+        now[CPU_SURFACE_SNAPSHOT_SEQUENCES]==seen[CPU_SURFACE_SNAPSHOT_SEQUENCES] && now[CPU_SURFACE_SNAPSHOT_PENDING]==seen[CPU_SURFACE_SNAPSHOT_PENDING];
+}
+/* render_frame submitted every recorded draw. */
 static void cpu_surface_batch_submitted(void) {
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
     s_cpu_surface_pending_count=0;s_cpu_surface_pending_overflow=0;
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
 }
 static void cpu_surface_service_ready(void) {
     if(!s_cpu_surface_prompt)return;
@@ -922,6 +1028,7 @@ static void cpu_surface_init(void) {
     const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
     s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
     const char *fast=getenv("RSX_CPU_SURFACE_FAST");s_cpu_surface_fast=!(fast&&fast[0]=='0'&&!fast[1]);
+    const char *snapshot_fast=getenv("RSX_CPU_SURFACE_SNAPSHOT_FAST");s_cpu_surface_snapshot_fast=snapshot_fast&&snapshot_fast[0]=='1'&&!snapshot_fast[1];
     cpu_surface_batch_submitted();
     cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
     if(s_cpu_surface_profile) {
