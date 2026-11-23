@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Compile the production per-draw GPU record block (RSX_DRAW_CSV) with fake
-D3D12 objects, and audit its call sites in the backend.
+"""Compile the production per-draw GPU record block with fake D3D12 objects,
+and audit its call sites in the backend.
 
-The fixture covers: off by default; no record without a GPU timestamp
-frequency; the rows of a batch written at the start of the next batch; row
-facts, the state flags, the barrier count, the time before the draw and the
-draw time; a row without an end timestamp; a failed readback; the row limit
-with one log line; file close and object release at shutdown. Mutants of the
-backend and of the compiled block must fail. No game input; no performance
-claim."""
+The record starts with RSX_PHASE_GPU_DRAWS=1 and a RSX_PHASE_CSV path, like
+the record of the game copy of this backend, and writes rsx_draws.csv next to
+that path. RSX_DRAW_CSV belongs to the live draw fingerprints (rsx_live_draw.c).
+
+The fixture covers: off by default; a path alone and the switch alone start
+nothing; no record without a GPU timestamp frequency; the rows of a batch
+written at the start of the next batch; row facts, the state flags, the
+barrier count, the time before the draw and the draw time; a row without an
+end timestamp; a failed readback; the row limit with one log line; file close
+and object release at shutdown; both path separators. Mutants of the backend
+and of the compiled block must fail. No game input; no performance claim."""
 import argparse
 import os
 from pathlib import Path
@@ -28,12 +32,13 @@ EXPECTED = [
     "0,4,300,0,4,00000000,00000000,00000000,00000000,0,320,180,-1,00000000,00000010,0,1,0,1,1,2,0,250.000,30.000",
     "2,20,6,0,4,00000000,00000000,00000000,00000000,0,0,0,7,00000000,00000000,0,0,0,0,0,0,0,10.000,5.000"]
 LIMIT = 3
-ROW = "draw_csv_row(dr, d, row_flags, s_rt_barriers - row_barriers);"
+ROW = "phase_draw_row(dr, d, row_flags, s_rt_barriers - row_barriers);"
 ROW_LINE = " " * 16 + ROW + "\n"
-QUERY_LINE = " " * 16 + "draw_csv_query();\n"
-COLLECT = "        draw_csv_collect();\n"
+QUERY_LINE = " " * 16 + "phase_draw_query();\n"
+COLLECT = "        phase_draw_collect();\n"
 RESET = "    s_draw_rows_n = 0;\n"
-CHECKS = {"off": 4, "noclock": 5, "on": 42}
+SWITCH = '        if (!draws || strcmp(draws, "1")) return 0;\n'
+CHECKS = {"off": 4, "noswitch": 2, "nopath": 2, "noclock": 5, "on": 42}
 
 
 def balanced(text, at, pattern):
@@ -81,27 +86,36 @@ def record_block(source):
 
 
 def contract(source):
+    assert "RSX_DRAW_CSV" not in source, "RSX_DRAW_CSV is the live draw fingerprint switch of rsx_live_draw.c"
     block = record_block(source)
-    assert 'getenv("RSX_DRAW_CSV")' in block, "the record takes its switch from RSX_DRAW_CSV"
-    begin = function(block, "draw_csv_batch_begin")
+    assert 'getenv("RSX_PHASE_GPU_DRAWS")' in block and 'getenv("RSX_PHASE_CSV")' in block, \
+        "the record takes the switch and the directory of the game copy"
+    on = function(block, "phase_draw_csv_on")
+    assert SWITCH in on, "the record needs the per-draw timestamp switch"
+    assert "Draw CSV off: RSX_PHASE_CSV gives no path" in on, "the record says when the path is missing"
+    path = function(block, "phase_draw_csv_path")
+    assert 'memcpy(path + dir, "rsx_draws.csv", sizeof "rsx_draws.csv");' in path and \
+        "strrchr(phases, '\\\\')" in path and "strrchr(phases, '/')" in path, \
+        "the file is rsx_draws.csv in the directory of RSX_PHASE_CSV, with either separator"
+    begin = function(block, "phase_draw_batch_begin")
     assert begin.count(COLLECT) == 1 and begin.index(COLLECT) < begin.index(RESET), \
         "the rows of the previous batch are written before the reset"
-    assert "fclose(s_draw_csv);" in function(block, "draw_csv_shutdown"), "shutdown closes the file"
+    assert "fclose(s_draw_csv);" in function(block, "phase_draw_shutdown"), "shutdown closes the file"
     transition = function(source, "off_rt_transition")
     assert transition.count("s_rt_barriers++;") == 1 and \
         transition.index("->ResourceBarrier(") < transition.index("s_rt_barriers++;"), \
         "the transition count follows the issued barrier"
     submit = function(source, "submit_recorded_commands")
-    assert submit.count("draw_csv_batch_end();") == 1 and \
-        submit.index("draw_csv_batch_end();") < submit.index("->Close(s_d3d.cmd_list)"), \
+    assert submit.count("phase_draw_batch_end();") == 1 and \
+        submit.index("phase_draw_batch_end();") < submit.index("->Close(s_d3d.cmd_list)"), \
         "the batch end timestamp and the readback copy precede Close"
     backend = function(source, "rsx_d3d12_backend_shutdown")
-    assert backend.count("draw_csv_shutdown();") == 1 and \
-        backend.index("address_retire();") < backend.index("draw_csv_shutdown();"), \
+    assert backend.count("phase_draw_shutdown();") == 1 and \
+        backend.index("address_retire();") < backend.index("phase_draw_shutdown();"), \
         "the record shuts down after the GPU retirement"
     frame = function(source, "render_frame")
     command_reset = "s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);\n"
-    batch_begin = "    draw_csv_batch_begin();\n"
+    batch_begin = "    phase_draw_batch_begin();\n"
     loop = "for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {"
     assert frame.count(batch_begin) == 1 and frame.count(loop) == 1
     assert frame.index(command_reset) < frame.index(batch_begin) < frame.index(loop), \
@@ -112,7 +126,7 @@ def contract(source):
         "each record starts with its own flags and transition count"
     targets = "row_flags |= PHASE_DRAW_TARGETS;"
     assert body.count(targets) == 1 and body.index("OMSetRenderTargets(s_d3d.cmd_list, nrt, rh, FALSE, &dsv_handle);") \
-        < body.index(targets) < body.index("draw_csv_viewport(vp.TopLeftX"), \
+        < body.index(targets) < body.index("phase_draw_viewport(vp.TopLeftX"), \
         "the target flag sits in the target change block"
     pso = "if (next_pso != draw_last_pso) { row_flags |= PHASE_DRAW_PSO; draw_last_pso = next_pso; }"
     assert body.count(pso) == 1 and body.index("SetPipelineState(s_d3d.cmd_list, next_pso);") < body.index(pso), \
@@ -120,7 +134,7 @@ def contract(source):
     srv = "if (gh.ptr != draw_last_srv) { row_flags |= PHASE_DRAW_SRV; draw_last_srv = gh.ptr; }"
     assert body.count(srv) == 1 and body.index(srv) < body.index("SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);"), \
         "the SRV flag precedes the SRV table of this draw"
-    assert body.index("D3D12_RECT dsc = {") < body.index("draw_csv_viewport(dvp.TopLeftX") \
+    assert body.index("D3D12_RECT dsc = {") < body.index("phase_draw_viewport(dvp.TopLeftX") \
         < body.index("row_flags |= PHASE_DRAW_VIEWPORT;") < body.index("RSSetViewports(s_d3d.cmd_list, 1, &dvp);"), \
         "the viewport flag compares the values given to the command list"
     start = body.index(QUERY_LINE + ROW_LINE)
@@ -138,7 +152,7 @@ def without(text, part, replacement=""):
 
 def reset_first(source):
     """`source` with the row reset before the write: the defect of the first port."""
-    begin = function(source, "draw_csv_batch_begin")
+    begin = function(source, "phase_draw_batch_begin")
     moved = without(begin, RESET).replace(COLLECT, RESET + COLLECT, 1)
     return source.replace(begin, moved, 1)
 
@@ -177,13 +191,15 @@ def main():
         without(source, QUERY_LINE),                    # no start timestamp
         without(source, end_query),                     # no end timestamp
         without(source, "    s_rt_barriers++;\n"),
-        without(source, "    draw_csv_batch_end();\n"),
-        without(source, "    draw_csv_shutdown();\n"),
+        without(source, "    phase_draw_batch_end();\n"),
+        without(source, "    phase_draw_shutdown();\n"),
         without(source, "                    row_flags |= PHASE_DRAW_TARGETS;\n"),
         without(source, "                        row_flags |= PHASE_DRAW_VIEWPORT;\n"),
         without(source, "row_flags |= PHASE_DRAW_PSO; "),
         without(source, "row_flags |= PHASE_DRAW_SRV; "),
         without(source, "fclose(s_draw_csv); "),
+        without(source, SWITCH),                        # a record that needs no switch
+        without(source, "strrchr(phases, '\\\\')"),     # a backslash path loses its directory
     ]
     for index, mutant in enumerate(mutants):
         try:
@@ -201,21 +217,37 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rsx-draw-record-") as temporary:
         path = Path(temporary)
         csv = path / "rsx_draws.csv"
+        phases = str(csv.with_name("rsx_phases.csv"))
         exe = build(compiler, environment, path, "record", code)
-        off = dict(environment)
-        off.pop("RSX_DRAW_CSV", None)
-        result = run(exe, off, "off", "off")
-        assert "[RSXDRAW]" not in result.stderr and not csv.exists(), "the default run logs and writes no draw CSV"
-        on = dict(environment, RSX_DRAW_CSV=str(csv))
+        base = dict(environment)
+        base.pop("RSX_PHASE_GPU_DRAWS", None)
+        base.pop("RSX_PHASE_CSV", None)
+        result = run(exe, base, "off", "off")
+        assert "[RSXPHASE]" not in result.stderr and not csv.exists(), "the default run logs and writes no draw CSV"
+        on = dict(base, RSX_PHASE_GPU_DRAWS="1", RSX_PHASE_CSV=phases)
+        result = run(exe, dict(base, RSX_PHASE_CSV=phases), "noswitch", "noswitch")
+        assert "[RSXPHASE]" not in result.stderr and not csv.exists(), "a path alone logs and writes no draw CSV"
+        result = run(exe, dict(base, RSX_PHASE_GPU_DRAWS="1"), "nopath", "nopath")
+        assert result.stderr.count("[RSXPHASE] Draw CSV off: RSX_PHASE_CSV gives no path\n") == 1, result.stderr
+        assert not csv.exists(), "no file without a path"
         result = run(exe, on, "noclock", "noclock")
-        assert result.stderr.count("[RSXDRAW] GPU timestamps unavailable; the draw CSV stays off\n") == 1, result.stderr
+        assert result.stderr.count("[RSXPHASE] GPU timestamps unavailable; the draw CSV stays off\n") == 1, result.stderr
         assert not csv.exists(), "no file without a GPU timestamp frequency"
         result = run(exe, on, "on", "on")
-        assert result.stderr.count("[RSXDRAW] Draw CSV %s (stops at %d rows)\n" % (csv, LIMIT)) == 1, result.stderr
-        assert result.stderr.count("[RSXDRAW] Draw CSV stopped at %d rows: %s\n" % (LIMIT, csv)) == 1, \
+        assert result.stderr.count("[RSXPHASE] Draw CSV %s (stops at %d rows)\n" % (csv, LIMIT)) == 1, result.stderr
+        assert result.stderr.count("[RSXPHASE] Draw CSV stopped at %d rows: %s\n" % (LIMIT, csv)) == 1, \
             "one stop line: " + result.stderr
         lines = csv.read_text().splitlines()
         assert lines == EXPECTED and len(lines) == LIMIT + 1, lines
+        # The record keeps the directory of RSX_PHASE_CSV, with either separator.
+        csv.unlink()
+        slashed = dict(environment, RSX_PHASE_GPU_DRAWS="1", RSX_PHASE_CSV=phases.replace("\\", "/"))
+        result = subprocess.run([str(exe), "on"], env=slashed, capture_output=True, text=True, errors="replace",
+                                timeout=30)
+        assert result.returncode == 0 and "FAIL" not in result.stderr, result.stderr
+        assert "[RSXPHASE] Draw CSV %s (stops at %d rows)\n" % (str(csv).replace("\\", "/"), LIMIT) in result.stderr, \
+            result.stderr
+        assert csv.read_text().splitlines() == EXPECTED, "a path with forward slashes writes the same file"
         # Fixture controls: the compiled block must fail on each of these.
         controls = [
             (reset_first(code), "reset before the write"),
@@ -231,8 +263,8 @@ def main():
             written = csv.read_text().splitlines() if csv.exists() else None
             assert result.returncode != 0 or "FAIL" in result.stderr or written != EXPECTED, \
                 "control accepted: " + label
-    print("PASS actual draw record block: default off, no timestamp frequency, rows of a batch at the next batch, "
-          "flags, barriers, gap and draw time, failed readback, row limit, shutdown, call sites, "
+    print("PASS actual draw record block: default off, switch and path, no timestamp frequency, rows of a batch at "
+          "the next batch, flags, barriers, gap and draw time, failed readback, row limit, shutdown, call sites, "
           "%d mutants, %d fixture controls" % (len(mutants), len(controls)))
 
 

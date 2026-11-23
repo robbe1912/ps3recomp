@@ -143,12 +143,14 @@ static int fixture_fclose(FILE* file) { ++closes; return fclose(file); }
  * with end_step the end timestamp at that step. */
 static void draw(const D3D12DrawRecord* dr, u32 index, u32 flags, u32 barriers, u32 end_step)
 {
-    draw_csv_query();
-    draw_csv_row(dr, index, flags, barriers);
-    if (end_step) { step = end_step; draw_csv_query(); }
+    phase_draw_query();
+    phase_draw_row(dr, index, flags, barriers);
+    if (end_step) { step = end_step; phase_draw_query(); }
 }
 int main(int argc, char** argv)
 {
+    /* The process environment selects the mode: off has no switch and no
+     * path, noswitch a path only, nopath the switch only, noclock and on both. */
     const char* mode = argc > 1 ? argv[1] : "off";
     (void)fixture_fclose;   /* a fixture control removes the only call of it */
     D3D12DrawRecord a = {0}, b = {0}, c = {0};
@@ -160,62 +162,71 @@ int main(int argc, char** argv)
     c.vertex_count = 6; c.topology = 4; c.vs_idx = 7;   /* slot 7 does not exist */
     s_d3d.vp_vs[2].hash = 0x11223344; s_d3d.vp_vs_n = 3;
     if (strcmp(mode, "off") == 0) {
-        check(draw_csv_on() == 0, "no record without RSX_DRAW_CSV");
-        draw_csv_batch_begin();
-        check(draw_csv_viewport(0, 0, 1, 1, 0, 0, 1, 1) == 0, "no viewport tracking when off");
+        check(phase_draw_csv_on() == 0, "no record without RSX_PHASE_GPU_DRAWS");
+        phase_draw_batch_begin();
+        check(phase_draw_viewport(0, 0, 1, 1, 0, 0, 1, 1) == 0, "no viewport tracking when off");
         draw(&a, 3, 0, 0, 1);
         check(s_draw_rows_n == 0, "no row when off");
-        draw_csv_batch_end();
-        draw_csv_shutdown();
+        phase_draw_batch_end();
+        phase_draw_shutdown();
         check(created == 0 && end_queries == 0 && s_draw_csv == NULL, "off creates nothing");
+    } else if (strcmp(mode, "noswitch") == 0) {
+        check(phase_draw_csv_on() == 0, "a path alone does not start the record");
+        phase_draw_shutdown();
+        check(created == 0, "a path alone creates no object");
+    } else if (strcmp(mode, "nopath") == 0) {
+        check(phase_draw_csv_on() == 0, "no record without RSX_PHASE_CSV");
+        phase_draw_batch_begin();
+        check(s_draw_query_n == 0, "no timestamp without a path");
+        phase_draw_shutdown();
     } else if (strcmp(mode, "noclock") == 0) {
         frequency = 0;
-        check(draw_csv_on() == 0, "no record without a GPU timestamp frequency");
-        draw_csv_batch_begin();
+        check(phase_draw_csv_on() == 0, "no record without a GPU timestamp frequency");
+        phase_draw_batch_begin();
         check(s_draw_query_n == 0, "no timestamp without a frequency");
-        draw_csv_shutdown();
+        phase_draw_shutdown();
         check(closes == 0 && heap_released == 1 && readback_released == 1,
               "shutdown releases the created objects and closes no file");
     } else {
-        check(draw_csv_on() == 1, "record with RSX_DRAW_CSV");
+        check(phase_draw_csv_on() == 1, "record with the switch and a path");
         /* Batch 0: two draws with an end timestamp and one without. */
-        step = 40; draw_csv_batch_begin();                                   /* 40 */
-        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 1, "first viewport is a change");
-        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 0, "same viewport is no change");
-        check(draw_csv_viewport(0, 0, 1280, 720, 0, 0, 640, 720) == 1, "scissor change is a change");
-        step = 60; draw_csv_query(); step = 20;                              /* 100 */
-        draw_csv_row(&a, 3, PHASE_DRAW_VIEWPORT, 0); draw_csv_query();       /* 120 */
+        step = 40; phase_draw_batch_begin();                               /* 40 */
+        check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 1, "first viewport is a change");
+        check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 0, "same viewport is no change");
+        check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 640, 720) == 1, "scissor change is a change");
+        step = 60; phase_draw_query(); step = 20;                          /* 100 */
+        phase_draw_row(&a, 3, PHASE_DRAW_VIEWPORT, 0); phase_draw_query();  /* 120 */
         step = 250; draw(&b, 4, PHASE_DRAW_TARGETS | PHASE_DRAW_PSO | PHASE_DRAW_SRV, 2, 30); /* 370, 400 */
-        step = 70; draw(&c, 5, 0, 0, 0);                                     /* 470 */
-        step = 30; draw_csv_batch_end();                                     /* 500 */
+        step = 70; draw(&c, 5, 0, 0, 0);                                    /* 470 */
+        step = 30; phase_draw_batch_end();                                  /* 500 */
         s_d3d.frame_count = 1;
         check(resolved_n == 7 && s_draw_rows_n == 3, "batch 0 holds three rows and seven timestamps");
         /* Batch 1 writes batch 0 at its start. */
-        step = 1000; draw_csv_batch_begin();                                 /* 1500 */
+        step = 1000; phase_draw_batch_begin();                              /* 1500 */
         check(s_draw_csv_rows == 2 && s_draw_rows_n == 0,
               "two rows of batch 0 written; the third has no end timestamp");
         check(s_draw_query_n == 1 && ticks[0] == 1500, "batch 1 starts the timestamps again at index 0");
-        step = 100; draw(&a, 9, 0, 0, 1); step = 1; draw_csv_batch_end();
+        step = 100; draw(&a, 9, 0, 0, 1); step = 1; phase_draw_batch_end();
         s_d3d.frame_count = 2;
         /* Batch 2: the readback of batch 1 fails, so its rows are dropped. Two draws. */
-        map_fails = 1; step = 100; draw_csv_batch_begin();
+        map_fails = 1; step = 100; phase_draw_batch_begin();
         check(s_draw_csv_rows == 2 && s_draw_rows_n == 0, "a failed readback drops the rows");
         map_fails = 0;
-        step = 10; draw_csv_query(); step = 5;
-        draw_csv_row(&c, 20, 0, 0); draw_csv_query();
-        step = 7; draw(&b, 21, 0, 0, 0); step = 1; draw_csv_batch_end();
+        step = 10; phase_draw_query(); step = 5;
+        phase_draw_row(&c, 20, 0, 0); phase_draw_query();
+        step = 7; draw(&b, 21, 0, 0, 0); step = 1; phase_draw_batch_end();
         s_d3d.frame_count = 3;
         /* Batch 3 writes the first row of batch 2. It is the last row below the limit. */
-        draw_csv_batch_begin();
+        phase_draw_batch_begin();
         check(s_draw_csv_rows == PHASE_DRAW_ROWS_MAX && s_draw_csv_stopped == 0,
               "the last row below the limit is written");
-        draw(&a, 12, 0, 0, 1); draw_csv_batch_end();
+        draw(&a, 12, 0, 0, 1); phase_draw_batch_end();
         s_d3d.frame_count = 4;
         /* Batch 4 meets the limit with the row of batch 3. */
-        draw_csv_batch_begin();
+        phase_draw_batch_begin();
         check(s_draw_csv_rows == PHASE_DRAW_ROWS_MAX && s_draw_csv_stopped == 1 && s_draw_rows_n == 0,
               "the file stops at the row limit and takes no row after it");
-        draw_csv_shutdown();
+        phase_draw_shutdown();
         check(s_draw_csv == NULL && closes == 1 && heap_released == 1 && readback_released == 1,
               "shutdown closes the file and releases the query objects");
     }
