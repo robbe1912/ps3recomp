@@ -33,6 +33,7 @@ typedef struct {
 
     /* Frame counter */
     u64      frame_count;
+    u64      present_count;   /* flip callbacks that presented */
     u64      last_fps_time;
     u32      fps;
 
@@ -147,6 +148,7 @@ static void null_present(void* ud, u32 buffer_id)
     if (s_present_suppressed) return;
     (void)ud;
     (void)buffer_id;
+    s_state.present_count++;
 
     /* Trigger a repaint */
     if (s_state.hwnd)
@@ -313,13 +315,13 @@ int rsx_null_backend_pump_messages(void)
         /* Live draw owns presentation (and end_frame never runs) when enabled. */
         double fps = rsx_live_draw_get_present_fps();
         if (fps <= 0.0)
-            fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
+            fps = (s_state.present_count - s_state.title_frames) * 1000.0 /
                   (double)(now - s_state.title_time);
         char tb[256];
         snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
                  rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
         SetWindowTextA(s_state.hwnd, tb);
-        s_state.title_frames = s_state.frame_count;
+        s_state.title_frames = s_state.present_count;
         s_state.title_time = now;
     }
     return s_state.window_closed ? -1 : 0;

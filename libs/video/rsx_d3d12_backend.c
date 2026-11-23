@@ -5584,6 +5584,9 @@ skip_dump_consider: ;
                 backbuffer_only && !s_cap.presented_mode && reason == RSX_CAPTURE_SCHEDULED);
       } }
 
+    /* Presented frames since the last title refresh. Only a Present counts. */
+    static u64 s_tframes = 0;
+
     /* Present */
     if (s_present_this_frame) {
         HRESULT present_hr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
@@ -5593,6 +5596,7 @@ skip_dump_consider: ;
         }
         rdoc_present(s_d3d.device,s_d3d.hwnd);
         rsx_record_batch_presented(&s_record_batch);
+        s_tframes++;
     }
 
     move_to_next_frame();
@@ -5603,8 +5607,6 @@ skip_dump_consider: ;
      * draw count of the last frame, and the backbuffer size. */
     {
         static ULONGLONG s_tt0 = 0;
-        static u64 s_tframes = 0;
-        s_tframes++;
         ULONGLONG tnow = GetTickCount64();
         if (s_tt0 == 0) s_tt0 = tnow;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
