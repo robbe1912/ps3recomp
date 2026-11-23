@@ -4190,9 +4190,10 @@ static void shader_prepare_draw(D3D12DrawRecord* dr,int use_pool)
  * timestamp pair around each draw of the VP pass and writes one row per pair
  * to that file at the start of the next batch. The rows of the last batch of
  * a process are not written. The file stops at PHASE_DRAW_ROWS_MAX rows and
- * the log says so. The switch is off by default. zeta and fp_snap are always
- * 0 here: this backend has one depth buffer and no fragment program
- * snapshots. srv_chg is always 1: each draw has its own SRV window. */
+ * the log says so. The switch is off by default. zeta, fp_snap and depth are
+ * always 0 here: this backend has one depth buffer, no fragment program
+ * snapshots and no depth reads as shader resources. srv_chg is always 1:
+ * each draw has its own SRV window. */
 #ifndef PHASE_DRAW_ROWS_MAX
 #define PHASE_DRAW_ROWS_MAX 2000000u
 #endif
@@ -4288,7 +4289,7 @@ static void draw_csv_rows_write(const u64* ticks, u32 query_n, u64 batch, u64 fr
         if (s_draw_csv) {
             setvbuf(s_draw_csv, NULL, _IOFBF, 16384);
             fprintf(s_draw_csv, "batch,draw,verts,idx,prim,rt0,rt1,rt2,rt3,zeta,vp_w,vp_h,vs,vs_hash,fp,fp_snap,"
-                "rt_chg,vp_chg,pso_chg,srv_chg,barriers,gap_us,gpu_us\n");
+                "rt_chg,vp_chg,pso_chg,srv_chg,barriers,depth,gap_us,gpu_us\n");
         } else fprintf(stderr, "[RSXDRAW] Cannot open draw CSV: %s\n", path);
     }
     double scale = 1e6 / (double)frequency;
@@ -4303,7 +4304,7 @@ static void draw_csv_rows_write(const u64* ticks, u32 query_n, u64 batch, u64 fr
             break;
         }
         u64 before = i ? ticks[s_draw_rows[i - 1].query + 1] : ticks[0];
-        fprintf(s_draw_csv, "%llu,%u,%u,0,%u,%08X,%08X,%08X,%08X,0,%u,%u,%d,%08X,%08X,0,%u,%u,%u,%u,%u,%.3f,%.3f\n",
+        fprintf(s_draw_csv, "%llu,%u,%u,0,%u,%08X,%08X,%08X,%08X,0,%u,%u,%d,%08X,%08X,0,%u,%u,%u,%u,%u,0,%.3f,%.3f\n",
             (unsigned long long)batch, row->draw, row->verts, row->prim,
             row->rt[0], row->rt[1], row->rt[2], row->rt[3], row->vp_w, row->vp_h,
             row->vs, row->vs_hash, row->fp,
