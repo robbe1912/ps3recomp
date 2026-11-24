@@ -374,6 +374,67 @@ static void check_formula(void)
            (unsigned long long)checked);
 }
 
+/* A texel that two triangles of one draw cover gets the last paint of the
+ * draw on its byte before the draw. Two draws accumulate. */
+static void check_overlap(void)
+{
+    const float colour = 174.0f / 255.0f;
+    configure("00A80500", "1", "0");
+    state_init();
+    if (rsx_deform_mode() != 1) FAIL("RSX_DEFORM_BUFFER=1 is the mode on");
+    path_brush();
+    for (u32 y = 30; y < 40; y++)
+        for (u32 x = 10; x < 26; x++) vm_base[BASE + y * PITCH + x] = 32;
+    quad(0, 10, 20, 30, 40, path, 174, 0);
+    quad(6, 15, 25, 30, 40, path, 174, 0);
+    /* One draw holds the two stamps. Columns 15 to 19 are covered twice. */
+    dr.vertex_count = 12;
+    deform_paint(&dr, 0, 12, 0, 5);
+    for (u32 y = 30; y < 40; y++)
+        for (u32 x = 10; x < 25; x++) {
+            u8 want = ref_op(32, x < 15 ? path_texel(x, 10, 20) : path_texel(x, 15, 25), colour);
+            if (vm_base[BASE + y * PITCH + x] != want)
+                FAIL("one draw, two stamps: texel %u %u is %u, expected %u", x, y,
+                     vm_base[BASE + y * PITCH + x], want);
+        }
+    /* Two draws: stamp 1, then stamp 2. Each adds to the byte of its draw
+     * start. */
+    dr.vertex_count = 6;
+    deform_paint(&dr, 0, 6, 0, 5);
+    deform_paint(&dr, 6, 6, 0, 5);
+    for (u32 y = 30; y < 40; y++)
+        for (u32 x = 10; x < 25; x++) {
+            u8 want;
+            if (x < 15) want = ref_op(ref_op(32, path_texel(x, 10, 20), colour),
+                                      path_texel(x, 10, 20), colour);
+            else if (x < 20)
+                want = ref_op(ref_op(ref_op(32, path_texel(x, 15, 25), colour),
+                                     path_texel(x, 10, 20), colour), path_texel(x, 15, 25), colour);
+            else want = ref_op(ref_op(32, path_texel(x, 15, 25), colour),
+                               path_texel(x, 15, 25), colour);
+            if (vm_base[BASE + y * PITCH + x] != want)
+                FAIL("two draws: texel %u %u is %u, expected %u", x, y,
+                     vm_base[BASE + y * PITCH + x], want);
+        }
+    /* The shadow mode paints each operation with the same rule. */
+    configure("00A80500", "1", "1");
+    state_init();
+    if (rsx_deform_mode() != 2) FAIL("RSX_DEFORM_SHADOW=1 with the buffer is the shadow mode");
+    path_brush();
+    quad(0, 10, 20, 30, 40, path, 174, 0);
+    quad(6, 15, 25, 30, 40, path, 174, 0);
+    dr.vertex_count = 12;
+    deform_paint(&dr, 0, 12, 0, 5);
+    RsxDeformSurface* s = &s_deform_surface[0];
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        for (u32 y = 30; y < 40; y++)
+            for (u32 x = 15; x < 20; x++)
+                if (s->ops[k][y * PITCH + x] != s_deform_ops[k].fn(0, path_texel(x, 15, 25), colour))
+                    FAIL("one draw in the shadow mode: operation %d at texel %u %u is %u", k, x, y,
+                         s->ops[k][y * PITCH + x]);
+    puts("PASS overlap: the last paint of a draw wins, two draws accumulate");
+}
+
 static void check_on(void)
 {
     unsigned char out[4];
@@ -925,8 +986,10 @@ int main(void)
     before = (u8*)malloc((size_t)PITCH * ROWS);
     expected = (u8*)malloc((size_t)PITCH * ROWS);
     if (!vm_base || !gpu0 || !gpu1 || !before || !expected) FAIL("no memory");
+    setvbuf(stdout, NULL, _IONBF, 0);   /* the lines before a crash stay visible */
     check_off();
     check_formula();
+    check_overlap();
     check_on();
     check_shadow();
     check_dump();

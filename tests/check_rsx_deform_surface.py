@@ -117,6 +117,15 @@ MUTANTS = [
     ('dump-first-is-last',
      'last ? last->slot : 0, first ? first->dest : 0, 0 };',
      'last ? last->slot : 0, last ? last->dest : 0, 0 };'),
+    ('paint-accumulates-in-a-draw',
+     '            u32 dest = first ? first[s_deform.op] : row[px];\n',
+     '            u32 dest = row[px]; (void)first;\n'),
+    ('other-ops-accumulate-in-a-draw',
+     '                        other[at] = s_deform_ops[k].fn(first ? first[k] : other[at], value, colour);\n',
+     '                        other[at] = s_deform_ops[k].fn(other[at], value, colour);\n'),
+    ('draw-first-kept-across-draws', '    s->draw_n = 0;\n    s->draw_id++;\n', '    s->draw_n = 0;\n'),
+    ('draw-first-is-zero', '        e->dest[k] = s->ops[k] ? s->ops[k][at] : image[at];\n',
+     '        e->dest[k] = 0;\n'),
 ]
 
 
@@ -193,7 +202,8 @@ def main():
     print((result.stdout + result.stderr).strip()[-6000:])
     if result.returncode:
         return 1
-    for line in ('PASS off:', 'PASS formula:', 'PASS on:', 'PASS shadow:', 'PASS dump:', 'PASS dump min:'):
+    for line in ('PASS off:', 'PASS formula:', 'PASS overlap:', 'PASS on:', 'PASS shadow:', 'PASS dump:',
+                 'PASS dump min:'):
         assert line in result.stdout, line
     assert '[DEFORM] target address=00001000 offset=00A80500: 4096x4096, pitch 4096' in result.stdout
     lines = [m.groups() for m in LINE.finditer(result.stdout)]

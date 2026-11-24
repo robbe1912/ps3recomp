@@ -586,6 +586,14 @@ typedef struct DeformPaint {
     int    kx, ky;
 } DeformPaint;
 
+/* One draw. The destination of a texel before its first paint in the draw,
+ * one byte per operation. An entry with draw 0 is free. */
+typedef struct DeformDrawFirst {
+    u32    at;      /* index of the texel in level 0                              */
+    u32    draw;    /* number of the draw that holds the entry                   */
+    u8     dest[RSX_DEFORM_OP_COUNT];
+} DeformDrawFirst;
+
 typedef struct RsxDeformSurface {
     _Atomic u64 sequence;      /* 0 = empty; odd while the renderer changes the record or paints */
     u32        offset;         /* RSX offset of level 0                                    */
@@ -603,6 +611,11 @@ typedef struct RsxDeformSurface {
     u32        dirty_y0, dirty_y1;
     u32        painted, skipped;
     u64        texels;
+    /* The first destinations of the texels of the current draw. */
+    DeformDrawFirst* draw;      /* table with open addressing; 0 without memory   */
+    u32        draw_n;          /* entries of the current draw                       */
+    u32        draw_cap;        /* entries of the table: a power of two              */
+    u32        draw_id;         /* number of the current draw                        */
     u64        compare_frame;      /* frame of the last compare                           */
     u64        compare_frames;     /* compares since the binding                          */
     const void* level;             /* the GPU surface of level 0 at the last start          */
@@ -622,6 +635,58 @@ typedef struct RsxDeformSurface {
 
 static RsxDeformSurface s_deform_surface[RSX_DEFORM_TARGETS_MAX];
 static _Atomic u64 s_deform_reads;
+
+/* ---- the first destination of a texel in a draw --------------------------- */
+
+/* Renderer thread. A new table of `cap` entries that holds the entries of the
+ * current draw. Returns 0 when the memory is not available. */
+static int deform_draw_grow(RsxDeformSurface* s, u32 cap)
+{
+    DeformDrawFirst* table = (DeformDrawFirst*)calloc(cap, sizeof *table);
+    if (!table) return 0;
+    u32 mask = cap - 1;
+    for (u32 i = 0; i < s->draw_cap; i++) {
+        DeformDrawFirst* e = &s->draw[i];
+        if (e->draw != s->draw_id) continue;
+        DeformDrawFirst* to = &table[e->at * 2654435761u & mask];
+        while (to->draw) to = &table[(u32)(to - table + 1) & mask];
+        *to = *e;
+    }
+    free(s->draw);
+    s->draw = table;
+    s->draw_cap = cap;
+    return 1;
+}
+
+/* Renderer thread. The bytes of a texel before its first paint in the current
+ * draw, one per operation.
+ *
+ * The GPU reads the destination texture of a draw as it was before the draw:
+ * the backend binds the OffRT of the target as the texture and as the render
+ * target of the same draw, with no barrier. So a texel that two triangles of
+ * a draw cover gets the last paint of the draw on its byte before the draw.
+ * The painter does the same. The first paint of a texel in the draw copies
+ * its current bytes. Returns 0 when the memory is not available: the painter
+ * then accumulates the paints of the draw. */
+static const u8* deform_draw_first(RsxDeformSurface* s, const u8* image, size_t at)
+{
+    if ((!s->draw_cap || s->draw_n * 2 >= s->draw_cap)
+        && !deform_draw_grow(s, s->draw_cap ? s->draw_cap * 2 : 1024) && !s->draw_cap)
+        return 0;
+    u32 mask = s->draw_cap - 1;
+    DeformDrawFirst* e = &s->draw[(u32)at * 2654435761u & mask];
+    while (e->draw == s->draw_id) {
+        if (e->at == (u32)at) return e->dest;
+        e = &s->draw[(u32)(e - s->draw + 1) & mask];
+    }
+    if (s->draw_n >= mask) return 0;
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        e->dest[k] = s->ops[k] ? s->ops[k][at] : image[at];
+    e->at = (u32)at;
+    e->draw = s->draw_id;
+    s->draw_n++;
+    return e->dest;
+}
 
 /* Section C: the dump file of the shadow mode. */
 static FILE* deform_dump_open(void);
@@ -813,6 +878,9 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
         free(s->cols);
         s->cols = NULL;
         s->level = NULL;     /* the next batch end starts the new copies */
+        free(s->draw);
+        s->draw = NULL;
+        s->draw_cap = s->draw_n = 0;
     }
     s->offset = dr->rt_off;
     s->guest_address = address;
@@ -1050,14 +1118,17 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
             float u = (float)(w0 * a.u + w1 * b.u + w2 * c.u);
             float v = (float)(w0 * a.v + w1 * b.v + w2 * c.v);
             float colour = (float)(w0 * a.a + w1 * b.a + w2 * c.a);
-            u32 dest = row[px], value = deform_brush_sample(brush, u, v);
+            size_t at = (size_t)py * s->pitch + (size_t)px;
+            const u8* first = deform_draw_first(s, image, at);
+            u32 dest = first ? first[s_deform.op] : row[px];
+            u32 value = deform_brush_sample(brush, u, v);
             row[px] = op->fn(dest, value, colour);
             if (shadow) {
                 /* The shadow mode paints the texel with each other operation. */
-                size_t at = (size_t)py * s->pitch + (size_t)px;
                 for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++) {
                     u8* other = s->ops[k];
-                    if (other != image) other[at] = s_deform_ops[k].fn(other[at], value, colour);
+                    if (other != image)
+                        other[at] = s_deform_ops[k].fn(first ? first[k] : other[at], value, colour);
                 }
                 if (s->paints && s_deform_dumped < s_deform_dump_frames)
                     deform_paint_note(s, (u32)at, dest, value, u, v, colour, brush);
@@ -1144,6 +1215,13 @@ static void deform_paint_draw(RsxDeformSurface* s, u8* image, const D3D12DrawRec
     deform_state_log(s, dr, st);
     const RsxDeformOp* op = &s_deform_ops[s_deform.op];
     DeformVertex v[3];
+    /* A new draw: each texel starts again from its current bytes. */
+    s->draw_n = 0;
+    s->draw_id++;
+    if (!s->draw_id) {
+        s->draw_id = 1;
+        if (s->draw) memset(s->draw, 0, (size_t)s->draw_cap * sizeof *s->draw);
+    }
     for (u32 i = 0; i + 2 < dr->vertex_count; i += 3) {
         int finite = 1;
         for (u32 k = 0; k < 3 && finite; k++)

@@ -35,6 +35,10 @@ words of the backend:
 - Position is attribute 0, the brush coordinates are attribute 8 and the
   intensity is the first byte of attribute 3.
 - A stamp is two triangles. The raster rule is the top left rule of the host.
+- A texel that two triangles of one draw cover gets the last paint of the
+  draw on its byte before the draw. The backend binds the OffRT of the
+  target as the texture and as the render target of one draw, so the GPU
+  reads the destination as it was before the draw. Two draws accumulate.
 - The pixel operation is `fp16(saturate(fp16(brush - 0.25) * colour.x + dest))`.
   `dest` is the byte of the target, `brush` is a byte of the B8 brush.
 - The brush comes from the decoded texture: nearest or bilinear, with the
@@ -170,3 +174,12 @@ difference of one. The larger differences come in the later frames: from
 frame 8606 the largest difference of a frame is 40 to 230. The dump of S5
 holds the first three frames only. Their largest difference is 10. So the
 cause of the larger differences needs a dump with `RSX_DEFORM_DUMP_MIN`.
+
+The 1825 texels of S5 differ by more than one. The dump of S5 holds two of
+them, in frame 8374 at (168, 271) and (168, 272). The painter painted each
+twice in the frame. At the first, the CPU byte is 36 and the byte before
+the last paint is 75. The GPU byte is 46. It is the byte before the first
+paint (then 85) plus the increment of the last paint (-39). So the GPU
+applies the last paint of a draw on the byte before the draw, and the
+painter accumulated the paints of the draw. The painter now applies the
+same rule. No run has the new painter.
