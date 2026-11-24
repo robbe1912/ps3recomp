@@ -1,9 +1,9 @@
 """Compile the production PPU wait profile header with the authored harness.
 
 The parent sets PPU_WAIT_PROFILE; the harness never does. The check asserts
-the default-off silence, the switch values, the record fields, a measured
-wait, the replace rule of a nested begin, the production hook wiring, and
-rejects one mutant per rule.
+the default-off silence, the switch values, the default threshold of short
+waits, the record fields, a measured wait, the replace rule of a nested begin,
+the production hook wiring, and rejects one mutant per rule.
 """
 import os
 from pathlib import Path
@@ -17,6 +17,7 @@ HEADER = ROOT / 'runtime/syscalls/ppu_wait_profile.h'
 HARNESS = ROOT / 'tests/ppu_wait_profile_harness.c'
 OUT = ROOT / 'build/self-tests/ppu-wait-profile'
 SWITCH = 'PPU_WAIT_PROFILE'
+MIN_SWITCH = 'PPU_WAIT_PROFILE_MIN_US'
 HOOKS = {
     'sys_cond.c': ('sys_cond_wait', 'cond_wait'),
     'sys_semaphore.c': (None, 'semaphore_wait'),
@@ -47,11 +48,14 @@ def build(out, include_dir):
     return exe
 
 
-def run(exe, mode, switch=None):
+def run(exe, mode, switch=None, min_us=None):
     env = dict(os.environ)
     env.pop(SWITCH, None)
+    env.pop(MIN_SWITCH, None)
     if switch is not None:
         env[SWITCH] = switch
+    if min_us is not None:
+        env[MIN_SWITCH] = min_us
     result = subprocess.run([str(exe), mode], capture_output=True, text=True, env=env, timeout=30)
     lines = result.stderr.splitlines()
     records = [dict(re.findall(r'(\w+)=(\w+)', line)) for line in lines
@@ -67,11 +71,17 @@ def seconds(record):
 def verify(exe):
     """Raise AssertionError when the harness at exe breaks one rule."""
     for name, switch in (('off', None), ('zero', '0'), ('word', 'yes')):
-        result, records, other = run(exe, 'on', switch)
-        assert result.returncode == 0 and result.stdout.strip() == 'brackets=1', (name, result.stdout, result.stderr)
-        assert not records and not other, (name, records, other)
+        for mode in ('on', 'sleep'):
+            result, records, other = run(exe, mode, switch)
+            assert result.returncode == 0 and result.stdout.strip() == 'brackets=1', (name, result.stdout, result.stderr)
+            assert not records and not other, (name, records, other)
 
+    # The default threshold is 1000 us: a wait that returns at once writes no line.
     result, records, other = run(exe, 'on', '1')
+    assert result.returncode == 0 and result.stdout.strip() == 'brackets=1' and not other, (result.stdout, result.stderr)
+    assert not records, records
+
+    result, records, other = run(exe, 'on', '1', '0')
     assert result.returncode == 0 and not other, (result.stdout, result.stderr)
     assert len(records) == 1, records
     record = records[0]
@@ -82,7 +92,7 @@ def verify(exe):
     assert result.returncode == 0 and not other and len(records) == 1, (result.stdout, result.stderr, records)
     assert records[0]['kind'] == 'cond_wait' and 0.030 <= seconds(records[0]) < 2.0, records[0]
 
-    result, records, other = run(exe, 'nested', '1')
+    result, records, other = run(exe, 'nested', '1', '0')
     assert result.returncode == 0 and not other and len(records) == 1, (result.stdout, result.stderr, records)
     assert (records[0]['kind'], records[0]['id']) == ('mutex_lock', '9'), records[0]
 
@@ -117,6 +127,12 @@ MUTANTS = [
     ('call-site-lost', '    t_ppu_wait_profile.lr = lr;', '    t_ppu_wait_profile.lr = 0;'),
     ('nested-begin-ignored', '    if (!ppu_wait_profile_on()) {',
      '    if (!ppu_wait_profile_on() || t_ppu_wait_profile.active) {'),
+    ('min-ignored', 'if (finished - t_ppu_wait_profile.start < ppu_wait_profile_min_ticks())', 'if (0)'),
+    ('min-default-zero', 'unsigned long long us = 1000;', 'unsigned long long us = 0;'),
+    ('min-switch-ignored', '        if (value && value[0])\n            us = strtoull(value, 0, 10);',
+     '        if (0)\n            us = strtoull(value, 0, 10);'),
+    ('min-long-wait-dropped', 'min_ticks = us * ppu_wait_profile_frequency() / 1000000ull;',
+     'min_ticks = us * ppu_wait_profile_frequency();'),
 ]
 
 
@@ -137,7 +153,7 @@ def main():
         except AssertionError:
             continue
         raise AssertionError('mutant accepted: ' + name)
-    print('PASS: default off, switch values, record fields, measured wait, nested begin; '
+    print('PASS: default off, switch values, default threshold, record fields, measured wait, nested begin; '
           + '%d mutants rejected' % len(MUTANTS))
     return 0
 
