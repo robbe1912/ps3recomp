@@ -3,28 +3,42 @@
 #include "spurs_scheduler_observer_fixture.h"
 static atomic_ullong fixture_poll_time;
 static atomic_int fixture_poll_clock;
-static atomic_uintptr_t fixture_park_cv;
+static atomic_uintptr_t fixture_park_timer;
 static atomic_uint fixture_parked, fixture_stop_wakes;
-static ULONGLONG fixture_poll_now(void) {
-    return atomic_load(&fixture_poll_clock) ? atomic_load(&fixture_poll_time) : GetTickCount64();
+/* With fixture_poll_clock set, the performance counter of the coordinator
+ * deadline (spurs_notify_wait.h) reads fixture_poll_time in milliseconds. */
+static BOOL fixture_qpc(LARGE_INTEGER* counter) {
+    if (atomic_load(&fixture_poll_clock)) { counter->QuadPart=(LONGLONG)atomic_load(&fixture_poll_time)*10000; return TRUE; }
+    return QueryPerformanceCounter(counter);
 }
-static BOOL fixture_wait(CONDITION_VARIABLE* cv, SRWLOCK* lock, DWORD ms, ULONG flags) {
-    if ((uintptr_t)cv == atomic_load(&fixture_park_cv)) atomic_store(&fixture_parked, 1);
-    return SleepConditionVariableSRW(cv, lock, ms, flags);
+static BOOL fixture_qpf(LARGE_INTEGER* frequency) {
+    QueryPerformanceFrequency(frequency);
+    if (atomic_load(&fixture_poll_clock)) frequency->QuadPart=10000000;
+    return TRUE;
 }
-static void fixture_wake_all(CONDITION_VARIABLE* cv) {
-    if ((uintptr_t)cv == atomic_load(&fixture_park_cv)) atomic_fetch_add(&fixture_stop_wakes, 1);
-    WakeAllConditionVariable(cv);
+/* The coordinator wait of the notify mode is one waitable timer. The fakes
+ * mark its entry and the wake that stops it. */
+static DWORD fixture_wait_single(HANDLE handle, DWORD ms) {
+    if ((uintptr_t)handle == atomic_load(&fixture_park_timer)) atomic_store(&fixture_parked, 1);
+    return WaitForSingleObject(handle, ms);
 }
-#define GetTickCount64 fixture_poll_now
-#define SleepConditionVariableSRW fixture_wait
-#define WakeAllConditionVariable fixture_wake_all
+static BOOL fixture_set_timer(HANDLE handle, const LARGE_INTEGER* due, LONG period,
+                              PTIMERAPCROUTINE completion, LPVOID arg, BOOL resume) {
+    if ((uintptr_t)handle == atomic_load(&fixture_park_timer) && due->QuadPart == -1)
+        atomic_fetch_add(&fixture_stop_wakes, 1);
+    return SetWaitableTimer(handle, due, period, completion, arg, resume);
+}
+#define QueryPerformanceCounter fixture_qpc
+#define QueryPerformanceFrequency fixture_qpf
+#define WaitForSingleObject fixture_wait_single
+#define SetWaitableTimer fixture_set_timer
 #define spu_workload_dispatch_async fixture_unbounded_dispatch
 #include "../libs/spurs/cellSpurs.c"
 #undef spu_workload_dispatch_async
-#undef GetTickCount64
-#undef SleepConditionVariableSRW
-#undef WakeAllConditionVariable
+#undef SetWaitableTimer
+#undef WaitForSingleObject
+#undef QueryPerformanceFrequency
+#undef QueryPerformanceCounter
 /* Keep lock witnesses active for authored policies that use ef_line_end,
  * whose paired unlock lives in the actual production implementation. */
 #include <assert.h>
@@ -251,8 +265,8 @@ static int notify_main(void)
     assert(cellSpursInitialize((CellSpurs*)0x3000,1,0,0,0)==0);
     struct SpursInst* parked = spurs_inst_find(0x3000);
     AcquireSRWLockExclusive(&parked->lock);
-    atomic_store(&fixture_park_cv,(uintptr_t)&parked->kick);
-    WakeConditionVariable(&parked->kick);
+    atomic_store(&fixture_park_timer,(uintptr_t)parked->poll_timer);
+    spurs_poll_wake(parked->poll_timer);
     ReleaseSRWLockExclusive(&parked->lock);
     wait_for(&fixture_parked,1,"coordinator wait entry");
     /* Acquiring this lock proves the wait released it atomically. */
