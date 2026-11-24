@@ -212,8 +212,8 @@ static int deform_on(void)
         if (atomic_compare_exchange_strong_explicit(&s_deform.config_state, &expected, 1,
                                                     memory_order_acq_rel, memory_order_acquire)) {
             deform_config_read();
-            atomic_store_explicit(&s_deform.config_state, s_deform.any ? 2 : 0,
-                                  memory_order_release);
+            st = s_deform.any ? 2 : 0;
+            atomic_store_explicit(&s_deform.config_state, st, memory_order_release);
         } else {
             st = atomic_load_explicit(&s_deform.config_state, memory_order_acquire);
         }
