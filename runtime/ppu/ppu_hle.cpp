@@ -20,6 +20,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ppu_fastmem.h" /* ppu_fm_arm */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -752,6 +753,12 @@ extern "C" void ppu_hle_register_all(void) {}
 extern "C" void ppu_hle_init(void)
 {
     ppu_hle_register_all();
+    /* F-tr-08: decide once, before any guest code runs, whether a memory
+     * diagnostic is armed. If one is, every access routes through the full
+     * out-of-line vm_read/vm_write family (identical to the pre-fastmem
+     * behavior); if none is, the lifted code's accesses stay on the inline
+     * fast paths. Defined in ppu_loader.cpp. */
+    ppu_fm_arm();   /* declared by ppu_fastmem.h, included above */
 
     /* The generated registration unit is per-game and easy to leave out: the
      * weak stub above means a build without it links and starts, then fails

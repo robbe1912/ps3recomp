@@ -1621,6 +1621,165 @@ static struct VmInlineInit {
         vm_inline_ok = !d;
     }
 } s_vm_inline_init;
+/* PPU_SPINYIELD (default ON, =0 disables): the HOTREAD* detectors fire only
+ * on a genuine hard spin -- 200000 consecutive reads of one EA -- which no
+ * legit poller does (wave-7 err: every HOTREAD8 fire is guest-fn 0x00266320,
+ * the video post-thread pacing gate, on 3 per-stream gate EAs). When one
+ * fires, hand the host core back once so co-ready host threads (render pump,
+ * audio mixer) get their fair share instead of being starved by the spin.
+ * SwitchToThread() returns immediately when nothing else is ready, so the
+ * cost is one cheap syscall per 200k reads on a thread burning the core
+ * anyway; short polling loops never reach the threshold and pay nothing. */
+static void ppu_spin_yield(void)
+{
+#ifdef _WIN32
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PPU_SPINYIELD"); on = (e && *e == '0') ? 0 : 1; }
+    if (on) SwitchToThread();
+#endif
+}
+/* ---------------------------------------------------------------------------
+ * F-tr-08: fast-path support (see include/ps3emu/ppu_fastmem.h)
+ *
+ * A ppu_recomp.h that includes ppu_fastmem.h renames the vm_read/vm_write
+ * family this file defines to fast-path accessors. Those accessors keep
+ * every behavior that is not a diagnostic -- alias normalize, bounds,
+ * null-page report, raw-SPU MMIO side effects, GCM ref-poll, the hot-spin
+ * fair-share yield -- and delegate the whole access back HERE when a
+ * diagnostic knob is armed (ppu_fm_diag, set once by ppu_fm_arm at boot) or
+ * the access hits a condition the fast path serves by delegation. The fork
+ * lifter does not emit that include yet (docs/PPU_FASTMEM.md): a fork build
+ * runs the inline loads of its ppu_recomp.h and the out-of-line functions
+ * below. The fire halves below are the fire halves of the fast paths.
+ * -----------------------------------------------------------------------*/
+extern "C" volatile uint32_t ppu_fm_diag = 0;
+
+/* Hot-spin detector switch of the inline fast paths: 1 = the detector runs.
+ * Only the exact value PPU_FM_SPINDET=0 turns it off. */
+extern "C" volatile uint32_t ppu_fm_spin_det = 1;
+
+/* Any of these in the environment routes every memory access through the
+ * out-of-line family, exactly as before the fast paths existed. PPU_FM=0 is
+ * the runtime kill switch: same routing, no rebuild -- the one-binary A/B
+ * knob for isolating a fastmem regression. */
+extern "C" void ppu_fm_arm(void)
+{
+    if (ppu_fm_diag) return;
+    const char* spindet = getenv("PPU_FM_SPINDET");
+    if (spindet && spindet[0] == '0' && !spindet[1]) ppu_fm_spin_det = 0;
+    static const char* const knobs[] = {
+        "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "PPU_HOTMAP", "PPU_RVAL",
+        "PPU_RVAL64", "YDKJ_RWATCH", "PT", "PPU_WVAL", "PPU_WVAL_LO",
+        "PPU_WVAL_HI", "PPU_WWATCH", "PS3_NULL_SWEEP", "SPU_WP",
+        "PPU_FM", 0 };
+    for (int i = 0; knobs[i]; i++) {
+        const char* e = getenv(knobs[i]);
+        if (!e) continue;
+        /* SPU_WP is a boolean control: explicit zero disables the watch.
+         * Do not turn every guest memory access into a diagnostic call for
+         * a disabled watch. Address-valued knobs still use presence. */
+        if (!strcmp(knobs[i], "SPU_WP") && e[0] == '0' && !e[1]) continue;
+        int is_fm = (knobs[i][0] == 'P' && knobs[i][4] == 'F' &&
+                     knobs[i][5] == 'M' && !knobs[i][6]);
+        /* PPU_FM=0 disarms the fast paths (kill switch); PPU_FM=1 keeps
+         * them. Any other knob here being set at all arms the full
+         * out-of-line family. */
+        if (is_fm) { if (e[0] == '0') { ppu_fm_diag = 1; return; } continue; }
+        ppu_fm_diag = 1; return;
+    }
+}
+
+/* GCM_REFPOLL fire (read32 of VM_HLE_INJECT_BASE+0x2008). Env-gated,
+ * default ON; kept out of line because the fast path reaches it only on the
+ * exact address match. */
+extern "C" void ppu_fm_refpoll(void)
+{
+    static int _rp = -1;
+    if (_rp < 0) { const char* e = getenv("GCM_REFPOLL"); _rp = (e && *e == '0') ? 0 : 1; }
+    if (_rp) { extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); }
+}
+
+extern "C" void ppu_fm_hotread8(uint32_t a, void* ra)
+{
+    ppu_spin_yield();
+    { static int dp = -1;   /* SPU_DEBUG_PRINTS: same generic knob as the
+       SPU side (spu_dma.h), default 0 keeps 60 FPS runs quiet. The
+       ppu_spin_yield() above stays unconditional -- fair-share must not
+       depend on logging. */
+      if (dp < 0) { const char* e = getenv("SPU_DEBUG_PRINTS"); dp = e && atoi(e) != 0; }
+      if (dp) {
+    fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
+            a, vm_base[a], GetCurrentThreadId(),
+            ppu_prof_resolve_host(ra));
+    /* VideoStream::my_post_thread pacing gate (F-av-03): the spin reads
+     * stream+0x6C; print the present-ring pair write-idx[+0x64] /
+     * read-idx[+0x68]. SAMPLE ONLY -- successive prints must be compared
+     * before calling the ring frozen (full = (wr+1)%depth==rd); a single
+     * print says nothing about consumer liveness. */
+    if (ppu_prof_resolve_host(ra) == 0x266320u && a >= 0x6Cu) {
+        uint32_t wr = 0, rd = 0;
+        { uint32_t q = a - 0x6Cu; wr = vm_read32(q + 0x64); rd = vm_read32(q + 0x68); }
+        fprintf(stderr, "[HOTREAD8] post-thread ring: wr=%u rd=%u depth=%u\n",
+                wr, rd, vm_read32(a - 0x6Cu + 0x60));
+    }
+      } }
+}
+
+extern "C" void ppu_fm_hotread16(uint32_t a, void* ra)
+{
+    (void)ra;
+    ppu_spin_yield();
+    fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", a);
+}
+
+extern "C" void ppu_fm_hotread32(uint32_t a, uint32_t raw_v, void* ra)
+{
+    (void)ra;
+    ppu_spin_yield();
+    if ((a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
+        /* A spin on the GCM control block is a fence/FIFO wait. Print the
+         * WHOLE block: put vs get says whether the RSX side is behind or
+         * whether the guest never submitted, which is the difference
+         * between a stalled pump and a command that never arrived. */
+        uint32_t pu = 0, ge = 0, rf = 0;
+        if (vm_base) {
+            const uint8_t* c = vm_base + (VM_HLE_INJECT_BASE + 0x2000u);
+            pu = ((uint32_t)c[0]<<24)|((uint32_t)c[1]<<16)|((uint32_t)c[2]<<8)|c[3];
+            ge = ((uint32_t)c[4]<<24)|((uint32_t)c[5]<<16)|((uint32_t)c[6]<<8)|c[7];
+            rf = ((uint32_t)c[8]<<24)|((uint32_t)c[9]<<16)|((uint32_t)c[10]<<8)|c[11];
+        }
+        fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
+                "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, a);
+    } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", a, __builtin_bswap32(raw_v),
+    g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0);
+#ifdef _WIN32
+    /* PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
+     * is on the watched address -- names the guest function containing the
+     * spin loop + its callers (resolve RVAs against the linker map). Same
+     * mechanism as the read64 variant; LBP's GPU-ref wait (0x03002008) is a
+     * read32 spin. */
+    { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
+      if(wa>=0 && a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
+        void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
+        char* mb=(char*)GetModuleHandleA(0); char line[800]; int p=snprintf(line,sizeof line,"[SPINBT32 0x%08X] rva:",a);
+        for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+        fprintf(stderr,"%s\n",line); fflush(stderr); } } }
+#endif
+}
+
+extern "C" void ppu_fm_hotread64(uint32_t a, uint64_t raw_v, void* ra)
+{
+    fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", a, (unsigned long long)__builtin_bswap64(raw_v), ppu_prof_resolve_host(ra));
+    ppu_spin_yield();
+#ifdef _WIN32
+    { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
+      if(wa>=0 && a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
+        void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
+        char* mb=(char*)GetModuleHandleA(0); char line[800]; int p=snprintf(line,sizeof line,"[SPINBT 0x%08X] rva:",a);
+        for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+        fprintf(stderr,"%s\n",line); } } }
+#endif
+}
 
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_cpu_read_sync((uint32_t)a,1); vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
