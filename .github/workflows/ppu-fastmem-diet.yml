@@ -1,0 +1,32 @@
+name: PPU fast memory paths
+on:
+  workflow_dispatch:
+  push:
+    branches: [combined, codex/frame60-fastmem-v2]
+    paths:
+      - 'include/ps3emu/ppu_fastmem.h'
+      - 'runtime/ppu/ppu_loader.cpp'
+      - 'runtime/ppu/ppu_hle.cpp'
+      - 'tests/check_ppu_fastmem_diet.py'
+      - '.github/workflows/ppu-fastmem-diet.yml'
+  pull_request:
+    paths:
+      - 'include/ps3emu/ppu_fastmem.h'
+      - 'runtime/ppu/ppu_loader.cpp'
+      - 'runtime/ppu/ppu_hle.cpp'
+      - 'tests/check_ppu_fastmem_diet.py'
+      - '.github/workflows/ppu-fastmem-diet.yml'
+jobs:
+  fastmem:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - run: python tests/check_ppu_fastmem_diet.py
