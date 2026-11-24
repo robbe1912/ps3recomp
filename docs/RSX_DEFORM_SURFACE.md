@@ -25,6 +25,7 @@ first call.
 | `RSX_DEFORM_OP=fp16\|fused\|f32` | The pixel operation of the painter. `fp16` is the default. |
 | `RSX_DEFORM_LOG=<frames>` | `300`. Interval of the `[DEFORM]` lines. Number of compared frames of the shadow mode and of frames with `[DEFORM_WHEEL]` lines. |
 | `RSX_DEFORM_DUMP=<frames>` | With the shadow mode: write the first n compared frames with a difference to a file. |
+| `RSX_DEFORM_DUMP_MIN=<k>` | With `RSX_DEFORM_DUMP`: write only the frames whose largest difference is at least `k`. Default 0. |
 
 ## Mode on
 
@@ -70,9 +71,12 @@ that the game reads.
 ## Dump
 
 `RSX_DEFORM_DUMP=<frames>` writes the compared frames that have a
-difference, until n frames are written. The file is `RSX_DEFORM_DUMP_FILE`,
-else `rsx_deform_dump.bin` next to `rsx_phases.csv`, else
-`rsx_deform_dump.bin` in the current folder. Each record starts with a word:
+difference, until n frames are written. `RSX_DEFORM_DUMP_MIN=<k>` adds the
+condition that the largest difference of the frame is at least `k`. A frame
+below it is not written and does not use the budget. The file is
+`RSX_DEFORM_DUMP_FILE`, else `rsx_deform_dump.bin` next to `rsx_phases.csv`,
+else `rsx_deform_dump.bin` in the current folder. Each record starts with a
+word:
 
 | Word | Record |
 |---|---|
@@ -82,11 +86,12 @@ else `rsx_deform_dump.bin` next to `rsx_phases.csv`, else
 | `0x46` | A frame: frame, target, rows, then the smallest rectangle of the compared columns. Per row: y, x0, x1, then one record per texel. |
 | `0x58` | The end. |
 
-A texel record holds `cpu`, `gpu`, `count`, `dest`, `brush`, `slot`, `u`, `v`,
-`colour`, `kx` and `ky`. `count` is the number of paints since the last
-compare. The other values are of the last paint: the destination before it,
-the brush byte, the slot of the brush, the brush coordinates, the intensity
-and the nearest brush texel.
+A texel record holds `cpu`, `gpu`, `count`, `dest`, `brush`, `slot`, `first`,
+`u`, `v`, `colour`, `kx` and `ky`. `count` is the number of paints since the
+last compare. The other values are of the last paint: the destination before
+it, the brush byte, the slot of the brush, the brush coordinates, the
+intensity and the nearest brush texel. `first` is the destination before the
+first paint.
 
 ## Log lines
 
@@ -156,3 +161,12 @@ line is at frame 9013, 176.0 s into the run. So each batch end after it
 stopped at the return for a frame without a painted column. Run 2 has the
 same phase: its lines without texels start at frame 7939, and its first
 texel is at frame 8271, about 22 s later. A shadow run needs 300 s.
+
+Run S5 (exe `c6aea3c150144769`, `20261124T134739.069671Z`, 300 s) has the
+GPU start: 59 compares, 38630 texels, 32237 equal (83 percent), 4568 with a
+difference of one, 1825 with a larger difference (largest 230). The first
+frames are near exact: frame 8366 has 194 of 204 texels equal and 10 with a
+difference of one. The larger differences come in the later frames: from
+frame 8606 the largest difference of a frame is 40 to 230. The dump of S5
+holds the first three frames only. Their largest difference is 10. So the
+cause of the larger differences needs a dump with `RSX_DEFORM_DUMP_MIN`.

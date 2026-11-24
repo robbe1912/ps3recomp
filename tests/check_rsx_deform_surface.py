@@ -77,8 +77,9 @@ MUTANTS = [
      '                            (u8)(paints > 255 ? 255 : paints), last ? last->dest : 0,',
      '                            (u8)(paints > 255 ? 255 : paints), last ? last->brush : 0,'),
     ('dump-unbounded',
-     '    if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {',
-     '    if (s_deform_dump_file && diff.texels != diff.equal) {'),
+     'diff.texels != diff.equal && diff.diffmax >= s_deform_dump_min\n'
+     '        && s_deform_dumped < s_deform_dump_frames) {',
+     'diff.texels != diff.equal && diff.diffmax >= s_deform_dump_min) {'),
     ('start-never', '    if (level->res != s->level) {\n', '    if (0) {\n'),
     ('start-never-again', '    if (level->res != s->level) {\n', '    if (!s->level) {\n'),
     ('start-keeps-copies',
@@ -107,6 +108,15 @@ MUTANTS = [
      '    if (!s) return;\n'),
     ('compare-never-marks',
      '        atomic_store_explicit(&s->compared, 1, memory_order_relaxed);\n', ''),
+    ('dump-min-ignored',
+     'diff.diffmax >= s_deform_dump_min\n        && s_deform_dumped < s_deform_dump_frames) {',
+     's_deform_dumped < s_deform_dump_frames) {'),
+    ('dump-min-above', 'diff.diffmax >= s_deform_dump_min', 'diff.diffmax > s_deform_dump_min'),
+    ('dump-min-not-read',
+     '    if (dump_min && *dump_min) s_deform_dump_min = (u32)strtoul(dump_min, NULL, 10);\n', ''),
+    ('dump-first-is-last',
+     'last ? last->slot : 0, first ? first->dest : 0, 0 };',
+     'last ? last->slot : 0, last ? last->dest : 0, 0 };'),
 ]
 
 
@@ -183,7 +193,7 @@ def main():
     print((result.stdout + result.stderr).strip()[-6000:])
     if result.returncode:
         return 1
-    for line in ('PASS off:', 'PASS formula:', 'PASS on:', 'PASS shadow:', 'PASS dump:'):
+    for line in ('PASS off:', 'PASS formula:', 'PASS on:', 'PASS shadow:', 'PASS dump:', 'PASS dump min:'):
         assert line in result.stdout, line
     assert '[DEFORM] target address=00001000 offset=00A80500: 4096x4096, pitch 4096' in result.stdout
     lines = [m.groups() for m in LINE.finditer(result.stdout)]

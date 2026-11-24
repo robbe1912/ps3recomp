@@ -757,10 +757,12 @@ static void check_dump(void)
     quad(0, 10, 20, 30, 40, path, 174, 0);
     dr.vertex_count = 6;
     deform_paint(&dr, 0, 6, 0, 5);
+    deform_paint(&dr, 0, 6, 0, 5);   /* twice: the record holds first and dest */
     current = deform_image(s);
     /* Frame 1: one byte differs. The frame is written. */
     memcpy(gpu0, current, (size_t)PITCH * ROWS);
     gpu0[30 * PITCH + 10] = (u8)(gpu0[30 * PITCH + 10] + 1);
+    gpu0[30 * PITCH + 15] = (u8)(gpu0[30 * PITCH + 15] - 2);
     s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
     s_d3d.frame_count = 101;
     rsx_deform_batch_end();
@@ -831,13 +833,21 @@ static void check_dump(void)
                 u32 y = le32(bytes + at), x0 = le32(bytes + at + 4), x1 = le32(bytes + at + 8);
                 at += 12;
                 for (u32 x = x0; x < x1; x++, at += 28) {
-                    if (frames || y != 30 || x != 10) continue;
-                    u32 brush = path_texel(10, 10, 20);
-                    if (bytes[at] != current[30 * PITCH + 10] || bytes[at + 1] != bytes[at] + 1
-                        || bytes[at + 2] != 1 || bytes[at + 3] != 0 || bytes[at + 4] != brush
-                        || bytes[at + 5] != 0 || le32(bytes + at + 20) != 1 || le32(bytes + at + 24) != 0
+                    if (frames || y != 30 || (x != 10 && x != 15)) continue;
+                    u32 brush = path_texel(x, 10, 20);
+                    int step = x == 10 ? 1 : -2;
+                    u32 first = ref_op(0, brush, 174.0f / 255.0f);
+                    u32 kx = (u32)((x + 0.5 - 10.0) / 10.0 * 32.0);
+                    if (bytes[at] != current[30 * PITCH + x] || bytes[at + 1] != (u8)(bytes[at] + step)
+                        || bytes[at + 2] != 2 || bytes[at + 3] != first || bytes[at + 4] != brush
+                        || bytes[at + 5] != 0 || bytes[at + 6] != 0 || le32(bytes + at + 20) != (int)kx
+                        || le32(bytes + at + 24) != 0
                         || fabsf(lefloat(bytes + at + 16) - 174.0f / 255.0f) > 1e-6f)
-                        FAIL("the first texel record is wrong");
+                        FAIL("the first texel record is wrong at column %u: cpu %u gpu %u count %u dest %u"
+                             " brush %u slot %u first %u kx %u ky %u; expected cpu %u first %u brush %u kx %u",
+                             x, bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4],
+                             bytes[at + 5], bytes[at + 6], le32(bytes + at + 20), le32(bytes + at + 24),
+                             current[30 * PITCH + x], first, brush, kx);
                 }
             }
             frames++;
@@ -850,6 +860,61 @@ static void check_dump(void)
         FAIL("dump records: edges %u, brushes %u, frames %u, ends %u, end at %u of %u",
              edges, brushes, frames, ends, (u32)at, (u32)size);
     puts("PASS dump: header, brush, edges, two frames with a difference, none past the switch");
+}
+
+/* RSX_DEFORM_DUMP_MIN=8: a frame with a largest difference below 8 is not
+ * written and does not use the budget of RSX_DEFORM_DUMP=2. */
+static void check_dump_min(void)
+{
+    const char* file = getenv("RSX_DEFORM_DUMP_FILE");
+    if (!file || !*file) FAIL("the check must set RSX_DEFORM_DUMP_FILE");
+    set_switch("RSX_DEFORM_DUMP", "2");
+    set_switch("RSX_DEFORM_DUMP_MIN", "8");
+    configure("00A80500", "1", "1");
+    set_switch("RSX_DEFORM_LOG", "6");
+    s_deform_dumped = 0;
+    s_deform_dump_edges = 0;
+    state_init();
+    if (rsx_deform_mode() != 2) FAIL("RSX_DEFORM_SHADOW=1 with the buffer is the shadow mode");
+    if (s_deform_dump_frames != 2 || s_deform_dump_min != 8) FAIL("RSX_DEFORM_DUMP_MIN is not read");
+    path_brush();
+    /* A stamp that covers no pixel makes the record. */
+    for (u32 i = 12; i < 18; i++) vertex(i, -1.0, -1.0, 0.5, 0.5, 174);
+    deform_paint(&dr, 12, 6, 0, 5);
+    RsxDeformSurface* s = &s_deform_surface[0];
+    current = deform_image(s);
+    memcpy(gpu0, current, (size_t)PITCH * ROWS);
+    s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    s_d3d.frame_count = 100;
+    rsx_deform_batch_end();
+    if (s_deform_dumped) FAIL("the start frame is written to the dump");
+    /* Four compared frames. The largest difference of each is 5, 8, 200
+     * and 7. The frames with 8 and 200 are written. */
+    static const u32 largest[4] = { 5, 8, 200, 7 };
+    static const int written[4] = { 0, 1, 1, 0 };
+    static const u32 count[4] = { 0, 1, 2, 2 };
+    for (u32 i = 0; i < 4; i++) {
+        quad(6 * i, 10 + 10 * i, 20 + 10 * i, 30, 40, path, 174, 0);
+        deform_paint(&dr, 6 * i, 6, 0, 5);
+        memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+        size_t at = (size_t)30 * PITCH + 10 + 10 * i;
+        u32 cpu = gpu0[at];
+        gpu0[at] = (u8)(cpu + largest[i] <= 255 ? cpu + largest[i] : cpu - largest[i]);
+        long before = ftell(s_deform_dump_file);
+        s_d3d.off_rt[0].gpu_generation++;
+        s_d3d.frame_count = 101 + i;
+        rsx_deform_batch_end();
+        if (s_deform_dumped != count[i] || (ftell(s_deform_dump_file) != before) != (written[i] != 0))
+            FAIL("frame %u: largest difference %u, written %d, %u frames written", i, largest[i],
+                 written[i], (u32)s_deform_dumped);
+    }
+    fclose(s_deform_dump_file);
+    s_deform_dump_file = NULL;
+    set_switch("RSX_DEFORM_DUMP", "0");
+    set_switch("RSX_DEFORM_DUMP_MIN", "0");
+    s_deform_dump_frames = 0;
+    s_deform_dump_min = 0;
+    puts("PASS dump min: frames below RSX_DEFORM_DUMP_MIN are not written and use no budget");
 }
 
 int main(void)
@@ -866,5 +931,7 @@ int main(void)
     check_shadow();
     check_dump();
     puts(log_text);
+    log_text[0] = 0;
+    check_dump_min();
     return 0;
 }

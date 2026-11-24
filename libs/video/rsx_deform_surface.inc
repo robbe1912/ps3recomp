@@ -177,8 +177,11 @@ static int deform_switch(const char* name)
 }
 
 /* RSX_DEFORM_DUMP=<frames>: the shadow mode writes the first n compared
- * frames with a difference to a file (section C). */
+ * frames with a difference to a file (section C). RSX_DEFORM_DUMP_MIN=<k>
+ * (0) adds a condition: the largest difference of the frame is at least k.
+ * A frame below the condition is not written and does not use the budget. */
 static u64 s_deform_dump_frames;
+static u32 s_deform_dump_min;        /* the condition of RSX_DEFORM_DUMP_MIN */
 static FILE* s_deform_dump_file;
 static u64 s_deform_dumped;          /* frames written to the dump */
 
@@ -207,6 +210,8 @@ static void deform_config_read(void)
     if (log && *log) s_deform.log_frames = strtoull(log, NULL, 10);
     const char* dump = getenv("RSX_DEFORM_DUMP");
     if (dump && *dump) s_deform_dump_frames = strtoull(dump, NULL, 10);
+    const char* dump_min = getenv("RSX_DEFORM_DUMP_MIN");
+    if (dump_min && *dump_min) s_deform_dump_min = (u32)strtoul(dump_min, NULL, 10);
     s_deform.any = s_deform.capture || s_deform.buffer;
 }
 
@@ -1297,9 +1302,10 @@ static OffRT* deform_off_rt(u32 address)
  *   0x46 frame target rows xmin xmax ymin ymax
  *                             a frame. Then per row: y, x0, x1 and x1 - x0
  *                             texel records: cpu, gpu, count, dest, brush,
- *                             slot, 0, 0, u, v, colour, kx, ky. count is the
- *                             number of paints since the last compare. The
- *                             other values are of the last paint.
+ *                             slot, first, 0, u, v, colour, kx, ky. count is
+ *                             the number of paints since the last compare.
+ *                             The other values are of the last paint. first is
+ *                             the destination before the first paint.
  *   0x58                     the end
  */
 static int s_deform_dump_edges;      /* the edges record is written */
@@ -1397,15 +1403,17 @@ static void deform_dump_frame(RsxDeformSurface* s, u64 frame)
         for (u32 x = x0; x < x1; x++) {
             size_t at = (size_t)y * s->pitch + x;
             DeformPaint* last = NULL;
+            const DeformPaint* first = NULL;
             u32 paints = 0;
             while (j < s->paint_n && s->paints[j].at < at) j++;
             while (j < s->paint_n && s->paints[j].at == at) {
                 last = &s->paints[j++];
+                if (!first) first = last;
                 paints++;
             }
             u8 bytes[8] = { s->ops[s_deform.op][at], vm_base[s->guest_address + at],
                             (u8)(paints > 255 ? 255 : paints), last ? last->dest : 0,
-                            last ? last->brush : 0, last ? last->slot : 0, 0, 0 };
+                            last ? last->brush : 0, last ? last->slot : 0, first ? first->dest : 0, 0 };
             float values[3] = { last ? last->u : 0.0f, last ? last->v : 0.0f,
                                 last ? last->colour : 0.0f };
             int index[2] = { last ? last->kx : 0, last ? last->ky : 0 };
@@ -1511,7 +1519,8 @@ static void deform_shadow_compare(RsxDeformSurface* s)
     }
     if (diff.texels)
         atomic_store_explicit(&s->compared, 1, memory_order_relaxed);
-    if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {
+    if (s_deform_dump_file && diff.texels != diff.equal && diff.diffmax >= s_deform_dump_min
+        && s_deform_dumped < s_deform_dump_frames) {
         if (!s_deform_dump_edges) deform_dump_edges(s);
         deform_dump_frame(s, frame);
     }
