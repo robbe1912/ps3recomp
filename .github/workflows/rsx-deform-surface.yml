@@ -1,0 +1,20 @@
+name: CPU deformation buffer
+on:
+  workflow_dispatch:
+  push:
+    branches: [combined, codex/frame60-deform-cpu-buffer]
+  pull_request:
+jobs:
+  buffer:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - run: python tests/check_rsx_deform_surface.py
