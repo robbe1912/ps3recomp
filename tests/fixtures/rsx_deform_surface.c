@@ -551,16 +551,27 @@ static void check_shadow(void)
     path_brush();
     quad(0, 10, 20, 30, 40, path, 174, 0);
     quad(6, 200, 202, 0, 2, path, 0, 0);
-    dr.vertex_count = 12;
-    deform_paint(&dr, 0, 12, 0, 5);
+    dr.vertex_count = 6;
+    vm_base[BASE + 500 * PITCH + 12] = 77;
+    vm_base[MIP + 700] = 66;      /* the GPU surface starts as guest memory */
+    deform_paint(&dr, 0, 6, 0, 5);
     RsxDeformSurface* s = &s_deform_surface[0];
     if (!s->ops[0] || !s->ops[RSX_DEFORM_OP_COUNT - 1] || !s->mip || !s->cols)
         FAIL("no private copies");
+    if (s->ops[0][500 * PITCH + 12] != 77 || s->ops[RSX_DEFORM_OP_COUNT - 1][500 * PITCH + 12] != 77
+        || s->mip[700] != 66)
+        FAIL("the private copies do not start as guest memory");
+    /* The stamp at rows 0 to 2 makes the painter compute row 0 of level 1. */
+    deform_paint(&dr, 6, 6, 0, 5);
     current = deform_image(s);
     for (u32 i = 0; i < (size_t)PITCH * ROWS; i += 997)
-        if (vm_base[BASE + i]) FAIL("the shadow painter wrote guest memory");
+        if (vm_base[BASE + i] && i != 500 * PITCH + 12) FAIL("the shadow painter wrote guest memory");
     memset(before, 0, (size_t)PITCH * ROWS);
     memcpy(expected, before, (size_t)PITCH * ROWS);
+    expected[500 * PITCH + 12] = 77;
+    /* The brush of the fixture lies in the range of level 0: guest memory
+     * holds its bytes, and so does each private copy. */
+    for (u32 i = 0; i < 32; i++) expected[511 * PITCH + i] = (u8)(7 * i + 3);
     expect_path(10, 20, 30, 40, 174);
     expect_path(200, 202, 0, 2, 0);
     compare("shadow path stamps");
@@ -583,19 +594,15 @@ static void check_shadow(void)
     size_t a = (size_t)30 * PITCH + 10, b = (size_t)30 * PITCH + 15;
     gpu0[a] = (u8)(gpu0[a] < 255 ? gpu0[a] + 1 : gpu0[a] - 1);
     gpu0[b] = (u8)(gpu0[b] >= 7 ? gpu0[b] - 7 : gpu0[b] + 7);
-    memcpy(gpu1, s->mip, MIP_TEXELS);
-    gpu1[3] ^= 1;
-    gpu1[9] ^= 0x80;
     s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
-    s_d3d.off_rt[1] = (OffRT){ (void*)1, 0x01A80500, MIP, MIP_TEXELS, 5, 0, gpu1, 1 };
     s_d3d.frame_count = 101;
     rsx_deform_batch_end();
     size_t logged = strlen(log_text);
     if (!logged) FAIL("no [DEFORM_SHADOW] line after a compare");
-    if (memcmp(vm_base + BASE, gpu0, (size_t)PITCH * ROWS) || memcmp(vm_base + MIP, gpu1, MIP_TEXELS))
-        FAIL("the compare did not copy the GPU surfaces to guest memory");
+    if (memcmp(vm_base + BASE, gpu0, (size_t)PITCH * ROWS))
+        FAIL("the compare did not copy the GPU surface to guest memory");
     if (!logged_line("101", "texels=104 equal=102 diff1=1 diffmax=7 first=0001F00")
-        || !strstr(log_text, "mip_texels=2048 mip_equal=2046 mip_diff1=1 mip_diffmax=128 neighbour=0/0,0/0"))
+        || strstr(log_text, "mip_") || strstr(log_text, "neighbour="))
         FAIL("the first compare line is wrong: %s", log_text);
     /* A second batch end in the frame: no line. */
     rsx_deform_batch_end();
@@ -618,33 +625,163 @@ static void check_shadow(void)
     if (!logged_line("102", "texels=100 equal=100 diff1=0 diffmax=0 first=00000000"))
         FAIL("the second compare line is wrong: %s", log_text);
     logged = strlen(log_text);
-    /* A frame without a change: no line. */
+    /* A frame without a painted column: no line. The GPU mip row is not a
+     * reference: the emulator does not render it. */
+    s_d3d.off_rt[1] = (OffRT){ (void*)1, 0x01A80500, MIP, MIP_TEXELS, 5, 0, gpu1, 1 };
     s_d3d.frame_count = 103;
     rsx_deform_batch_end();
-    if (strlen(log_text) != logged) FAIL("a compare without a change");
-    /* The mip pass ran: the private row compares again. That is the third
-     * compare, the last of RSX_DEFORM_LOG frames. */
-    memcpy(gpu1, s->mip, MIP_TEXELS);
-    gpu1[0] ^= 0x40;
-    s_d3d.off_rt[1].gpu_generation = 6;
-    s_d3d.frame_count = 104;
-    rsx_deform_batch_end();
-    if (strlen(log_text) == logged) FAIL("no compare after the mip pass");
-    if (!logged_line("104", "texels=0 equal=0 diff1=0 diffmax=0 first=00000000")
-        || !strstr(log_text, "mip_texels=2048 mip_equal=2047 mip_diff1=0 mip_diffmax=64 neighbour=0/64,0/0")
-        || !strstr(log_text, "[DEFORM_SHADOW] done target=00A80500 frames=3 texels=204 diff=2 diffmax=7 "
-                            "mip_texels=4096 mip_diff=3 mip_diffmax=128"))
-        FAIL("the third compare line is wrong: %s", log_text);
-    /* The periodic [DEFORM] line of the frame can come with this paint. */
+    if (strlen(log_text) != logged) FAIL("a compare without a painted column");
+    /* A third frame with a stamp: the third compare, the last of
+     * RSX_DEFORM_LOG frames. */
     quad(18, 60, 70, 30, 40, path, 174, 0);
     deform_paint(&dr, 18, 6, 0, 5);
-    logged = strlen(log_text);
     memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
     s_d3d.off_rt[0].gpu_generation = 3;
+    s_d3d.frame_count = 104;
+    logged = strlen(log_text);
+    rsx_deform_batch_end();
+    if (!logged_line("104", "texels=100 equal=100 diff1=0 diffmax=0 first=00000000")
+        || !strstr(log_text, "[DEFORM_SHADOW] done target=00A80500 frames=3 texels=304 diff=2 diffmax=7"))
+        FAIL("the third compare line is wrong: %s", log_text);
+    logged = strlen(log_text);
+    /* The periodic [DEFORM] line of the frame can come with a paint. */
+    quad(24, 80, 90, 30, 40, path, 174, 0);
+    deform_paint(&dr, 24, 6, 0, 5);
+    memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    s_d3d.off_rt[0].gpu_generation = 4;
     s_d3d.frame_count = 105;
+    logged = strlen(log_text);
     rsx_deform_batch_end();
     if (strlen(log_text) != logged) FAIL("a compare past RSX_DEFORM_LOG frames");
-    puts("PASS shadow: private copies, compare once a frame, mip row, wheel line");
+    puts("PASS shadow: private copies, compare once a frame, wheel line");
+    puts(log_text);
+}
+
+static u32 le32(const unsigned char* p)
+{
+    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
+static float lefloat(const unsigned char* p)
+{
+    u32 bits = le32(p);
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+/* RSX_DEFORM_DUMP=2 writes the brushes, the edges and the two first frames
+ * with a difference. The third frame with a difference is past the switch. */
+static void check_dump(void)
+{
+    const char* file = getenv("RSX_DEFORM_DUMP_FILE");
+    if (!file || !*file) FAIL("the check must set RSX_DEFORM_DUMP_FILE");
+    set_switch("RSX_DEFORM_DUMP", "2");
+    s_deform_dump_frames = 0;
+    configure("00A80500", "1", "1");
+    set_switch("RSX_DEFORM_LOG", "6");
+    s_deform_dumped = 0;
+    s_deform_dump_edges = 0;
+    state_init();
+    if (rsx_deform_mode() != 2 || s_deform_dump_frames != 2) FAIL("RSX_DEFORM_DUMP=2 is not read");
+    path_brush();
+    quad(0, 10, 20, 30, 40, path, 174, 0);
+    dr.vertex_count = 6;
+    deform_paint(&dr, 0, 6, 0, 5);
+    RsxDeformSurface* s = &s_deform_surface[0];
+    if (!s->paints || !s_deform_dump_file) FAIL("the dump is not open");
+    current = deform_image(s);
+    /* Frame 1: one byte differs. The frame is written. */
+    memcpy(gpu0, current, (size_t)PITCH * ROWS);
+    gpu0[30 * PITCH + 10] = (u8)(gpu0[30 * PITCH + 10] + 1);
+    s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    s_d3d.frame_count = 101;
+    rsx_deform_batch_end();
+    if (s_deform_dumped != 1) FAIL("the frame with a difference is not written");
+    long first = ftell(s_deform_dump_file);
+    /* Frame 2: no difference. Nothing is written. */
+    quad(6, 40, 50, 30, 40, path, 174, 0);
+    deform_paint(&dr, 6, 6, 0, 5);
+    memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    s_d3d.off_rt[0].gpu_generation = 2;
+    s_d3d.frame_count = 102;
+    rsx_deform_batch_end();
+    if (s_deform_dumped != 1 || ftell(s_deform_dump_file) != first)
+        FAIL("a frame without a difference is written");
+    /* Frame 3: a difference. The second frame is written: the last. */
+    quad(12, 60, 70, 30, 40, path, 174, 0);
+    deform_paint(&dr, 12, 6, 0, 5);
+    memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    gpu0[35 * PITCH + 65] = (u8)(gpu0[35 * PITCH + 65] ^ 3);
+    s_d3d.off_rt[0].gpu_generation = 3;
+    s_d3d.frame_count = 103;
+    rsx_deform_batch_end();
+    if (s_deform_dumped != 2) FAIL("the second frame with a difference is not written");
+    long second = ftell(s_deform_dump_file);
+    /* Frame 4: a difference past RSX_DEFORM_DUMP. Nothing is written. */
+    quad(18, 80, 90, 30, 40, path, 174, 0);
+    deform_paint(&dr, 18, 6, 0, 5);
+    memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    gpu0[32 * PITCH + 82] = (u8)(gpu0[32 * PITCH + 82] ^ 1);
+    s_d3d.off_rt[0].gpu_generation = 4;
+    s_d3d.frame_count = 104;
+    rsx_deform_batch_end();
+    if (ftell(s_deform_dump_file) != second) FAIL("a frame past RSX_DEFORM_DUMP is written");
+    fclose(s_deform_dump_file);
+    s_deform_dump_file = NULL;
+    set_switch("RSX_DEFORM_DUMP", "0");
+    s_deform_dump_frames = 0;
+
+    static unsigned char bytes[1 << 16];
+    FILE* f = fopen(file, "rb");
+    if (!f) FAIL("cannot read the dump");
+    size_t size = fread(bytes, 1, sizeof bytes, f), at;
+    fclose(f);
+    if (size < 12 || memcmp(bytes, "DFRM", 4) || le32(bytes + 4) != 1 || le32(bytes + 8) != 28)
+        FAIL("the dump header is wrong");
+    u32 edges = 0, brushes = 0, frames = 0, ends = 0;
+    for (at = 12; at + 4 <= size;) {
+        u32 tag = le32(bytes + at);
+        if (tag == 0x45) {
+            u32 part = le32(bytes + at + 4), count = part == 2 ? MIP_TEXELS : PITCH;
+            at += 8;
+            for (u32 i = 0; i < count; i++)
+                if (bytes[at + i]) FAIL("the edges record holds a byte that is not 0");
+            at += count;
+            edges++;
+        } else if (tag == 0x42) {
+            u32 slot = le32(bytes + at + 4), w = le32(bytes + at + 8), h = le32(bytes + at + 12);
+            at += 24;
+            if (slot == 0 && w == 32 && h == 1 && (bytes[at] != 3 || bytes[at + 31] != 220))
+                FAIL("the path brush is wrong in the dump");
+            at += (size_t)w * h;
+            brushes++;
+        } else if (tag == 0x46) {
+            u32 rows = le32(bytes + at + 12);
+            at += 32;
+            for (u32 r = 0; r < rows; r++) {
+                u32 y = le32(bytes + at), x0 = le32(bytes + at + 4), x1 = le32(bytes + at + 8);
+                at += 12;
+                for (u32 x = x0; x < x1; x++, at += 28) {
+                    if (frames || y != 30 || x != 10) continue;
+                    u32 brush = path_texel(10, 10, 20);
+                    if (bytes[at] != current[30 * PITCH + 10] || bytes[at + 1] != bytes[at] + 1
+                        || bytes[at + 2] != 1 || bytes[at + 3] != 0 || bytes[at + 4] != brush
+                        || bytes[at + 5] != 0 || le32(bytes + at + 20) != 1 || le32(bytes + at + 24) != 0
+                        || fabsf(lefloat(bytes + at + 16) - 174.0f / 255.0f) > 1e-6f)
+                        FAIL("the first texel record is wrong");
+                }
+            }
+            frames++;
+        } else if (tag == 0x58) {
+            at += 4;
+            ends++;
+        } else FAIL("unknown dump record %08X", tag);
+    }
+    if (edges != 3 || brushes != 1 || frames != 2 || ends != 1 || at != size)
+        FAIL("dump records: edges %u, brushes %u, frames %u, ends %u, end at %u of %u",
+             edges, brushes, frames, ends, (u32)at, (u32)size);
+    puts("PASS dump: header, brush, edges, two frames with a difference, none past the switch");
 }
 
 int main(void)
@@ -659,6 +796,7 @@ int main(void)
     check_formula();
     check_on();
     check_shadow();
+    check_dump();
     puts(log_text);
     return 0;
 }

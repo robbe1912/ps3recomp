@@ -176,6 +176,11 @@ static int deform_switch(const char* name)
     return value && *value && strcmp(value, "0") != 0;
 }
 
+/* RSX_DEFORM_DUMP=<frames>: the shadow mode writes the first n compared
+ * frames with a difference to a file (section C). */
+static u64 s_deform_dump_frames;
+static FILE* s_deform_dump_file;
+
 static void deform_config_read(void)
 {
     const char* targets = getenv("RSX_DEFORM_TARGETS");
@@ -199,6 +204,8 @@ static void deform_config_read(void)
     }
     const char* log = getenv("RSX_DEFORM_LOG");
     if (log && *log) s_deform.log_frames = strtoull(log, NULL, 10);
+    const char* dump = getenv("RSX_DEFORM_DUMP");
+    if (dump && *dump) s_deform_dump_frames = strtoull(dump, NULL, 10);
     s_deform.any = s_deform.capture || s_deform.buffer;
 }
 
@@ -564,6 +571,15 @@ static void deform_capture_record(int which, const D3D12DrawRecord* dr, const rs
  * steps. The shadow mode paints all three and counts the equal texels of each.
  */
 
+/* RSX_DEFORM_DUMP: one painted texel since the last compare of the shadow
+ * mode. at is the index of the texel in level 0. */
+typedef struct DeformPaint {
+    u32    at, order;
+    u8     dest, brush, slot;
+    float  u, v, colour;
+    int    kx, ky;
+} DeformPaint;
+
 typedef struct RsxDeformSurface {
     _Atomic u64 sequence;      /* 0 = empty; odd while the renderer changes the record or paints */
     u32        offset;         /* RSX offset of level 0                                    */
@@ -583,9 +599,12 @@ typedef struct RsxDeformSurface {
     u64        texels;
     u64        compare_frame;      /* frame of the last compare                           */
     u64        compare_frames;     /* compares since the binding                          */
-    u64        compare_generation; /* gpu_generation of level 1 at the last mip compare   */
-    u64        total_texels, total_diff, total_mip_texels, total_mip_diff;
-    u32        total_diffmax, total_mip_diffmax;
+    u64        total_texels, total_diff;
+    u32        total_diffmax;
+    /* RSX_DEFORM_DUMP. Renderer thread only. */
+    struct DeformPaint* paints;   /* the painted texels since the last compare */
+    u32        paint_n, paint_cap;
+    u64        dumped_key[2];     /* brush cache keys written to the dump      */
     u32        programs[8];
     u32        program_count;
     int        noted_state;
@@ -595,6 +614,9 @@ typedef struct RsxDeformSurface {
 
 static RsxDeformSurface s_deform_surface[RSX_DEFORM_TARGETS_MAX];
 static _Atomic u64 s_deform_reads;
+
+/* Section C: the dump file of the shadow mode. */
+static FILE* deform_dump_open(void);
 
 /* The buffer is on: the reads take their bytes from guest memory. */
 static int deform_buffer_on(void)
@@ -717,13 +739,20 @@ static void deform_shadow_allocate(RsxDeformSurface* s, size_t bytes)
     int ok = mip && cols;
     for (int k = 0; ok && k < RSX_DEFORM_OP_COUNT; k++) {
         s->ops[k] = (u8*)malloc(bytes);
-        if (s->ops[k]) memset(s->ops[k], 0, bytes);
+        /* The GPU surface starts as a copy of guest memory: off_rt_get
+         * uploads it at creation. The private copies start the same way. */
+        if (s->ops[k]) memcpy(s->ops[k], vm_base + s->guest_address, bytes);
         else ok = 0;
     }
     if (ok) {
-        memset(mip, 0, s->mip_width);
+        memcpy(mip, vm_base + s->mip_address, s->mip_width);
         s->cols = cols;
         for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);
+        if (s_deform_dump_frames && !s_deform_dump_file) s_deform_dump_file = deform_dump_open();
+        if (s_deform_dump_file) {
+            s->paints = (DeformPaint*)malloc(4096 * sizeof *s->paints);
+            s->paint_cap = s->paints ? 4096 : 0;
+        }
         s->mip = mip;
         return;
     }
@@ -790,7 +819,6 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
     s->program_count = 0;
     s->noted_state = s->noted_bad = 0;
     s->noted_skip = 0;
-    s->compare_generation = 0;
     if (s_deform.shadow && !s->ops[0]) deform_shadow_allocate(s, (size_t)pitch * dr->rt_h);
     atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);
     fprintf(stderr, "[DEFORM] target address=%08X offset=%08X: %ux%u, pitch %u, level 1 row 0 at %08X"
@@ -943,6 +971,31 @@ static int deform_vertex(const rsx_state* st, u32 index, const float rect[4], De
     return 1;
 }
 
+/* Shadow mode with RSX_DEFORM_DUMP: one entry per painted texel since the
+ * last compare. */
+static void deform_paint_note(RsxDeformSurface* s, u32 at, u32 dest, u32 brush, float u, float v,
+                              float colour, const DeformBrush* b)
+{
+    if (s->paint_n == s->paint_cap) {
+        u32 cap = s->paint_cap * 2;
+        DeformPaint* list = (DeformPaint*)realloc(s->paints, (size_t)cap * sizeof *list);
+        if (!list) return;
+        s->paints = list;
+        s->paint_cap = cap;
+    }
+    DeformPaint* p = &s->paints[s->paint_n];
+    p->at = at;
+    p->order = ++s->paint_n;
+    p->dest = (u8)dest;
+    p->brush = (u8)brush;
+    p->slot = (u8)(b - s_deform_brush);
+    p->u = u;
+    p->v = v;
+    p->colour = colour;
+    p->kx = (int)floorf(u * (float)b->width);
+    p->ky = (int)floorf(v * (float)b->height);
+}
+
 /* Paints one triangle with the top left rule of the host. clip is the
  * scissor: left, top, right, bottom. Right and bottom are outside. */
 static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* v0,
@@ -997,6 +1050,7 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
                     u8* other = s->ops[k];
                     if (other != image) other[at] = s_deform_ops[k].fn(other[at], value, colour);
                 }
+                if (s->paints) deform_paint_note(s, (u32)at, dest, value, u, v, colour, brush);
                 if ((u32)px < column[0]) column[0] = (u32)px;
                 if ((u32)px + 1 > column[1]) column[1] = (u32)px + 1;
             }
@@ -1222,49 +1276,188 @@ static OffRT* deform_off_rt(u32 address)
     return NULL;
 }
 
+/* ---- the dump of the shadow mode -----------------------------------------
+ *
+ * RSX_DEFORM_DUMP=<frames> writes the first n compared frames with a
+ * difference to one file: RSX_DEFORM_DUMP_FILE, else rsx_deform_dump.bin
+ * next to rsx_phases.csv, else rsx_deform_dump.bin in the current folder.
+ * The file holds words of four bytes in the order of the host:
+ *   "DFRM", 1, 28              header: version, bytes of a texel record
+ *   0x42 slot w h linear modes a brush of the painter, then w * h bytes.
+ *                              modes is wrap_s | wrap_t << 4.
+ *   0x45 part                 part 0 and 1: the GPU bytes of rows 0 and 1 of
+ *                             level 0, width bytes each. Part 2: the GPU
+ *                             bytes of row 0 of level 1, mip_width bytes.
+ *                             Written once.
+ *   0x46 frame target rows xmin xmax ymin ymax
+ *                             a frame. Then per row: y, x0, x1 and x1 - x0
+ *                             texel records: cpu, gpu, count, dest, brush,
+ *                             slot, 0, 0, u, v, colour, kx, ky. count is the
+ *                             number of paints since the last compare. The
+ *                             other values are of the last paint.
+ *   0x58                     the end
+ */
+static u64 s_deform_dumped;          /* frames written */
+static int s_deform_dump_edges;      /* the edges record is written */
+
+static FILE* deform_dump_open(void)
+{
+    const char* name = "rsx_deform_dump.bin";
+    const char* phases = getenv("RSX_PHASE_CSV");
+    const char* slash = phases ? strrchr(phases, '\\') : NULL;
+    const char* other = phases ? strrchr(phases, '/') : NULL;
+    char path[1024];
+    size_t dir = 0;
+    if (other && (!slash || other > slash)) slash = other;
+    if (phases && *phases && slash) dir = (size_t)(slash - phases) + 1;
+    const char* file = getenv("RSX_DEFORM_DUMP_FILE");
+    if ((!file || !*file) && dir + strlen(name) + 1 <= sizeof path) {
+        if (dir) memcpy(path, phases, dir);
+        memcpy(path + dir, name, strlen(name) + 1);
+        file = path;
+    }
+    s_deform_dump_file = file ? fopen(file, "wb") : NULL;
+    fprintf(stderr, "[DEFORM] dump: %s%s\n", file ? file : "no path",
+            s_deform_dump_file ? "" : " (cannot open)");
+    if (s_deform_dump_file) {
+        u32 header[2] = { 1, 28 };
+        fwrite("DFRM", 1, 4, s_deform_dump_file);
+        fwrite(header, sizeof header, 1, s_deform_dump_file);
+    }
+    return s_deform_dump_file;
+}
+
+static int deform_dump_order(const void* a, const void* b)
+{
+    const DeformPaint* p = a, * q = b;
+    if (p->at != q->at) return p->at < q->at ? -1 : 1;
+    return p->order < q->order ? -1 : p->order > q->order ? 1 : 0;
+}
+
+/* Writes the GPU bytes of the two rows of level 0 that the painter holds for
+ * row 0 of level 1, and the GPU bytes of that row. */
+static void deform_dump_edges(RsxDeformSurface* s)
+{
+    FILE* f = s_deform_dump_file;
+    OffRT* mip_rt = deform_off_rt(s->mip_address);
+    if (mip_rt) cpu_surface_copy(mip_rt);
+    for (u32 part = 0; part < 3; part++) {
+        u32 head[2] = { 0x45, part };
+        u32 count = part == 2 ? s->mip_width : s->width;
+        const u8* bytes = part == 2 ? vm_base + s->mip_address
+                                    : vm_base + s->guest_address + (size_t)part * s->pitch;
+        fwrite(head, sizeof head, 1, f);
+        fwrite(bytes, 1, count, f);
+    }
+    s_deform_dump_edges = 1;
+}
+
+/* Writes the brushes of the painter and the compared columns with the bytes
+ * of both sides. The columns are not reset yet. */
+static void deform_dump_frame(RsxDeformSurface* s, u64 frame)
+{
+    FILE* f = s_deform_dump_file;
+    for (int slot = 0; slot < 2; slot++) {
+        const DeformBrush* b = &s_deform_brush[slot];
+        u32 head[6];
+        if (!b->key || b->key == s->dumped_key[slot]) continue;
+        s->dumped_key[slot] = b->key;
+        head[0] = 0x42;
+        head[1] = (u32)slot;
+        head[2] = b->width;
+        head[3] = b->height;
+        head[4] = (u32)b->linear;
+        head[5] = b->wrap_s | b->wrap_t << 4;
+        fwrite(head, sizeof head, 1, f);
+        fwrite(b->bytes, 1, (size_t)b->width * b->height, f);
+    }
+    qsort(s->paints, s->paint_n, sizeof *s->paints, deform_dump_order);
+    u32 head[8] = { 0x46, (u32)frame, s->offset, 0, s->width, 0, s->height, 0 };
+    for (u32 y = 0; y < s->height; y++) {
+        u32 x0 = s->cols[2 * y], x1 = s->cols[2 * y + 1];
+        if (x1 <= x0) continue;
+        head[3]++;
+        if (x0 < head[4]) head[4] = x0;
+        if (x1 > head[5]) head[5] = x1;
+        if (y < head[6]) head[6] = y;
+        if (y + 1 > head[7]) head[7] = y + 1;
+    }
+    fwrite(head, sizeof head, 1, f);
+    u32 j = 0;
+    for (u32 y = 0; y < s->height; y++) {
+        u32 x0 = s->cols[2 * y], x1 = s->cols[2 * y + 1];
+        if (x1 <= x0) continue;
+        fwrite(&y, sizeof y, 1, f);
+        fwrite(&x0, sizeof x0, 1, f);
+        fwrite(&x1, sizeof x1, 1, f);
+        for (u32 x = x0; x < x1; x++) {
+            size_t at = (size_t)y * s->pitch + x;
+            DeformPaint* last = NULL;
+            u32 paints = 0;
+            while (j < s->paint_n && s->paints[j].at < at) j++;
+            while (j < s->paint_n && s->paints[j].at == at) {
+                last = &s->paints[j++];
+                paints++;
+            }
+            u8 bytes[8] = { s->ops[s_deform.op][at], vm_base[s->guest_address + at],
+                            (u8)(paints > 255 ? 255 : paints), last ? last->dest : 0,
+                            last ? last->brush : 0, last ? last->slot : 0, 0, 0 };
+            float values[3] = { last ? last->u : 0.0f, last ? last->v : 0.0f,
+                                last ? last->colour : 0.0f };
+            int index[2] = { last ? last->kx : 0, last ? last->ky : 0 };
+            fwrite(bytes, 1, 8, f);
+            fwrite(values, sizeof values, 1, f);
+            fwrite(index, sizeof index, 1, f);
+        }
+    }
+    s_deform_dumped++;
+    if (s_deform_dumped == s_deform_dump_frames) {
+        u32 end = 0x58;
+        fwrite(&end, sizeof end, 1, f);
+    }
+    fflush(f);
+}
+
+/* Renderer thread, after a submitted batch. Copies the OffRT of level 0 to
+ * guest memory (cpu_surface_copy waits for the GPU) and compares the columns
+ * the painter changed since the last compare. A target compares at most once
+ * a frame and RSX_DEFORM_LOG frames in all (300). The dump holds the frames
+ * with a difference. Row 0 of level 1 is not compared: the emulator does not
+ * render it, because the mip pass of the capture has positions that are not
+ * finite. [DEFORM_WHEEL] holds the two bytes of it that the game reads. */
 static void deform_shadow_compare(RsxDeformSurface* s)
 {
     if (!s->ops[0] || s->compare_frames >= s_deform.log_frames) return;
     u64 frame = s_d3d.frame_count;
     if (frame == s->compare_frame) return;      /* at most one compare a frame */
-    OffRT* level = deform_off_rt(s->guest_address), *mip_rt = deform_off_rt(s->mip_address);
-    /* The mip pass ran since the last compare: level 1 has a new generation. */
-    int mipped = mip_rt && mip_rt->gpu_generation != s->compare_generation;
+    OffRT* level = deform_off_rt(s->guest_address);
     u32 rows = 0;
     for (u32 y = 0; y < s->height; y++) rows += s->cols[2 * y + 1] > s->cols[2 * y];
-    if (!level || (!rows && !mipped)) return;
+    if (!level || !rows) return;
     s->compare_frame = frame;
     s->compare_frames++;
-    DeformDiff diff = { 0, 0, 0, 0, 0, 0, 0 }, mip = { 0, 0, 0, 0, 0, 0, 0 };
+    DeformDiff diff = { 0, 0, 0, 0, 0, 0, 0 };
     u64 op_equal[RSX_DEFORM_OP_COUNT] = { 0 };
-    if (rows) {
-        cpu_surface_copy(level);
-        for (u32 y = 0; y < s->height; y++) {
-            u32 x0 = s->cols[2 * y], x1 = s->cols[2 * y + 1];
-            deform_columns_reset(s, y);
-            if (x1 <= x0) continue;
-            size_t at = (size_t)y * s->pitch + x0;
-            const u8* gpu = vm_base + s->guest_address + at;
-            for (u32 k = 0; k < RSX_DEFORM_OP_COUNT; k++)
-                for (u32 x = 0; x < x1 - x0; x++)
-                    op_equal[k] += gpu[x] == s->ops[k][at + x];
-            deform_diff(&diff, s->ops[s_deform.op] + at, gpu, x1 - x0,
-                        s->guest_address + (u32)at);
-        }
+    cpu_surface_copy(level);
+    for (u32 y = 0; y < s->height; y++) {
+        u32 x0 = s->cols[2 * y], x1 = s->cols[2 * y + 1];
+        if (x1 <= x0) continue;
+        size_t at = (size_t)y * s->pitch + x0;
+        const u8* gpu = vm_base + s->guest_address + at;
+        for (u32 k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+            for (u32 x = 0; x < x1 - x0; x++)
+                op_equal[k] += gpu[x] == s->ops[k][at + x];
+        deform_diff(&diff, s->ops[s_deform.op] + at, gpu, x1 - x0, s->guest_address + (u32)at);
     }
-    const u8* gpu_mip = NULL;
-    if (mipped) {
-        cpu_surface_copy(mip_rt);
-        s->compare_generation = mip_rt->gpu_generation;
-        gpu_mip = vm_base + s->mip_address;
-        deform_diff(&mip, s->mip, gpu_mip, s->mip_width, s->mip_address);
+    if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {
+        if (!s_deform_dump_edges) deform_dump_edges(s);
+        deform_dump_frame(s, frame);
     }
+    for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);
+    s->paint_n = 0;
     s->total_texels += diff.texels;
     s->total_diff += diff.texels - diff.equal;
-    s->total_mip_texels += mip.texels;
-    s->total_mip_diff += mip.texels - mip.equal;
     if (diff.diffmax > s->total_diffmax) s->total_diffmax = diff.diffmax;
-    if (mip.diffmax > s->total_mip_diffmax) s->total_mip_diffmax = mip.diffmax;
     fprintf(stderr, "[DEFORM_SHADOW] frame=%llu target=%08X texels=%llu equal=%llu diff1=%llu"
                     " diffmax=%u first=%08X cpu=%u gpu=%u",
             (unsigned long long)frame, s->offset, (unsigned long long)diff.texels,
@@ -1272,20 +1465,14 @@ static void deform_shadow_compare(RsxDeformSurface* s)
             diff.first, diff.cpu, diff.gpu);
     for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
         fprintf(stderr, " op_%s=%llu", s_deform_ops[k].name, (unsigned long long)op_equal[k]);
-    if (mipped)
-        fprintf(stderr, " mip_texels=%llu mip_equal=%llu mip_diff1=%llu mip_diffmax=%u"
-                        " neighbour=%u/%u,%u/%u",
-                (unsigned long long)mip.texels, (unsigned long long)mip.equal,
-                (unsigned long long)mip.diff1, mip.diffmax, s->mip[0], gpu_mip[0],
-                s->mip[1], gpu_mip[1]);
+    if (s_deform_dump_file) fprintf(stderr, " dump=%llu", (unsigned long long)s_deform_dumped);
     fprintf(stderr, "\n");
     if (s->compare_frames == s_deform.log_frames)
         fprintf(stderr, "[DEFORM_SHADOW] done target=%08X frames=%llu texels=%llu diff=%llu"
-                        " diffmax=%u mip_texels=%llu mip_diff=%llu mip_diffmax=%u\n",
+                        " diffmax=%u\n",
                 s->offset, (unsigned long long)s->compare_frames,
                 (unsigned long long)s->total_texels, (unsigned long long)s->total_diff,
-                s->total_diffmax, (unsigned long long)s->total_mip_texels,
-                (unsigned long long)s->total_mip_diff, s->total_mip_diffmax);
+                s->total_diffmax);
 }
 
 /* ---------------------------------------------------------------------------

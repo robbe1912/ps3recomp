@@ -19,10 +19,8 @@ LIMITS = '#ifndef RSX_DEFORM_TARGETS_MAX'
 GUEST_INDEX = 'static u32 deform_guest_index(const rsx_state* st, u32 k)'
 LINE = re.compile(r'\[DEFORM_SHADOW\] frame=(\d+) target=([0-9A-F]+) texels=(\d+) equal=(\d+) diff1=(\d+) '
                   r'diffmax=(\d+) first=([0-9A-F]+) cpu=(\d+) gpu=(\d+) op_fp16=(\d+) op_fused=(\d+) op_f32=(\d+)'
-                  r'(?: mip_texels=(\d+) mip_equal=(\d+) mip_diff1=(\d+) mip_diffmax=(\d+) '
-                  r'neighbour=(\d+)/(\d+),(\d+)/(\d+))?')
-DONE = ('[DEFORM_SHADOW] done target=00A80500 frames=3 texels=204 diff=2 diffmax=7 '
-        'mip_texels=4096 mip_diff=3 mip_diffmax=128')
+                  r'(?: dump=(\d+))?')
+DONE = '[DEFORM_SHADOW] done target=00A80500 frames=3 texels=304 diff=2 diffmax=7'
 WHEEL = '[DEFORM_WHEEL] frame=101 x=10 y=30 level=bilinear cpu=01020304 gpu=05060708'
 # (name, production text, changed text). Each changed text must fail the fixture.
 MUTANTS = [
@@ -59,9 +57,25 @@ MUTANTS = [
      '    return vm_base + s->guest_address;'),
     ('compare-twice-a-frame',
      '    if (frame == s->compare_frame) return;      /* at most one compare a frame */\n', ''),
-    ('compared-columns-stay', '            deform_columns_reset(s, y);\n            if (x1 <= x0) continue;',
-     '            if (x1 <= x0) continue;'),
+    ('compared-columns-stay',
+     '    for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);\n    s->paint_n = 0;',
+     '    s->paint_n = 0;'),
+    ('private-copies-start-at-zero',
+     '        if (s->ops[k]) memcpy(s->ops[k], vm_base + s->guest_address, bytes);',
+     '        if (s->ops[k]) memset(s->ops[k], 0, bytes);'),
+    ('private-mip-starts-at-zero',
+     '        memcpy(mip, vm_base + s->mip_address, s->mip_width);',
+     '        memset(mip, 0, s->mip_width);'),
     ('first-call-reads-off', '            st = s_deform.any ? 2 : 0;\n', ''),
+    ('dump-count-off-by-one',
+     '                            (u8)(paints > 255 ? 255 : paints), last ? last->dest : 0,',
+     '                            (u8)(paints > 255 ? 255 : paints + 1), last ? last->dest : 0,'),
+    ('dump-dest-is-brush',
+     '                            (u8)(paints > 255 ? 255 : paints), last ? last->dest : 0,',
+     '                            (u8)(paints > 255 ? 255 : paints), last ? last->brush : 0,'),
+    ('dump-unbounded',
+     '    if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {',
+     '    if (s_deform_dump_file && diff.texels != diff.equal) {'),
 ]
 
 
@@ -126,7 +140,8 @@ def main():
         (folder / 'build.log').write_text(build.stdout + build.stderr, encoding='utf-8')
         if build.returncode:
             return None, 'build failed: ' + (build.stdout + build.stderr).strip()[-800:]
-        done = subprocess.run([str(exe)], capture_output=True, text=True, timeout=600)
+        done = subprocess.run([str(exe)], capture_output=True, text=True, timeout=600,
+                              env=dict(os.environ, RSX_DEFORM_DUMP_FILE=str(folder / 'dump.bin')))
         (folder / 'run.log').write_text(done.stdout + done.stderr, encoding='utf-8')
         return done, None
 
@@ -137,20 +152,19 @@ def main():
     print((result.stdout + result.stderr).strip()[-6000:])
     if result.returncode:
         return 1
-    for line in ('PASS off:', 'PASS formula:', 'PASS on:', 'PASS shadow:'):
+    for line in ('PASS off:', 'PASS formula:', 'PASS on:', 'PASS shadow:', 'PASS dump:'):
         assert line in result.stdout, line
     assert '[DEFORM] target address=00001000 offset=00A80500: 4096x4096, pitch 4096' in result.stdout
-    frames = [m.groups() for m in LINE.finditer(result.stdout)]
-    assert len(frames) == 3, frames
-    first, second, third = frames
-    assert first[:6] == ('101', '00A80500', '104', '102', '1', '7'), first
-    assert first[9] == '102' and first[12:16] == ('2048', '2046', '1', '128'), first
-    assert first[16:20] == ('0', '0', '0', '0'), first
-    assert second[:7] == ('102', '00A80500', '100', '100', '0', '0', '00000000'), second
-    assert second[12:20] == (None,) * 8, second
-    assert third[:7] == ('104', '00A80500', '0', '0', '0', '0', '00000000'), third
-    assert third[12:16] == ('2048', '2047', '0', '64') and third[16:20] == ('0', '64', '0', '0'), third
-    assert DONE in result.stdout and WHEEL in result.stdout
+    lines = [m.groups() for m in LINE.finditer(result.stdout)]
+    first, second, third = [g for g in lines if g[12] is None]
+    frames = [g for g in lines if g[12] is None]
+    dumped = [g for g in lines if g[12] is not None]
+    assert len(frames) == 3 and len(dumped) == 4, lines
+    assert [g[12] for g in dumped] == ['1', '1', '2', '2'] and dumped[1][3:5] == ('100', '0'), dumped
+    assert first[:7] == ('101', '00A80500', '104', '102', '1', '7', '0001F00A'), first
+    assert first[7:10] == ('0', '1', '102') and first[9:12] == ('102', '102', '102') and first[12] is None, first
+    assert second[:7] == ('102', '00A80500', '100', '100', '0', '0', '00000000') and second[12] is None, second
+    assert third[:7] == ('104', '00A80500', '100', '100', '0', '0', '00000000') and third[12] is None, third
     print('PASS lines: [DEFORM_SHADOW] frames, totals, [DEFORM_WHEEL], bound target')
 
     survived = []
