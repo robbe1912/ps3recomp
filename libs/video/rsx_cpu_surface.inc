@@ -121,8 +121,17 @@ static int cpu_surface_view_probe(const CpuSurfaceView *v,u32 address,u32 bytes)
 /* Client thread. Returns 1 when it served the read, so no request is queued.
  * A view that changes or waits for a copy makes the read take the queued
  * path. A read that touches no surface takes the queued path too. */
+/* Hooks of rsx_deform_surface.inc, the CPU buffer of a paint target. They
+ * are NULL while that file is not in the build, or until its init runs:
+ * then every path below is as it was. */
+static struct {
+    int (*serve)(u32 address,u32 bytes);   /* 1: the CPU buffer holds every byte of the range */
+    int (*owned)(u32 rsx_offset);          /* 1: level 0 of a listed surface, buffer mode on   */
+    u64 (*sequence)(void);                 /* sum of the paint sequence numbers               */
+} s_cpu_surface_deform;
 static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
     if(!s_cpu_surface_fast)return 0;
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,bytes))return 1;
     u64 views=cpu_surface_view_load(&s_cpu_surface_views);
     CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
     u64 hits=0;
@@ -227,7 +236,7 @@ static CpuSurfaceView *cpu_surface_view_slot(int index) {
 static void cpu_surface_view_update(OffRT *r) {
     CpuSurfaceView *v=cpu_surface_view_slot(cpu_surface_view_index(r));
     if(!v)return;
-    int live=r->res && r->cpu_address;
+    int live=r->res && r->cpu_address && !(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off));
     u64 begin=live?(u64)r->cpu_address:0,end=live?begin+(u64)r->cpu_pitch*r->h:0;
     u64 ready=!r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation;
     u64 sequence=cpu_surface_view_load(&v->sequence);
@@ -467,6 +476,7 @@ static void cpu_surface_prefetch_shutdown(void) {
 }
 static void cpu_surface_copy(OffRT *r) {
     extern uint8_t *vm_base;
+    if(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off))return;
     if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation){if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->hits++;return;}
     if(cpu_surface_prefetch_take(r))return;
     unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);
@@ -533,6 +543,7 @@ static void cpu_surface_copy(OffRT *r) {
         r->cpu_address,r->off,r->cpu_pitch,width,r->h,r->cpu_format&31u,(unsigned long long)r->gpu_generation);
 }
 static void cpu_surface_read(u32 address,u32 bytes) {
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,bytes))return;
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
         OffRT *r=&s_d3d.off_rt[i];
         if(!r->res || !r->cpu_address)continue;
@@ -596,6 +607,7 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
         OffRT *r=&s_d3d.off_rt[i];
         if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->h)continue;
+        if(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off))continue;
         views[view_count]=(RsxCpuSurfaceSnapshotView){r->cpu_address,r->cpu_pitch,r->h};
         targets[view_count++]=r;
     }
@@ -612,6 +624,8 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
                 (uint64_t)views[j].pitch*views[j].height;
             if(begin<view_end && end>views[j].address)intersects=1;
         }
+        /* A range the CPU buffer holds needs no view and no copy. */
+        if(intersects&&s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(ranges[i].address,ranges[i].bytes))intersects=0;
         bindings[i].view_index=UINT32_MAX;
         if(intersects && !rsx_cpu_surface_snapshot_bind(&ranges[i],1,
             views,view_count,&bindings[i]))
@@ -909,6 +923,7 @@ static void cpu_surface_pending_insert(u32 address,u32 pitch,u32 height) {
 }
 /* Renderer thread. Each recorded draw or clear registers its targets here. */
 static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,(u32)((u64)pitch*height)))return;
     cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
     cpu_surface_pending_insert(address,pitch,height);
     cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
@@ -926,6 +941,7 @@ static int cpu_surface_pending_overlaps(u32 address,u32 bytes) {
  * recorded draws, and the number of surfaces that hold a range. */
 static int cpu_surface_snapshot_clear(const VmReadSnapshotRange *ranges,u32 count,u64 *seen) {
     u64 table=cpu_surface_view_load(&s_cpu_surface_views),sequences=0,matched=0;
+    if(s_cpu_surface_deform.sequence)sequences+=s_cpu_surface_deform.sequence();
     CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(table&CPU_SURFACE_VIEW_ADDRESS);
     u32 owners[VM_READ_SNAPSHOT_MAX_RANGES]={0};
     for(u64 i=table>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
