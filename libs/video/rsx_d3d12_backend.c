@@ -6610,13 +6610,15 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     u32 o = 0;
     /* Strip/fan triangles share vertices. Reuse their exact decoded bytes
      * only within this callback: all attribute/base/frequency state is fixed,
-     * and nothing survives a later draw or guest-memory update. 64 entries,
+     * and nothing survives a later draw or guest-memory update. Cache entries
+     * point to decoded output slots. Reservation finishes before `out` is
+     * formed, so those slots stay in place for this callback. 64 entries,
      * two-way set-associative on the index with LRU per set: both shared strip
      * vertices and the fan center are retained across common strip/fan patterns.
      * Two ways also retain reuse between neighbouring strip rows. */
     const int use_cache = count > 3 || count + cursor.held > 3;
     enum { VP_STRIP_SETS = 32 };
-    VPSlot cached_vertices[VP_STRIP_SETS][2][16];
+    VPSlot* cached_vertices[VP_STRIP_SETS][2];
     u32 cached_indices[VP_STRIP_SETS][2];
     u8 cached_state[VP_STRIP_SETS];   /* bit w: way w valid; bit 2: way to evict */
     if (use_cache) memset(cached_state, 0, sizeof cached_state);
@@ -6645,7 +6647,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
             else if ((bits & 2u) && cached_indices[set][1] == triangle[v]) { way = 1; hit = 1; }
             else {
                 way = !(bits & 1u) ? 0u : !(bits & 2u) ? 1u : (bits >> 2) & 1u;
-                read_vp_vertex(state, &fetch_batch, triangle[v], cached_vertices[set][way]);
+                cached_vertices[set][way] = &out[o*16];
+                read_vp_vertex(state, &fetch_batch, triangle[v], &out[o*16]);
                 cached_indices[set][way] = triangle[v];
                 bits |= 1u << way;
             }
@@ -6654,11 +6657,13 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
                 else ++s_vertex_profile.cache_misses;
             }
             cached_state[set] = (u8)((bits & 3u) | ((way ^ 1u) << 2));
-            const double started = s_vertex_profile_enabled ? perf_now() : 0.0;
-            memcpy(&out[o*16], cached_vertices[set][way], sizeof cached_vertices[set][way]);
-            if (s_vertex_profile_enabled) {
-                s_vertex_profile.copy_bytes += sizeof cached_vertices[set][way];
-                s_vertex_profile.copy_seconds += perf_now() - started;
+            if (hit) {
+                const double started = s_vertex_profile_enabled ? perf_now() : 0.0;
+                memcpy(&out[o*16], cached_vertices[set][way], VP_VERT_STRIDE);
+                if (s_vertex_profile_enabled) {
+                    s_vertex_profile.copy_bytes += VP_VERT_STRIDE;
+                    s_vertex_profile.copy_seconds += perf_now() - started;
+                }
             }
             ++o;
         }
