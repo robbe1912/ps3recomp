@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_job_dump.h"
 #include "spu_policy_counters.h"
 #include "spu_coherency.h"
 #include <stdint.h>
@@ -573,6 +574,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             return 0;
         }
     }
+    if (g_spu_job_dump >= 0)
+        spu_job_dump_dma(spu, lsa, (uint32_t)ea, size, cmd, mfc_is_get(cmd),
+                         mfc_is_get(cmd) ? ea_ptr : ls_ptr);
     if (mfc_is_get(cmd)) {
         /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the

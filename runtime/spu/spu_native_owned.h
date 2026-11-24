@@ -6,6 +6,7 @@
 #ifndef SPU_NATIVE_OWNED_H
 #define SPU_NATIVE_OWNED_H
 #include "spu_context.h"
+#include "spu_job_dump.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,6 +43,7 @@ static inline int spu_native_owned_policy(const spu_context* ctx) {
     return ctx && ctx->policy_mode && spu_native_owned_enabled();
 }
 static inline int spu_native_owned_can_run(const spu_context* ctx, uint32_t pc) {
+    if (g_spu_job_dump >= 0) spu_job_dump_probe(ctx, pc);
     if (!spu_native_owned_policy(ctx) || ctx->image_id < 0 || !ctx->ls ||
         pc >= SPU_LS_SIZE || (pc & 3) || ctx->irq_frame || ctx->irq_saved ||
         (ctx->int_enable && (ctx->event_status & ctx->event_mask)) ||
