@@ -4235,9 +4235,12 @@ static void perf_batch_finish(double started)
     }
 }
 
+static void rsx_vertex_profile_finish(void);
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
+    rsx_vertex_profile_finish();
     u32 fi = s_d3d.frame_index;
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
@@ -5993,6 +5996,42 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
 typedef rsx_vertex_value VPSlot;
 #define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
 
+/* RSX_VERTEX_PROFILE=1: print vertex fetch and upload copy counts once per
+ * frame, then clear them. The default path does not read the clock. */
+static int s_vertex_profile_enabled;
+static struct {
+    u64 fetches, fetch_bytes;
+    double fetch_seconds;
+    u64 draws, repeats, cache_hits, cache_misses;
+    u64 direct_bytes, copy_bytes;
+    double copy_seconds;
+} s_vertex_profile;
+
+static void rsx_vertex_profile_finish(void)
+{
+    static int initialized;
+    if (!initialized) {
+        const char* option = getenv("RSX_VERTEX_PROFILE");
+        s_vertex_profile_enabled = option && !strcmp(option, "1");
+        initialized = 1;
+        return;
+    }
+    if (!s_vertex_profile_enabled) return;
+    fprintf(stderr, "[VTXPROFILE] fetches=%llu fetch_bytes=%llu fetch_ms=%.3f "
+                    "draws=%llu repeats=%llu hits=%llu misses=%llu direct_bytes=%llu "
+                    "copy_bytes=%llu copy_ms=%.3f\n",
+            (unsigned long long)s_vertex_profile.fetches,
+            (unsigned long long)s_vertex_profile.fetch_bytes,
+            s_vertex_profile.fetch_seconds * 1000.0,
+            (unsigned long long)s_vertex_profile.draws,
+            (unsigned long long)s_vertex_profile.repeats,
+            (unsigned long long)s_vertex_profile.cache_hits,
+            (unsigned long long)s_vertex_profile.cache_misses,
+            (unsigned long long)s_vertex_profile.direct_bytes,
+            (unsigned long long)s_vertex_profile.copy_bytes,
+            s_vertex_profile.copy_seconds * 1000.0);
+    memset(&s_vertex_profile, 0, sizeof s_vertex_profile);
+}
 
 void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
 
@@ -6003,11 +6042,18 @@ static void read_vp_vertex(const rsx_state* state,
                            const rsx_vertex_fetch_batch* batch,
                            u32 vi, VPSlot* out16)
 {
+    if (s_vertex_profile_enabled) {
+        ++s_vertex_profile.fetches;
+        s_vertex_profile.fetch_bytes += sizeof(out16[0]) * 16;
+    }
+    const double started = s_vertex_profile_enabled ? perf_now() : 0.0;
     if (batch->count <= 8)
         rsx_fetch_vertex_prepared(batch, vi, out16);
     else
         for (int i = 0; i < 16; i++)
             rsx_fetch_attrib(state, i, vi, out16[i].v);
+    if (s_vertex_profile_enabled)
+        s_vertex_profile.fetch_seconds += perf_now() - started;
     const rsx_vertex_attrib* a = &state->vertex_attribs[0];
     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
     rsx_vtx_pos_dbg(state, out16[0].v, n);
@@ -6549,6 +6595,10 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     if (!state->vertex_attribs[0].enabled) return 0;
     rsx_vertex_fetch_batch fetch_batch;
     rsx_vertex_fetch_prepare(&fetch_batch, state);
+    if (s_vertex_profile_enabled) {
+        ++s_vertex_profile.draws;
+        if (s_vertex_profile.draws > 1) ++s_vertex_profile.repeats;
+    }
     if (owner != state || epoch != state->begin_epoch || previous_fan != fan) {
         memset(&cursor, 0, sizeof cursor);
         owner = state; epoch = state->begin_epoch; previous_fan = fan;
@@ -6581,6 +6631,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         }
         /* A fresh single triangle has no shared work to amortize a cache. */
         if (!use_cache) {
+            if (s_vertex_profile_enabled)
+                s_vertex_profile.direct_bytes += 3u * VP_VERT_STRIDE;
             for (u32 v = 0; v < 3; ++v)
                 read_vp_vertex(state, &fetch_batch, triangle[v], &out[(o++)*16]);
             continue;
@@ -6588,16 +6640,26 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         for (u32 v = 0; v < 3; v++) {
             const u32 set = triangle[v] & (VP_STRIP_SETS - 1);
             u32 bits = cached_state[set], way;
-            if ((bits & 1u) && cached_indices[set][0] == triangle[v]) way = 0;
-            else if ((bits & 2u) && cached_indices[set][1] == triangle[v]) way = 1;
+            int hit = 0;
+            if ((bits & 1u) && cached_indices[set][0] == triangle[v]) { way = 0; hit = 1; }
+            else if ((bits & 2u) && cached_indices[set][1] == triangle[v]) { way = 1; hit = 1; }
             else {
                 way = !(bits & 1u) ? 0u : !(bits & 2u) ? 1u : (bits >> 2) & 1u;
                 read_vp_vertex(state, &fetch_batch, triangle[v], cached_vertices[set][way]);
                 cached_indices[set][way] = triangle[v];
                 bits |= 1u << way;
             }
+            if (s_vertex_profile_enabled) {
+                if (hit) ++s_vertex_profile.cache_hits;
+                else ++s_vertex_profile.cache_misses;
+            }
             cached_state[set] = (u8)((bits & 3u) | ((way ^ 1u) << 2));
+            const double started = s_vertex_profile_enabled ? perf_now() : 0.0;
             memcpy(&out[o*16], cached_vertices[set][way], sizeof cached_vertices[set][way]);
+            if (s_vertex_profile_enabled) {
+                s_vertex_profile.copy_bytes += sizeof cached_vertices[set][way];
+                s_vertex_profile.copy_seconds += perf_now() - started;
+            }
             ++o;
         }
     }
