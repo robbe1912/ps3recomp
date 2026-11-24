@@ -1645,14 +1645,15 @@ static void ppu_spin_yield(void)
  * family this file defines to fast-path accessors. Those accessors keep
  * every behavior that is not a diagnostic -- alias normalize, bounds,
  * null-page report, raw-SPU MMIO side effects, GCM ref-poll, the hot-spin
- * fair-share yield -- and delegate the whole access back HERE when a
- * diagnostic knob is armed (ppu_fm_diag, set once by ppu_fm_arm at boot) or
- * the access hits a condition the fast path serves by delegation. The fork
- * lifter does not emit that include yet (docs/PPU_FASTMEM.md): a fork build
- * runs the inline loads of its ppu_recomp.h and the out-of-line functions
- * below. The fire halves below are the fire halves of the fast paths.
+ * diagnostic knob is armed (a bit of ppu_fm_slow, set by ppu_fm_arm at
+ * boot) or the access hits a condition the fast path serves by delegation.
+ * ppu_fm_arm also fills the page table ppu_fm_kind with the pages that hold
+ * an address of such a condition. The fork lifter does not emit that
+ * include yet (docs/PPU_FASTMEM.md): a fork build runs the inline loads of
+ * its ppu_recomp.h and the out-of-line functions below. The fire halves
+ * below are the fire halves of the fast paths.
  * -----------------------------------------------------------------------*/
-#include "ps3emu/ppu_fastmem.h"   /* the accessor columns of the PPU_FM_COUNT counter */
+#include "ps3emu/ppu_fastmem.h"   /* flag word, page table, counter columns */
 #ifndef _WIN32
 #include <time.h>                 /* clock_gettime */
 #endif
@@ -1696,7 +1697,15 @@ static void ppu_fm_count_emit(const char* line)
     fflush(stderr);
 }
 
-extern "C" volatile uint32_t ppu_fm_diag = 0;
+/* Flag word of the fast paths (include/ps3emu/ppu_fastmem.h): one bit for
+ * each reason to leave the fast path. Each bit is set until ppu_fm_arm
+ * runs, so each access takes the out-of-line function until then. */
+extern "C" volatile uint32_t ppu_fm_slow = PPU_FM_S_ALL;
+
+/* Page table of the fast paths: one byte per 4 KB guest page. ppu_fm_arm
+ * sets the pages that hold an address with a slow-path reason. The header
+ * declares it with C linkage. */
+unsigned char ppu_fm_kind[PPU_FM_PAGES];
 
 /* Hot-spin detector switch of the inline fast paths: 1 = the detector runs.
  * Only the exact value PPU_FM_SPINDET=0 turns it off. */
@@ -1704,11 +1713,11 @@ extern "C" volatile uint32_t ppu_fm_spin_det = 1;
 
 /* ---- PPU_FM_COUNT: opt-in call counter of the accessors ------------------
  * One counter per accessor and per host thread that calls the accessors. It
- * runs only when ppu_fm_arm saw PPU_FM_COUNT. Then ppu_fm_diag is 1, every
- * access takes the out-of-line family, and ppu_fm_count_hit counts the call
- * before the family gets it. With the switch off, ppu_fm_count_hit returns
- * at its first test, and the default path of the header has no code of the
- * counter.
+ * runs only when ppu_fm_arm saw PPU_FM_COUNT. Then PPU_FM_S_COUNT is set in
+ * ppu_fm_slow, every access takes the out-of-line family, and
+ * ppu_fm_count_hit counts the call before the family gets it. The
+ * out-of-line function calls it only while PPU_FM_S_COUNT is set. The fast
+ * path of the header has no code of the counter.
  *
  * One line per second on stderr: one line for each thread with calls in that
  * second, then the sum of all threads. A thread reads the clock one time
@@ -1737,8 +1746,6 @@ static uint32_t ppu_fm_count_next;             /* slots handed out */
 static PPU_FM_TLS int ppu_fm_count_slot = -1;  /* the slot of this thread */
 static int64_t ppu_fm_count_last;              /* clock ticks at the start of the current second */
 static uint32_t ppu_fm_count_seq;
-
-extern "C" volatile uint32_t ppu_fm_count = 0; /* set by ppu_fm_arm */
 
 /* Appends the columns and the newline to `text`. */
 static void ppu_fm_count_columns(char* text, size_t cap, const uint64_t* n)
@@ -1810,7 +1817,6 @@ static void ppu_fm_count_tick(void)
 extern "C" void ppu_fm_count_hit(unsigned k)
 {
     int s;
-    if (!ppu_fm_count) return;
     s = ppu_fm_count_slot;
     if (s < 0) {
         /* The first count on this thread takes a slot. */
@@ -1830,44 +1836,73 @@ extern "C" void ppu_fm_count_hit(unsigned k)
         ppu_fm_count_tick();
 }
 
-/* Any of these in the environment routes every memory access through the
+/* Decides at boot which memory accesses leave the fast paths: sets the flag
+ * word ppu_fm_slow and fills the page table ppu_fm_kind. A second call
+ * computes the same state.
+ *
+ * Any of these in the environment routes every memory access through the
  * out-of-line family, exactly as before the fast paths existed. PPU_FM=0 is
  * the runtime kill switch: same routing, no rebuild -- the one-binary A/B
  * knob for isolating a fastmem regression. */
 extern "C" void ppu_fm_arm(void)
 {
-    if (ppu_fm_diag) return;
-    const char* spindet = getenv("PPU_FM_SPINDET");
-    if (spindet && spindet[0] == '0' && !spindet[1]) ppu_fm_spin_det = 0;
-    /* PPU_FM_COUNT counts the calls of the accessors (ppu_fm_count_hit). The
-     * count needs the out-of-line family, so it is a diagnostic. A value that
-     * is present and is not the exact value 0 turns it on. */
-    const char* count = getenv("PPU_FM_COUNT");
-    if (count && (count[0] != '0' || count[1])) {
-        ppu_fm_count = 1;
-        ppu_fm_count_emit("[PPU_FM_COUNT] on\n");
-    }
+    const uint32_t refpoll = (ppu_hle_inject_base + 0x2008u) & ~(PPU_FM_PAGE_SIZE - 1u);
     static const char* const knobs[] = {
         "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "PPU_HOTMAP", "PPU_RVAL",
         "PPU_RVAL64", "YDKJ_RWATCH", "PT", "PPU_WVAL", "PPU_WVAL_LO",
         "PPU_WVAL_HI", "PPU_WWATCH", "PS3_NULL_SWEEP", "SPU_WP",
         "PPU_FM", 0 };
+    uint32_t slow = 0;
+    const char* spindet;
+    const char* count;
+    const char* atom;
+    for (uint32_t p = 0; p < PPU_FM_PAGES; p++) {
+        uint32_t e = p << PPU_FM_PAGE_SHIFT;
+        unsigned char kind = 0;
+        /* Bounds: each page that is not entirely inside ppu_vm_size. */
+        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE > ppu_vm_size)
+            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+        if (e < 0x10000u) kind |= (unsigned char)PPU_FM_K_READ;   /* null-read report */
+        if (e < 0x1000u)  kind |= (unsigned char)PPU_FM_K_WRITE;  /* null-store report */
+        if (ppu_fm_in_alias(e))
+            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+        if (spu_raw_is_reg(e))
+            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+        if (e == refpoll) kind |= (unsigned char)PPU_FM_K_READ;   /* GCM ref-poll */
+        ppu_fm_kind[p] |= kind;
+    }
+    spindet = getenv("PPU_FM_SPINDET");
+    if (spindet && spindet[0] == '0' && !spindet[1]) ppu_fm_spin_det = 0;
+    /* PPU_FM_COUNT counts the calls of the accessors (ppu_fm_count_hit). The
+     * count needs the out-of-line family, so it is a diagnostic. A value that
+     * is present and is not the exact value 0 turns it on. */
+    count = getenv("PPU_FM_COUNT");
+    if (count && (count[0] != '0' || count[1])) {
+        slow |= PPU_FM_S_COUNT;
+        ppu_fm_count_emit("[PPU_FM_COUNT] on\n");
+    }
     for (int i = 0; knobs[i]; i++) {
         const char* e = getenv(knobs[i]);
+        int is_fm;
         if (!e) continue;
         /* SPU_WP is a boolean control: explicit zero disables the watch.
          * Do not turn every guest memory access into a diagnostic call for
          * a disabled watch. Address-valued knobs still use presence. */
         if (!strcmp(knobs[i], "SPU_WP") && e[0] == '0' && !e[1]) continue;
-        int is_fm = (knobs[i][0] == 'P' && knobs[i][4] == 'F' &&
-                     knobs[i][5] == 'M' && !knobs[i][6]);
+        is_fm = (knobs[i][0] == 'P' && knobs[i][4] == 'F' &&
+                knobs[i][5] == 'M' && !knobs[i][6]);
         /* PPU_FM=0 disarms the fast paths (kill switch); PPU_FM=1 keeps
          * them. Any other knob here being set at all arms the full
          * out-of-line family. */
-        if (is_fm) { if (e[0] == '0') { ppu_fm_diag = 1; return; } continue; }
-        ppu_fm_diag = 1; return;
+        if (is_fm) { if (e[0] == '0') { slow |= PPU_FM_S_DIAG; break; } continue; }
+        slow |= PPU_FM_S_DIAG; break;
     }
-    if (ppu_fm_count) ppu_fm_diag = 1;
+    /* SPU_ATOM_EA arms the skip-freeze barrier probe in the SPU channel
+     * code (it sets g_barrier_sync_watch). Stores then take the
+     * out-of-line family. Reads keep the fast path. */
+    atom = getenv("SPU_ATOM_EA");
+    if (atom && ((uint32_t)strtoul(atom, 0, 16) & ~127u)) slow |= PPU_FM_S_WATCH;
+    ppu_fm_slow = slow;
 }
 
 /* GCM_REFPOLL fire (read32 of VM_HLE_INJECT_BASE+0x2008). Env-gated,
