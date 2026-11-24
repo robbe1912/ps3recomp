@@ -12,6 +12,9 @@
  *                                          without this list.
  *   RSX_DEFORM_CAPTURE=1                   section A: dump the first draws
  *                                          into the listed surfaces.
+ *   RSX_DEFORM_CHAIN=1                     section A: with the capture, also
+ *                                          dump the records that follow the
+ *                                          first one.
  *
  * rsx_d3d12_backend.c includes this file after rsx_cpu_surface.inc. It uses
  * the record type D3D12DrawRecord, rsx_state, s_d3d, vm_base, the vertex
@@ -28,6 +31,10 @@
 #ifndef RSX_DEFORM_CAPTURE_MAX
 #define RSX_DEFORM_CAPTURE_MAX 64u
 #endif
+/* Records of the chain: the passes that follow the first record of the dump. */
+#ifndef RSX_DEFORM_CHAIN_MAX
+#define RSX_DEFORM_CHAIN_MAX 64u
+#endif
 /* Upper bound of one fragment program in guest memory (VP_FP_UCODE_MAX). */
 #define RSX_DEFORM_FP_UCODE_MAX 16384u
 
@@ -37,9 +44,10 @@ typedef struct {
     u32        offsets[RSX_DEFORM_TARGETS_MAX];
     int        n_offsets;
     int        capture;           /* RSX_DEFORM_CAPTURE=1                     */
+    int        chain;             /* RSX_DEFORM_CHAIN=1 with the capture      */
 } RsxDeformConfig;
 
-static RsxDeformConfig s_deform = { -1, 0, { 0 }, 0, 0 };
+static RsxDeformConfig s_deform = { -1, 0, { 0 }, 0, 0, 0 };
 
 /* Comma separated hex offsets. Returns the count, at most RSX_DEFORM_TARGETS_MAX. */
 static int deform_read_offsets(const char* list, u32* out)
@@ -57,14 +65,21 @@ static int deform_read_offsets(const char* list, u32* out)
     return n;
 }
 
+/* 1 when the variable exists and is not "0". */
+static int deform_switch(const char* name)
+{
+    const char* value = getenv(name);
+    return value && *value && strcmp(value, "0") != 0;
+}
+
 static void deform_config_read(void)
 {
     const char* targets = getenv("RSX_DEFORM_TARGETS");
     if (!targets || !*targets) return;
     s_deform.n_offsets = deform_read_offsets(targets, s_deform.offsets);
     if (!s_deform.n_offsets) return;
-    const char* capture = getenv("RSX_DEFORM_CAPTURE");
-    s_deform.capture = capture && *capture && strcmp(capture, "0") != 0;
+    s_deform.capture = deform_switch("RSX_DEFORM_CAPTURE");
+    s_deform.chain = s_deform.capture && deform_switch("RSX_DEFORM_CHAIN");
     s_deform.any = s_deform.capture;
 }
 
@@ -99,52 +114,65 @@ static int deform_listed(u32 offset)
  *
  * RSX_DEFORM_CAPTURE=1 and RSX_DEFORM_TARGETS write one record per clear and
  * per draw whose colour target is a listed offset, up to RSX_DEFORM_CAPTURE_MAX
- * records. The file is rsx_deform_draws.txt next to rsx_phases.csv, so it
- * needs the RSX_PHASE_CSV path. Each record holds the state words the backend
- * replays the draw with, the vertex stream, and the decompiled programs. The
- * shader text is printed once per program; later records name the record
- * that holds it.
+ * records, into rsx_deform_draws.txt. RSX_DEFORM_CHAIN=1 adds the next
+ * RSX_DEFORM_CHAIN_MAX records in FIFO order whose colour target 0 is not a
+ * listed offset, into rsx_deform_chain.txt. Those are the passes that follow
+ * the paint, such as the mip chain. Both files go next to rsx_phases.csv, so
+ * the capture needs the RSX_PHASE_CSV path. Each record holds the state words
+ * the backend replays the draw with, the vertex stream, and the decompiled
+ * programs. The shader text is printed once per program; later records name
+ * the file and the record that holds it.
  */
 
+enum { DEFORM_CAPTURE_DRAWS, DEFORM_CAPTURE_CHAIN, DEFORM_CAPTURE_FILES };
+static const char* const s_deform_capture_name[DEFORM_CAPTURE_FILES] = { "draws", "chain" };
+static const char* const s_deform_capture_path[DEFORM_CAPTURE_FILES] = {
+    "rsx_deform_draws.txt", "rsx_deform_chain.txt"
+};
+
 typedef struct {
-    FILE* file;
-    u32   count;        /* records written                              */
-    u32   fp_seen[16];  /* fp_addr of a printed fragment program        */
+    FILE* file[DEFORM_CAPTURE_FILES];
+    u32   count[DEFORM_CAPTURE_FILES]; /* records written per file            */
+    u64   fifo;                        /* records the hook has seen           */
+    u32   fp_seen[16];                 /* fp_addr of a printed fragment program */
+    u8    fp_file[16];
     u32   fp_record[16];
     int   fp_n;
-    u32   vp_seen[16];  /* start slot of a printed vertex program       */
+    u32   vp_seen[16];                 /* start slot of a printed vertex program */
+    u8    vp_file[16];
     u32   vp_record[16];
     int   vp_n;
+    int   chain_started;               /* the chain file was requested         */
 } RsxDeformCapture;
 
 static RsxDeformCapture s_deform_capture;
 
-static void deform_capture_open(void)
+/* Opens one capture file next to rsx_phases.csv. Returns 0 when there is no
+ * RSX_PHASE_CSV path or the file cannot be opened. */
+static int deform_capture_open(int which)
 {
     const char* phases = getenv("RSX_PHASE_CSV");
+    const char* name = s_deform_capture_path[which];
     char path[1024];
     const char* slash = phases ? strrchr(phases, '\\') : NULL;
     const char* other = phases ? strrchr(phases, '/') : NULL;
     if (other && (!slash || other > slash)) slash = other;
-    if (!phases || !*phases
-        || (size_t)(slash ? slash - phases + 1 : 0) + sizeof "rsx_deform_draws.txt" > sizeof path) {
-        fprintf(stderr, "[DEFORM_CAPTURE] off: RSX_DEFORM_CAPTURE needs the"
-                        " RSX_PHASE_CSV path\n");
-        s_deform.capture = 0;
-        return;
-    }
     size_t dir = slash ? (size_t)(slash - phases) + 1 : 0;
-    memcpy(path, phases, dir);
-    memcpy(path + dir, "rsx_deform_draws.txt", sizeof "rsx_deform_draws.txt");
-    s_deform_capture.file = fopen(path, "wb");
-    if (!s_deform_capture.file) {
-        fprintf(stderr, "[DEFORM_CAPTURE] off: cannot open %s\n", path);
-        s_deform.capture = 0;
-        return;
+    if (!phases || !*phases || dir + strlen(name) + 1 > sizeof path) {
+        fprintf(stderr, "[DEFORM_CAPTURE] %s: stopped, needs the RSX_PHASE_CSV path\n",
+                s_deform_capture_name[which]);
+        return 0;
     }
-    fprintf(stderr, "[DEFORM_CAPTURE] on: %d target%s, first %u records into %s\n",
-            s_deform.n_offsets, s_deform.n_offsets == 1 ? "" : "s",
-            (u32)RSX_DEFORM_CAPTURE_MAX, path);
+    memcpy(path, phases, dir);
+    memcpy(path + dir, name, strlen(name) + 1);
+    s_deform_capture.file[which] = fopen(path, "wb");
+    if (!s_deform_capture.file[which]) {
+        fprintf(stderr, "[DEFORM_CAPTURE] %s: stopped, cannot open %s\n",
+                s_deform_capture_name[which], path);
+        return 0;
+    }
+    fprintf(stderr, "[DEFORM_CAPTURE] %s: open %s\n", s_deform_capture_name[which], path);
+    return 1;
 }
 
 /* Index k of the guest index array. Same decode as read_guest_index. */
@@ -218,8 +246,10 @@ static void deform_capture_stream(FILE* f, const rsx_state* st, u32 first, u32 c
     }
 }
 
-/* Print a program once per identity. later records name the first record. */
-static void deform_capture_programs(FILE* f, const D3D12DrawRecord* dr, const rsx_state* st)
+/* Print a program once per identity. Later records name the file and the
+ * record that holds the text. */
+static void deform_capture_programs(int which, FILE* f, const D3D12DrawRecord* dr,
+                                    const rsx_state* st)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
@@ -236,19 +266,22 @@ static void deform_capture_programs(FILE* f, const D3D12DrawRecord* dr, const rs
             u32 size = rsx_fp_program_size(ucode, RSX_DEFORM_FP_UCODE_MAX);
             int n = rsx_fp_decompile(ucode, RSX_DEFORM_FP_UCODE_MAX, st->shader_control,
                                      text, (u32)sizeof text);
-            fprintf(f, " fp_text=record=%u fp_vm=0x%08X fp_ucode_bytes=%u"
-                       " fp_instrs=%d\n fp_ucode=", s_deform_capture.count, vm, size, n);
+            fprintf(f, " fp_text=%s:record=%u fp_vm=0x%08X fp_ucode_bytes=%u"
+                       " fp_instrs=%d\n fp_ucode=", s_deform_capture_name[which],
+                    s_deform_capture.count[which], vm, size, n);
             for (u32 b = 0; b + 4 <= size; b += 4)
                 fprintf(f, " %02X%02X%02X%02X", ucode[b], ucode[b + 1], ucode[b + 2],
                         ucode[b + 3]);
             fprintf(f, "\nFP_HLSL_BEGIN\n%s\nFP_HLSL_END\n", n > 0 ? text : "");
             if (s_deform_capture.fp_n < 16) {
                 s_deform_capture.fp_seen[s_deform_capture.fp_n] = dr->fp_addr;
-                s_deform_capture.fp_record[s_deform_capture.fp_n] = s_deform_capture.count;
+                s_deform_capture.fp_file[s_deform_capture.fp_n] = (u8)which;
+                s_deform_capture.fp_record[s_deform_capture.fp_n] = s_deform_capture.count[which];
                 s_deform_capture.fp_n++;
             }
         } else {
-            fprintf(f, " fp_text=record=%u\n", s_deform_capture.fp_record[seen]);
+            fprintf(f, " fp_text=%s:record=%u\n", s_deform_capture_name[s_deform_capture.fp_file[seen]],
+                    s_deform_capture.fp_record[seen]);
         }
     }
     /* Vertex program: from the start slot SET_TRANSFORM_PROGRAM_START names
@@ -263,30 +296,32 @@ static void deform_capture_programs(FILE* f, const D3D12DrawRecord* dr, const rs
             rsx_vp_set_branch_base(start / 16u);
             int n = rsx_vp_decompile(st->vp_ucode + start, st->vp_ucode_bytes - start,
                                      text, (u32)sizeof text);
-            fprintf(f, " vp_text=record=%u vp_start_slot=%u vp_store_bytes=%u"
+            fprintf(f, " vp_text=%s:record=%u vp_start_slot=%u vp_store_bytes=%u"
                        " vp_instrs=%d vp_vs_idx=%d\nVP_HLSL_BEGIN\n%s\nVP_HLSL_END\n",
-                    s_deform_capture.count, start / 16u, st->vp_ucode_bytes, n, dr->vs_idx,
-                    n > 0 ? text : "");
+                    s_deform_capture_name[which], s_deform_capture.count[which],
+                    start / 16u, st->vp_ucode_bytes, n, dr->vs_idx, n > 0 ? text : "");
             if (s_deform_capture.vp_n < 16) {
                 s_deform_capture.vp_seen[s_deform_capture.vp_n] = start;
-                s_deform_capture.vp_record[s_deform_capture.vp_n] = s_deform_capture.count;
+                s_deform_capture.vp_file[s_deform_capture.vp_n] = (u8)which;
+                s_deform_capture.vp_record[s_deform_capture.vp_n] = s_deform_capture.count[which];
                 s_deform_capture.vp_n++;
             }
         } else {
-            fprintf(f, " vp_text=record=%u vp_start_slot=%u vp_vs_idx=%d\n",
+            fprintf(f, " vp_text=%s:record=%u vp_start_slot=%u vp_vs_idx=%d\n",
+                    s_deform_capture_name[s_deform_capture.vp_file[seen]],
                     s_deform_capture.vp_record[seen], start / 16u, dr->vs_idx);
         }
     }
 }
 
-static void deform_capture_record(const D3D12DrawRecord* dr, u32 first, u32 count, int indexed)
+static void deform_capture_record(int which, const D3D12DrawRecord* dr, const rsx_state* st,
+                                  u32 first, u32 count, int indexed)
 {
-    const rsx_state* st = s_d3d.current_rsx_state;
-    FILE* f = s_deform_capture.file;
-    if (!st) return;
-    s_deform_capture.count++;
-    fprintf(f, "[DEFORM_CAPTURE] record=%u frame=%llu kind=%s\n", s_deform_capture.count,
-            (unsigned long long)s_d3d.frame_count, dr->is_clear ? "clear" : "draw");
+    FILE* f = s_deform_capture.file[which];
+    u32 index = ++s_deform_capture.count[which];
+    fprintf(f, "[DEFORM_CAPTURE] file=%s record=%u frame=%llu fifo=%llu kind=%s\n",
+            s_deform_capture_name[which], index, (unsigned long long)s_d3d.frame_count,
+            (unsigned long long)s_deform_capture.fifo, dr->is_clear ? "clear" : "draw");
     fprintf(f, " target rt=0x%08X rt_mrt=0x%08X,0x%08X,0x%08X rt_wh=%u,%u rt_fmt=0x%X"
                " zeta=0x%08X\n",
             dr->rt_off, dr->rt_mrt[0], dr->rt_mrt[1], dr->rt_mrt[2], dr->rt_w, dr->rt_h,
@@ -328,6 +363,16 @@ static void deform_capture_record(const D3D12DrawRecord* dr, u32 first, u32 coun
                " alpha test_enable=%d func=0x%X ref=0x%X\n",
             st->color_mask, st->color_mask_mrt, dr->cmask, st->alpha_test_enable,
             st->alpha_func, st->alpha_ref);
+    /* One line with the targets and the bound units. */
+    fprintf(f, " rt0..3=0x%08X,0x%08X,0x%08X,0x%08X pitch0=0x%X pitch1=0x%X"
+               " clip=%ux%u format=0x%X tex=",
+            st->surface_color_offset[0], st->surface_color_offset[1],
+            st->surface_color_offset[2], st->surface_color_offset[3],
+            st->surface_color_pitch[0], st->surface_color_pitch[1],
+            st->surface_clip_w, st->surface_clip_h, st->surface_format);
+    for (int u = 0; u < 16; u++)
+        fprintf(f, "%s0x%08X", u ? "," : "", st->textures[u].offset);
+    fprintf(f, "\n");
     for (int u = 0; u < 16; u++) {
         const rsx_texture_state* t = &st->textures[u];
         if (!(t->format | t->offset)) continue;
@@ -348,7 +393,7 @@ static void deform_capture_record(const D3D12DrawRecord* dr, u32 first, u32 coun
                " indexed=%d first=%u count=%u\n",
             st->primitive_type, dr->topology, dr->vertex_count, indexed, first, count);
     deform_capture_stream(f, st, first, count, indexed);
-    deform_capture_programs(f, dr, st);
+    deform_capture_programs(which, f, dr, st);
     fflush(f);
 }
 
@@ -359,16 +404,37 @@ static void deform_capture_record(const D3D12DrawRecord* dr, u32 first, u32 coun
 static void rsx_deform_capture(const D3D12DrawRecord* dr, u32 first, u32 count, int indexed)
 {
     if (!deform_on() || !s_deform.capture) return;
-    if (!s_deform_capture.file) {
-        deform_capture_open();
-        if (!s_deform.capture) return;
+    if (!s_deform_capture.file[DEFORM_CAPTURE_DRAWS]) {
+        if (!deform_capture_open(DEFORM_CAPTURE_DRAWS)) {
+            s_deform.capture = 0;
+            return;
+        }
+        fprintf(stderr, "[DEFORM_CAPTURE] on: %d target%s, first %u records\n",
+                s_deform.n_offsets, s_deform.n_offsets == 1 ? "" : "s",
+                (u32)RSX_DEFORM_CAPTURE_MAX);
     }
-    if (s_deform_capture.count >= RSX_DEFORM_CAPTURE_MAX) return;
-    if (!deform_listed(dr->rt_off) && !deform_listed(dr->rt_mrt[0])
-        && !deform_listed(dr->rt_mrt[1]) && !deform_listed(dr->rt_mrt[2]))
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st) return;
+    s_deform_capture.fifo++;
+    if (deform_listed(dr->rt_off) || deform_listed(dr->rt_mrt[0])
+        || deform_listed(dr->rt_mrt[1]) || deform_listed(dr->rt_mrt[2])) {
+        if (s_deform_capture.count[DEFORM_CAPTURE_DRAWS] >= RSX_DEFORM_CAPTURE_MAX) return;
+        deform_capture_record(DEFORM_CAPTURE_DRAWS, dr, st, first, count, indexed);
+        if (s_deform_capture.count[DEFORM_CAPTURE_DRAWS] == RSX_DEFORM_CAPTURE_MAX)
+            fprintf(stderr, "[DEFORM_CAPTURE] full: %u records written\n",
+                    (u32)RSX_DEFORM_CAPTURE_MAX);
+        /* The chain starts with the record that follows the first one of the dump. */
+        if (s_deform.chain && !s_deform_capture.chain_started) {
+            s_deform_capture.chain_started = 1;
+            deform_capture_open(DEFORM_CAPTURE_CHAIN);
+        }
         return;
-    deform_capture_record(dr, first, count, indexed);
-    if (s_deform_capture.count == RSX_DEFORM_CAPTURE_MAX)
-        fprintf(stderr, "[DEFORM_CAPTURE] full: %u records written\n",
-                s_deform_capture.count);
+    }
+    if (!s_deform_capture.file[DEFORM_CAPTURE_CHAIN]
+        || s_deform_capture.count[DEFORM_CAPTURE_CHAIN] >= RSX_DEFORM_CHAIN_MAX)
+        return;
+    deform_capture_record(DEFORM_CAPTURE_CHAIN, dr, st, first, count, indexed);
+    if (s_deform_capture.count[DEFORM_CAPTURE_CHAIN] == RSX_DEFORM_CHAIN_MAX)
+        fprintf(stderr, "[DEFORM_CAPTURE] chain: %u records written\n",
+                (u32)RSX_DEFORM_CHAIN_MAX);
 }
