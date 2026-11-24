@@ -5990,7 +5990,7 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
  * colour=a1 tex=a2; dbgfont: a0..a2), so a hardcoded pos+colour pair can't
  * cover them: every enabled attrib is fetched from guest memory and converted
  * by its RSX type; disabled slots read (0,0,0,1). */
-typedef struct { float v[4]; } VPSlot;
+typedef rsx_vertex_value VPSlot;
 #define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
 
 
@@ -5999,16 +5999,18 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
 /* Fill all 16 attribute slots for one vertex. The per-attribute work lives in
  * rsx_vertex_fetch.c so the Metal and null backends read guest vertices the
  * same way this one does, rather than each porting the logic again. */
-static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
+static void read_vp_vertex(const rsx_state* state,
+                           const rsx_vertex_fetch_batch* batch,
+                           u32 vi, VPSlot* out16)
 {
-    for (int i = 0; i < 16; i++) {
-        rsx_fetch_attrib(state, i, vi, out16[i].v);
-        if (i == 0) {
-            const rsx_vertex_attrib* a = &state->vertex_attribs[0];
-            u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-            rsx_vtx_pos_dbg(state, out16[0].v, n);
-        }
-    }
+    if (batch->count <= 8)
+        rsx_fetch_vertex_prepared(batch, vi, out16);
+    else
+        for (int i = 0; i < 16; i++)
+            rsx_fetch_attrib(state, i, vi, out16[i].v);
+    const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+    rsx_vtx_pos_dbg(state, out16[0].v, n);
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
@@ -6138,6 +6140,8 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     vp_attrs_dbg(state);
     u32 quads = count / 4;
     vp_upload_reserve((u64)quads * 6);
@@ -6148,7 +6152,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
         for (u32 k = 0; k < 4; k++)
-            read_vp_vertex(state, first + q*4 + k, c[k]);
+            read_vp_vertex(state, &fetch_batch, first + q*4 + k, c[k]);
         /* quad -> two triangles (perimeter winding) */
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
@@ -6172,6 +6176,8 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     s_req_verts += count; s_req_draws++;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     vp_attrs_dbg(state);
     vp_upload_reserve(count);
 
@@ -6179,7 +6185,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * s_d3d.vp_capacity * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       for (u32 k = 0; k < count; k++)
-          read_vp_vertex(state, first + k, &out[k*16]);
+          read_vp_vertex(state, &fetch_batch, first + k, &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* IDXDBG=<hex shader_program>: vertex range for that program's draws. */
     { static const char* ie = (const char*)1; static u32 iw = 0;
@@ -6234,6 +6240,8 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     if (count < 3) return 0;
     u32 tris = count - 2;
     vp_upload_reserve((u64)tris * 3);
@@ -6246,9 +6254,9 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
         /* strip winding alternates per triangle to keep facing consistent */
         u32 i1 = t + 1, i2 = t + 2;
         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
-        read_vp_vertex(state, first + i0, &out[o*16]); o++;
-        read_vp_vertex(state, first + i1, &out[o*16]); o++;
-        read_vp_vertex(state, first + i2, &out[o*16]); o++;
+        read_vp_vertex(state, &fetch_batch, first + i0, &out[o*16]); o++;
+        read_vp_vertex(state, &fetch_batch, first + i1, &out[o*16]); o++;
+        read_vp_vertex(state, &fetch_batch, first + i2, &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
@@ -6278,6 +6286,8 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     u32 quads = count / 4;
     vp_upload_reserve((u64)quads * 6);
 
@@ -6287,7 +6297,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
         for (u32 k = 0; k < 4; k++)
-            read_vp_vertex(state, read_guest_index(state, first + q*4 + k), c[k]);
+            read_vp_vertex(state, &fetch_batch, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
         if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 6) {
@@ -6319,6 +6329,8 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     s_req_verts += count; s_req_draws++;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     vp_attrs_dbg(state);
     vp_upload_reserve(count);
 
@@ -6326,7 +6338,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * s_d3d.vp_capacity * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       for (u32 k = 0; k < count; k++)
-          read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+          read_vp_vertex(state, &fetch_batch, read_guest_index(state, first + k), &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* IDXDBG=<hex shader_program>: index range for that program's draws. An
      * index past the vertex array reads unmapped guest memory as zero, which
@@ -6535,6 +6547,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     static int previous_fan;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    rsx_vertex_fetch_batch fetch_batch;
+    rsx_vertex_fetch_prepare(&fetch_batch, state);
     if (owner != state || epoch != state->begin_epoch || previous_fan != fan) {
         memset(&cursor, 0, sizeof cursor);
         owner = state; epoch = state->begin_epoch; previous_fan = fan;
@@ -6568,7 +6582,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         /* A fresh single triangle has no shared work to amortize a cache. */
         if (!use_cache) {
             for (u32 v = 0; v < 3; ++v)
-                read_vp_vertex(state, triangle[v], &out[(o++)*16]);
+                read_vp_vertex(state, &fetch_batch, triangle[v], &out[(o++)*16]);
             continue;
         }
         for (u32 v = 0; v < 3; v++) {
@@ -6578,7 +6592,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
             else if ((bits & 2u) && cached_indices[set][1] == triangle[v]) way = 1;
             else {
                 way = !(bits & 1u) ? 0u : !(bits & 2u) ? 1u : (bits >> 2) & 1u;
-                read_vp_vertex(state, triangle[v], cached_vertices[set][way]);
+                read_vp_vertex(state, &fetch_batch, triangle[v], cached_vertices[set][way]);
                 cached_indices[set][way] = triangle[v];
                 bits |= 1u << way;
             }
