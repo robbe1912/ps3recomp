@@ -11,8 +11,11 @@ nothing; no record without a GPU timestamp frequency; the rows of a batch
 written at the start of the next batch; row facts, the state flags, the
 barrier count, the time before the draw and the draw time; a row without an
 end timestamp; a failed readback; the row limit with one log line; file close
-and object release at shutdown; both path separators. Mutants of the backend
-and of the compiled block must fail. No game input; no performance claim."""
+and object release at shutdown; both path separators. It covers the full
+state of a draw against the previous draw: the signatures of the two constant
+slots, the commands without a flag (the mid-batch snapshot, a clear record,
+another sampler table) and state_eq. Mutants of the backend and of the
+compiled block must fail. No game input; no performance claim."""
 import argparse
 import os
 from pathlib import Path
@@ -25,20 +28,61 @@ ROOT = Path(__file__).resolve().parents[1]
 BEGIN = "/* RSX draw CSV."
 END = "/* End of the RSX draw CSV block. */"
 HEADER = ("batch,draw,verts,idx,prim,rt0,rt1,rt2,rt3,zeta,vp_w,vp_h,vs,vs_hash,fp,fp_snap,"
-          "rt_chg,vp_chg,pso_chg,srv_chg,barriers,depth,gap_us,gpu_us")
+          "rt_chg,vp_chg,pso_chg,srv_chg,barriers,depth,gap_us,gpu_us,cmd,vc_sig,fc_sig,state_eq")
+LIMIT = 14
+FNV_OFFSET, FNV_PRIME = 1469598103934665603, 1099511628211
+
+
+def signature(slot, stride):
+    """FNV-1a of the 8-byte words of a fixture slot. The fixture fills word w of
+    slot s with (s + 1) * 1000003 + w. This is the reference of the C loop."""
+    value = FNV_OFFSET
+    for word in range(stride // 8):
+        value = ((value ^ ((slot + 1) * 1000003 + word)) * FNV_PRIME) % (1 << 64)
+    return "%016X" % value
+
+
+def line(batch, draw, record, state, timing, cmd, vc, fc, same):
+    """One expected row. record: verts to fp_snap. state: the four flags,
+    barriers, depth. timing: gap_us, gpu_us."""
+    return ",".join(str(part) for part in (batch, draw, record, state, timing, cmd, vc, fc, same))
+
+
+VC, FC = signature(0, 8224), signature(0, 1280)     # slot of a, e and the b0 of f
+VB, FB = signature(1, 8224), signature(1, 1280)     # slot of b
+NONE = "0" * 16                                    # no b1 buffer
+A = "12,0,4,01A80500,0000AB00,00000000,00000000,0,1280,720,2,11223344,036CC2C1,0"
+B = "300,0,4,00000000,00000000,00000000,00000000,0,320,180,-1,00000000,00000010,0"
+E = "7,0,4,01A80500,0000AB00,00000000,00000000,0,1280,720,2,11223344,036CC2C1,0"
+F = "8,0,4,01A80500,0000AB00,00000000,00000000,0,1280,720,2,11223344,036CC2C1,0"
 EXPECTED = [
     HEADER,
-    "0,3,12,0,4,01A80500,0000AB00,00000000,00000000,0,1280,720,2,11223344,036CC2C1,0,0,1,0,0,0,0,60.000,20.000",
-    "0,4,300,0,4,00000000,00000000,00000000,00000000,0,320,180,-1,00000000,00000010,0,1,0,1,1,2,0,250.000,30.000",
-    "2,20,6,0,4,00000000,00000000,00000000,00000000,0,0,0,7,00000000,00000000,0,0,0,0,0,0,0,10.000,5.000"]
-LIMIT = 3
+    line(0, 3, A, "0,1,0,0,0,0", "60.000,20.000", 0, VC, FC, 0),
+    line(0, 4, B, "1,0,1,1,2,0", "250.000,30.000", 0, VB, FB, 0),
+    # Batch 2. state_eq is 1 only with the full state of the previous row.
+    line(2, 20, A, "0,0,0,0,0,0", "10.000,5.000", 0, VC, FC, 0),     # first row of a batch
+    line(2, 21, E, "0,0,0,0,0,0", "5.000,5.000", 0, VC, FC, 1),      # the bytes of slot 0 in slot 3
+    line(2, 22, E, "0,0,0,0,0,0", "5.000,5.000", 2, VC, FC, 0),      # a clear record before the draw
+    line(2, 23, E, "0,0,0,0,0,0", "5.000,5.000", 4, VC, FC, 0),      # another sampler table
+    line(2, 24, E, "0,0,0,0,0,0", "5.000,5.000", 0, VC, FC, 1),      # the same sampler table again
+    line(2, 25, E, "0,0,1,0,0,0", "5.000,5.000", 0, VC, FC, 0),      # a flag with equal constants
+    line(2, 26, E, "0,0,0,0,3,0", "5.000,5.000", 0, VC, FC, 1),      # barriers only
+    line(2, 27, E, "0,0,0,0,0,0", "5.000,5.000", 5, VC, FC, 0),      # snapshot and sampler table
+    line(2, 28, B, "0,0,0,0,0,0", "5.000,5.000", 0, VB, FB, 0),      # other vertex constants
+    line(2, 29, F, "0,0,0,0,0,0", "5.000,5.000", 0, VC, signature(4, 1280), 0),   # other fragment constants
+    line(2, 30, A, "0,0,0,0,0,0", "5.000,5.000", 0, VC, NONE, 0),    # no b1 buffer
+    line(2, 31, E, "0,0,0,0,0,0", "5.000,5.000", 0, VC, NONE, 1),
+]
 ROW = "phase_draw_row(dr, d, row_flags, s_rt_barriers - row_barriers);"
 ROW_LINE = " " * 16 + ROW + "\n"
 QUERY_LINE = " " * 16 + "phase_draw_query();\n"
 COLLECT = "        phase_draw_collect();\n"
 RESET = "    s_draw_rows_n = 0;\n"
 SWITCH = '        if (!draws || strcmp(draws, "1")) return 0;\n'
-CHECKS = {"off": 4, "noswitch": 2, "nopath": 2, "noclock": 5, "on": 42}
+CHECKS = {"off": 5, "noswitch": 2, "nopath": 2, "noclock": 5, "on": 68}
+SIGN = " " * 16 + "phase_draw_sign(dr);\n"
+SAMPLER_LINE = " " * 16 + "phase_draw_samplers(s_address_observed_table);\n"
+BIND = " " * 16 + "address_bind(dr, next_pso);\n" + SAMPLER_LINE
 
 
 def balanced(text, at, pattern):
@@ -75,7 +119,7 @@ def balanced(text, at, pattern):
 
 
 def function(source, name):
-    match = re.search(r"\b(?:static\s+)?(?:void|int|const char\*)\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", source)
+    match = re.search(r"\b(?:static\s+)?(?:void|int|u64|const char\*)\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", source)
     assert match, "missing actual helper: " + name
     return balanced(source, match.start(), name)
 
@@ -142,6 +186,65 @@ def contract(source):
     assert body.count(QUERY_LINE) == 2 and body.count(ROW_LINE) == 1 \
         and start < draw < body.index(QUERY_LINE, draw), \
         "the timestamps enclose the draw, and the row follows the start timestamp"
+    # The full state of a draw against the previous draw of the batch.
+    assert block.count('gpu_us,cmd,vc_sig,fc_sig,state_eq\\n");') == 1, "the header names the state columns"
+    writer = function(block, "phase_draw_rows_write")
+    writer_comment = block[:block.index("static void phase_draw_rows_write")]
+    for phrase in ("state_eq is 1 when this draw has the GPU state of the previous draw of the",
+                   "vc_sig and fc_sig equal those of the", "The first row of a batch has state_eq = 0",
+                   "barriers is not part of state_eq"):
+        assert writer_comment.count(phrase) == 1, "the rule of state_eq is in the comment of the writer: " + phrase
+    same = ("const PhaseDrawRow* prior = i ? &s_draw_rows[i - 1] : NULL;\n"
+            "        int same = prior && !row->flags && !row->cmds &&\n"
+            "                   row->vc_sig == prior->vc_sig && row->fc_sig == prior->fc_sig;\n")
+    assert writer.count(same) == 1, "state_eq: the previous row, no flag, no command, equal constants"
+    assert writer.count('"%u,%016llX,%016llX,%u\\n",') == 1 and \
+        writer.count("row->cmds, (unsigned long long)row->vc_sig, (unsigned long long)row->fc_sig, same != 0);") == 1, \
+        "the row ends with cmd, vc_sig, fc_sig and state_eq"
+    begin_reset = "    s_draw_cmds = 0; s_draw_samplers = NULL;\n    s_draw_previous[0] = s_draw_previous[1] = NULL;\n"
+    assert begin.count(begin_reset) == 1, "a batch starts without a pending command or slot"
+    record = function(block, "phase_draw_row")
+    assert record.count("row->cmds = s_draw_cmds; s_draw_cmds = 0;\n"
+                        "    row->vc_sig = s_draw_sign[0]; row->fc_sig = s_draw_sign[1];\n") == 1, \
+        "the row takes the commands and the signatures of its draw"
+    assert body.count(SIGN) == 1 and body.count(SIGN + QUERY_LINE + ROW_LINE) == 1, \
+        "the signatures of the constant slots precede the start timestamp of their draw"
+    sign_fn = function(block, "phase_draw_sign")
+    slot = "((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * "
+    assert sign_fn.count("if (!s_draw_query_n) return;\n    const unsigned char* b0 = (const unsigned char*)s_d3d.vp_cb_mapped +\n"
+                         "        " + slot + "VP_CB_STRIDE;") == 1, "the signature of the b0 slot of the draw, none when off"
+    assert sign_fn.count(slot + "VP_FPCB_STRIDE : NULL;") == 1 and \
+        sign_fn.count("s_draw_sign[0] = phase_draw_sig(b0, s_draw_previous[0], s_draw_sign[0], PHASE_DRAW_B0_BYTES);\n"
+                      "    s_draw_sign[1] = b1 ? phase_draw_sig(b1, s_draw_previous[1], s_draw_sign[1], VP_FPCB_STRIDE) : 0;\n"
+                      "    s_draw_previous[0] = b0; s_draw_previous[1] = b1;") == 1, \
+        "the signature of the b1 slot of the draw, 0 without a b1 buffer"
+    sig = function(block, "phase_draw_sig")
+    assert sig.count("if (previous && !memcmp(bytes, previous, size)) return previous_sig;\n") == 1, \
+        "equal bytes take the signature of the previous draw"
+    assert sig.count("h = 1469598103934665603ull;") == 1 and \
+        sig.count("memcpy(&word, bytes + i, sizeof word);\n        h ^= word; h *= 1099511628211ull;") == 1, \
+        "FNV-1a of the 8-byte words of the slot"
+    assert block.count("#define PHASE_DRAW_B0_BYTES (RSX_MAX_VERTEX_CONSTANTS * 16 + 32)") == 1 and \
+        source.count("memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);\n") == 1 and \
+        source.count("float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);\n") == 1, \
+        "b0 covers the bytes that vp_record_cb writes"
+    samplers = function(block, "phase_draw_samplers")
+    assert samplers.count("if (table == s_draw_samplers) return;\n    s_draw_samplers = table;\n"
+                          "    s_draw_cmds |= PHASE_DRAW_CMD_SAMPLERS;") == 1, \
+        "another sampler table is a command without a flag"
+    assert body.count(BIND) == 1, "the sampler table of the draw follows its bind"
+    capture = ("s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(\n"
+               "                            s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);\n"
+               "                        s_draw_cmds |= PHASE_DRAW_CMD_CAPTURE;\n")
+    assert body.count(capture) == 1, "the mid-batch snapshot reports its target rebind"
+    clear = "                if (dr->is_clear) {\n                    s_draw_cmds |= PHASE_DRAW_CMD_CLEAR;\n"
+    assert body.count(clear) == 1, "a clear record reports itself before the next row"
+    loop_text = balanced(frame, frame.index(loop), "replay loop")
+    for call in ("IASetVertexBuffers(", "IASetIndexBuffer(", "IASetPrimitiveTopology(", "OMSetStencilRef(",
+                 "OMSetBlendFactor(", "SetGraphicsRootSignature("):
+        assert call not in loop_text, "the loop issues no " + call
+    assert loop_text.count("DrawInstanced(s_d3d.cmd_list,\n                    dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);") == 1, \
+        "one draw per row, with instance count 1"
 
 
 def without(text, part, replacement=""):
@@ -200,6 +303,41 @@ def main():
         without(source, "fclose(s_draw_csv); "),
         without(source, SWITCH),                        # a record that needs no switch
         without(source, "strrchr(phases, '\\\\')"),     # a backslash path loses its directory
+        # The full state of a draw against the previous draw.
+        without(source, SIGN),
+        without(source, SIGN + QUERY_LINE + ROW_LINE, QUERY_LINE + SIGN + ROW_LINE),   # signature after the start
+        without(source, SAMPLER_LINE),
+        without(source, BIND, SAMPLER_LINE + " " * 16 + "address_bind(dr, next_pso);\n"),   # table before its bind
+        without(source, "                        s_draw_cmds |= PHASE_DRAW_CMD_CAPTURE;\n"),
+        without(source, "                    s_draw_cmds |= PHASE_DRAW_CMD_CLEAR;\n"),
+        without(source, "    s_draw_previous[0] = s_draw_previous[1] = NULL;\n"),
+        without(source, "s_draw_previous[0] = b0; s_draw_previous[1] = b1;"),
+        without(source, "    row->cmds = s_draw_cmds; s_draw_cmds = 0;\n"),
+        without(source, "row->vc_sig == prior->vc_sig && row->fc_sig == prior->fc_sig;", "row->vc_sig == prior->vc_sig;"),
+        without(source, "int same = prior && !row->flags && !row->cmds &&", "int same = prior && !row->flags &&"),
+        without(source, "const PhaseDrawRow* prior = i ? &s_draw_rows[i - 1] : NULL;",
+                 "const PhaseDrawRow* prior = &s_draw_rows[i ? i - 1 : 0];"),
+        without(source, "The first row of a batch has state_eq = 0. "),
+        without(source, "barriers is not part of state_eq: "),
+        without(source, ',cmd,vc_sig,fc_sig,state_eq\\n");'),
+        without(source, '"%u,%016llX,%016llX,%u\\n",', '"%u,%016llX,%u\\n",'),
+        without(source, "(unsigned long long)row->fc_sig, same != 0);", "same != 0);"),
+        without(source, "if (!s_draw_query_n) return;\n    const unsigned char* b0", "const unsigned char* b0"),
+        without(source, "+ dr->cb_slot) * VP_CB_STRIDE;", "+ 0) * VP_CB_STRIDE;"),
+        without(source, "+ dr->cb_slot) * VP_FPCB_STRIDE : NULL;", "+ 0) * VP_FPCB_STRIDE : NULL;"),
+        without(source, "s_draw_sign[1] = b1 ? phase_draw_sig(b1, s_draw_previous[1], s_draw_sign[1], VP_FPCB_STRIDE) : 0;",
+                 "s_draw_sign[1] = phase_draw_sig(b1, NULL, 0, VP_FPCB_STRIDE);"),
+        without(source, "if (previous && !memcmp(bytes, previous, size)) return previous_sig;",
+                 "if (previous) return previous_sig;"),
+        without(source, "#define PHASE_DRAW_B0_BYTES (RSX_MAX_VERTEX_CONSTANTS * 16 + 32)",
+                 "#define PHASE_DRAW_B0_BYTES (RSX_MAX_VERTEX_CONSTANTS * 16)"),
+        without(source, "float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);",
+                 "float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16 + 16);"),
+        without(source, "h ^= word; h *= 1099511628211ull;", "h ^= word;"),
+        without(source, "h = 1469598103934665603ull;", "h = 1;"),
+        without(source, "if (table == s_draw_samplers) return;", "if (table != s_draw_samplers) return;"),
+        without(source, "dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);", "dr->vertex_count, 2, dr->vb_byte_offset / 256, 0);"),
+        without(source, SIGN, " " * 16 + "s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(0, 1, &vbv);\n" + SIGN),
     ]
     for index, mutant in enumerate(mutants):
         try:
@@ -250,21 +388,45 @@ def main():
         assert csv.read_text().splitlines() == EXPECTED, "a path with forward slashes writes the same file"
         # Fixture controls: the compiled block must fail on each of these.
         controls = [
-            (reset_first(code), "reset before the write"),
-            (without(code, "fclose(s_draw_csv); "), "file stays open"),
+            (reset_first(code), "reset before the write", "on"),
+            (without(code, "fclose(s_draw_csv); "), "file stays open", "on"),
             (without(code, "dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n ? s_d3d.vp_vs[dr->vs_idx].hash : 0", "0"),
-             "vertex program hash lost"),
+             "vertex program hash lost", "on"),
+            (without(code, "h ^= word; h *= 1099511628211ull;", "h ^= word;"), "hash without the prime step", "on"),
+            (without(code, "h = 1469598103934665603ull;", "h = 1;"), "hash of another offset basis", "on"),
+            (without(code, "if (table == s_draw_samplers) return;", "if (table != s_draw_samplers) return;"),
+             "the same sampler table reported again", "on"),
+            (without(code, "int same = prior && !row->flags && !row->cmds &&", "int same = prior && !row->flags &&"),
+             "state_eq ignores the commands", "on"),
+            (without(code, "int same = prior && !row->flags && !row->cmds &&", "int same = prior && !row->cmds &&"),
+             "state_eq ignores the flags", "on"),
+            (without(code, "row->vc_sig == prior->vc_sig && row->fc_sig == prior->fc_sig;", "1;"),
+             "state_eq ignores the constants", "on"),
+            (without(code, "const PhaseDrawRow* prior = i ? &s_draw_rows[i - 1] : NULL;",
+                      "const PhaseDrawRow* prior = &s_draw_rows[i ? i - 1 : 0];"), "the first row is equal to itself", "on"),
+            (without(code, "s_draw_sign[1] = b1 ? phase_draw_sig(b1, s_draw_previous[1], s_draw_sign[1], VP_FPCB_STRIDE) : 0;",
+                      "s_draw_sign[1] = b1 ? 123 : 123;"), "fc_sig without a b1 buffer", "on"),
+            (without(code, "if (previous && !memcmp(bytes, previous, size)) return previous_sig;",
+                      "if (previous) return previous_sig;"), "the previous signature without equal bytes", "on"),
+            (without(code, "s_draw_sign[0] = phase_draw_sig(b0, s_draw_previous[0], s_draw_sign[0], PHASE_DRAW_B0_BYTES);",
+                      "s_draw_sign[0] = phase_draw_sig(b0, s_draw_previous[0], s_draw_sign[0], VP_CB_STRIDE);"),
+             "b0 beyond the bytes that vp_record_cb writes", "on"),
+            (without(code, "row->cmds = s_draw_cmds; s_draw_cmds = 0;", "row->cmds = 0;"), "the commands are lost", "on"),
+            (without(code, "    s_draw_cmds = 0; s_draw_samplers = NULL;", ""), "a command crosses the batch", "on"),
+            (without(code, "if (!s_draw_query_n) return;\n    const unsigned char* b0", "const unsigned char* b0"),
+             "signature when off", "off"),
         ]
-        for index, (changed, label) in enumerate(controls):
+        for index, (changed, label, control_mode) in enumerate(controls):
             csv.unlink(missing_ok=True)
             control = build(compiler, environment, path, "control%d" % index, changed)
-            result = subprocess.run([str(control), "on"], env=on, capture_output=True, text=True, errors="replace",
-                                    timeout=30)
+            result = subprocess.run([str(control), control_mode], env=base if control_mode == "off" else on,
+                                    capture_output=True, text=True, errors="replace", timeout=30)
             written = csv.read_text().splitlines() if csv.exists() else None
             assert result.returncode != 0 or "FAIL" in result.stderr or written != EXPECTED, \
-                "control accepted: " + label
+                "control accepted: " + label + ": " + result.stderr
     print("PASS actual draw record block: default off, switch and path, no timestamp frequency, rows of a batch at "
           "the next batch, flags, barriers, gap and draw time, failed readback, row limit, shutdown, call sites, "
+          "constant signatures, commands without a flag, state_eq, "
           "%d mutants, %d fixture controls" % (len(mutants), len(controls)))
 
 

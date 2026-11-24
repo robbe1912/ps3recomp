@@ -1,6 +1,8 @@
 /* Authored stand-ins for the D3D12 objects of the per-draw GPU record. The
  * fake clock moves by `step` at each timestamp. ResolveQueryData counts the
- * timestamps; Map returns them, or fails on request. No game bytes. */
+ * timestamps; Map returns them, or fails on request. Constant slots and
+ * sampler tables stand in for the upload buffers and the sampler heap. No
+ * game bytes. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stddef.h>
 #include <stdint.h>
@@ -15,9 +17,12 @@ typedef unsigned int UINT;
 typedef long HRESULT;
 #define FAILED(hr) ((hr) < 0)
 #define SUCCEEDED(hr) ((hr) >= 0)
-#define MAX_DRAWS 8
+#define MAX_DRAWS 16
 #define QUERIES (MAX_DRAWS * 2u + 2u)
 #define PHASE_DRAW_ROWS_MAX @LIMIT@u
+#define VP_CB_STRIDE 8448u
+#define VP_FPCB_STRIDE 1280u
+#define RSX_MAX_VERTEX_CONSTANTS 512
 #define D3D12_QUERY_TYPE_TIMESTAMP 2u
 #define D3D12_QUERY_HEAP_TYPE_TIMESTAMP 1u
 #define D3D12_RESOURCE_DIMENSION_BUFFER 1u
@@ -60,12 +65,18 @@ static const int IID_ID3D12QueryHeap = 1, IID_ID3D12Resource = 2;
 typedef struct {
     u32 vertex_count, topology, rt_off, rt_mrt[3], vp_w, vp_h, fp_addr;
     int vs_idx;
+    u32 cb_slot;
 } D3D12DrawRecord;
 typedef struct { u32 hash; } VPVSEntry;
 static struct {
     device* device; queue* cmd_queue; list* cmd_list; u64 frame_count;
     VPVSEntry vp_vs[3]; int vp_vs_n;
+    void* vp_cb_mapped; void* vp_fpcb_mapped; int vp_parity;
 } s_d3d;
+/* The constant slots. Word w of slot s holds (s + 1) * 1000003 + w until a
+ * test copies the words of another slot into it. */
+static u64 slot_b0[MAX_DRAWS * (VP_CB_STRIDE / 8)], slot_b1[MAX_DRAWS * (VP_FPCB_STRIDE / 8)];
+static int sampler_tables[2];   /* two sampler tables, told apart by their address */
 static u64 ticks[QUERIES];
 static u64 clock_tick, step, frequency = 1000000;
 static UINT resolved_n, end_queries;
@@ -139,10 +150,12 @@ static int fixture_fclose(FILE* file) { ++closes; return fclose(file); }
 #define fclose fixture_fclose
 @BLOCK@
 #undef fclose
-/* One timestamped draw: the start timestamp at the current step, the row, and
- * with end_step the end timestamp at that step. */
+/* One timestamped draw: the signatures of the constant slots, the start
+ * timestamp at the current step, the row, and with end_step the end timestamp
+ * at that step. */
 static void draw(const D3D12DrawRecord* dr, u32 index, u32 flags, u32 barriers, u32 end_step)
 {
+    phase_draw_sign(dr);
     phase_draw_query();
     phase_draw_row(dr, index, flags, barriers);
     if (end_step) { step = end_step; phase_draw_query(); }
@@ -153,20 +166,36 @@ int main(int argc, char** argv)
      * path, noswitch a path only, nopath the switch only, noclock and on both. */
     const char* mode = argc > 1 ? argv[1] : "off";
     (void)fixture_fclose;   /* a fixture control removes the only call of it */
-    D3D12DrawRecord a = {0}, b = {0}, c = {0};
+    D3D12DrawRecord a = {0}, b = {0}, c = {0}, e = {0}, f = {0};
     query_heap.lpVtbl = &heap_ops; readback.lpVtbl = &resource_ops;
     s_d3d.device = &fixture_device; s_d3d.cmd_queue = &fixture_queue; s_d3d.cmd_list = &fixture_list;
     a.vertex_count = 12; a.topology = 4; a.rt_off = 0x01A80500; a.rt_mrt[0] = 0xAB00;
     a.vp_w = 1280; a.vp_h = 720; a.vs_idx = 2; a.fp_addr = 0x036CC2C1;
     b.vertex_count = 300; b.topology = 4; b.vp_w = 320; b.vp_h = 180; b.vs_idx = -1; b.fp_addr = 0x10;
     c.vertex_count = 6; c.topology = 4; c.vs_idx = 7;   /* slot 7 does not exist */
+    e = a; e.vertex_count = 7;
+    f = a; f.vertex_count = 8;
+    for (u32 s = 0; s < MAX_DRAWS; ++s) {
+        for (u32 w = 0; w < VP_CB_STRIDE / 8; ++w)
+            slot_b0[s * (VP_CB_STRIDE / 8) + w] = (u64)(s + 1) * 1000003u + w;
+        for (u32 w = 0; w < VP_FPCB_STRIDE / 8; ++w)
+            slot_b1[s * (VP_FPCB_STRIDE / 8) + w] = (u64)(s + 1) * 1000003u + w;
+    }
+    a.cb_slot = 0; b.cb_slot = 1; c.cb_slot = 2; e.cb_slot = 3; f.cb_slot = 4;
+    /* Slot 3 holds the bytes of slot 0. Slot 4 holds the b0 bytes of slot 0 only. */
+    memcpy(slot_b0 + 3 * (VP_CB_STRIDE / 8), slot_b0, VP_CB_STRIDE);
+    memcpy(slot_b1 + 3 * (VP_FPCB_STRIDE / 8), slot_b1, VP_FPCB_STRIDE);
+    memcpy(slot_b0 + 4 * (VP_CB_STRIDE / 8), slot_b0, VP_CB_STRIDE);
+    s_d3d.vp_cb_mapped = slot_b0; s_d3d.vp_fpcb_mapped = slot_b1;
     s_d3d.vp_vs[2].hash = 0x11223344; s_d3d.vp_vs_n = 3;
     if (strcmp(mode, "off") == 0) {
         check(phase_draw_csv_on() == 0, "no record without RSX_PHASE_GPU_DRAWS");
         phase_draw_batch_begin();
         check(phase_draw_viewport(0, 0, 1, 1, 0, 0, 1, 1) == 0, "no viewport tracking when off");
+        s_draw_sign[0] = s_draw_sign[1] = 1;
         draw(&a, 3, 0, 0, 1);
         check(s_draw_rows_n == 0, "no row when off");
+        check(s_draw_sign[0] == 1 && s_draw_sign[1] == 1, "no signature when off");
         phase_draw_batch_end();
         phase_draw_shutdown();
         check(created == 0 && end_queries == 0 && s_draw_csv == NULL, "off creates nothing");
@@ -194,29 +223,55 @@ int main(int argc, char** argv)
         check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 1, "first viewport is a change");
         check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 1280, 720) == 0, "same viewport is no change");
         check(phase_draw_viewport(0, 0, 1280, 720, 0, 0, 640, 720) == 1, "scissor change is a change");
-        step = 60; phase_draw_query(); step = 20;                          /* 100 */
+        step = 60; phase_draw_sign(&a); phase_draw_query(); step = 20;    /* 100 */
         phase_draw_row(&a, 3, PHASE_DRAW_VIEWPORT, 0); phase_draw_query();  /* 120 */
         step = 250; draw(&b, 4, PHASE_DRAW_TARGETS | PHASE_DRAW_PSO | PHASE_DRAW_SRV, 2, 30); /* 370, 400 */
         step = 70; draw(&c, 5, 0, 0, 0);                                    /* 470 */
         step = 30; phase_draw_batch_end();                                  /* 500 */
         s_d3d.frame_count = 1;
         check(resolved_n == 7 && s_draw_rows_n == 3, "batch 0 holds three rows and seven timestamps");
+        check(phase_draw_sig((const unsigned char*)slot_b0, NULL, 0, PHASE_DRAW_B0_BYTES) ==
+              phase_draw_sig((const unsigned char*)slot_b0 + 3 * VP_CB_STRIDE, NULL, 0, PHASE_DRAW_B0_BYTES) &&
+              phase_draw_sig((const unsigned char*)slot_b0, NULL, 0, PHASE_DRAW_B0_BYTES) != 0,
+              "equal b0 bytes give one signature");
+        check(phase_draw_sig((const unsigned char*)slot_b0, NULL, 0, PHASE_DRAW_B0_BYTES) !=
+              phase_draw_sig((const unsigned char*)slot_b0 + VP_CB_STRIDE, NULL, 0, PHASE_DRAW_B0_BYTES),
+              "other b0 bytes give another signature");
+        check(phase_draw_sig((const unsigned char*)slot_b0 + 3 * VP_CB_STRIDE, (const unsigned char*)slot_b0, 77, PHASE_DRAW_B0_BYTES) == 77 &&
+              phase_draw_sig((const unsigned char*)slot_b0 + VP_CB_STRIDE, (const unsigned char*)slot_b0, 77, PHASE_DRAW_B0_BYTES) != 77,
+              "equal bytes take the signature of the previous draw, other bytes do not");
         /* Batch 1 writes batch 0 at its start. */
         step = 1000; phase_draw_batch_begin();                              /* 1500 */
         check(s_draw_csv_rows == 2 && s_draw_rows_n == 0,
               "two rows of batch 0 written; the third has no end timestamp");
         check(s_draw_query_n == 1 && ticks[0] == 1500, "batch 1 starts the timestamps again at index 0");
         step = 100; draw(&a, 9, 0, 0, 1); step = 1; phase_draw_batch_end();
+        /* Pending commands of batch 1 after its last row: batch 2 must not get them. */
+        s_draw_cmds |= PHASE_DRAW_CMD_CLEAR; phase_draw_samplers(&sampler_tables[1]);
         s_d3d.frame_count = 2;
-        /* Batch 2: the readback of batch 1 fails, so its rows are dropped. Two draws. */
+        /* Batch 2: the readback of batch 1 fails, so its rows are dropped. Its
+         * rows show state_eq = 1 only with the full state of the previous row. */
         map_fails = 1; step = 100; phase_draw_batch_begin();
         check(s_draw_csv_rows == 2 && s_draw_rows_n == 0, "a failed readback drops the rows");
         map_fails = 0;
-        step = 10; phase_draw_query(); step = 5;
-        phase_draw_row(&c, 20, 0, 0); phase_draw_query();
-        step = 7; draw(&b, 21, 0, 0, 0); step = 1; phase_draw_batch_end();
+        step = 10;
+        draw(&a, 20, 0, 0, 5);                                     /* first row of a batch */
+        draw(&e, 21, 0, 0, 5);                                     /* the bytes of slot 0 in another slot */
+        s_draw_cmds |= PHASE_DRAW_CMD_CLEAR; draw(&e, 22, 0, 0, 5);
+        phase_draw_samplers(&sampler_tables[0]); draw(&e, 23, 0, 0, 5);
+        phase_draw_samplers(&sampler_tables[0]); draw(&e, 24, 0, 0, 5);
+        draw(&e, 25, PHASE_DRAW_PSO, 0, 5);                        /* a flag with equal constants */
+        draw(&e, 26, 0, 3, 5);                                     /* barriers only */
+        s_draw_cmds |= PHASE_DRAW_CMD_CAPTURE; phase_draw_samplers(&sampler_tables[1]); draw(&e, 27, 0, 0, 5);
+        draw(&b, 28, 0, 0, 5);                                     /* other vertex constants */
+        draw(&f, 29, 0, 0, 5);                                     /* other fragment constants */
+        s_d3d.vp_fpcb_mapped = NULL; draw(&a, 30, 0, 0, 5);        /* no b1 buffer */
+        check(s_draw_sign[1] == 0, "no b1 buffer gives fc_sig 0");
+        draw(&e, 31, 0, 0, 5);
+        draw(&b, 32, 0, 0, 0);                                     /* no end timestamp */
+        step = 1; phase_draw_batch_end();
         s_d3d.frame_count = 3;
-        /* Batch 3 writes the first row of batch 2. It is the last row below the limit. */
+        /* Batch 3 writes the rows of batch 2. The last row of batch 2 fills the limit. */
         phase_draw_batch_begin();
         check(s_draw_csv_rows == PHASE_DRAW_ROWS_MAX && s_draw_csv_stopped == 0,
               "the last row below the limit is written");
