@@ -20,7 +20,7 @@ GUEST_INDEX = 'static u32 deform_guest_index(const rsx_state* st, u32 k)'
 LINE = re.compile(r'\[DEFORM_SHADOW\] frame=(\d+) target=([0-9A-F]+) texels=(\d+) equal=(\d+) diff1=(\d+) '
                   r'diffmax=(\d+) first=([0-9A-F]+) cpu=(\d+) gpu=(\d+) op_fp16=(\d+) op_fused=(\d+) op_f32=(\d+)'
                   r'(?: dump=(\d+))?')
-DONE = '[DEFORM_SHADOW] done target=00A80500 frames=3 texels=304 diff=2 diffmax=7'
+DONE = '[DEFORM_SHADOW] done target=00A80500 frames=5 texels=304 diff=2 diffmax=7'
 WHEEL = '[DEFORM_WHEEL] frame=101 x=10 y=30 level=bilinear cpu=01020304 gpu=05060708'
 # (name, production text, changed text). Each changed text must fail the fixture.
 MUTANTS = [
@@ -79,6 +79,28 @@ MUTANTS = [
     ('dump-unbounded',
      '    if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {',
      '    if (s_deform_dump_file && diff.texels != diff.equal) {'),
+    ('start-never', '    if (level->res != s->level) {\n', '    if (0) {\n'),
+    ('start-never-again', '    if (level->res != s->level) {\n', '    if (!s->level) {\n'),
+    ('start-keeps-copies',
+     '    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)\n'
+     '        memcpy(s->ops[k], vm_base + s->guest_address, bytes);\n'
+     '    atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);\n'
+     '    s->paint_n = 0;\n',
+     '    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)\n'
+     '        (void)bytes;\n'
+     '    atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);\n'
+     '    s->paint_n = 0;\n'),
+    ('start-without-copy',
+     '    cpu_surface_copy(level);\n    size_t bytes = (size_t)s->pitch * s->height;\n',
+     '    size_t bytes = (size_t)s->pitch * s->height;\n'),
+    ('start-keeps-columns',
+     '    s->paint_n = 0;\n'
+     '    for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);\n'
+     '    s->level = level->res;\n',
+     '    s->paint_n = 0;\n    s->level = level->res;\n'),
+    ('start-not-counted',
+     '    if (++s->compare_frames == s_deform.log_frames) deform_shadow_done(s);\n',
+     '    if (s->compare_frames == s_deform.log_frames) deform_shadow_done(s);\n'),
 ]
 
 
@@ -167,7 +189,7 @@ def main():
     assert first[:7] == ('101', '00A80500', '104', '102', '1', '7', '0001F00A'), first
     assert first[7:10] == ('0', '1', '102') and first[9:12] == ('102', '102', '102') and first[12] is None, first
     assert second[:7] == ('102', '00A80500', '100', '100', '0', '0', '00000000') and second[12] is None, second
-    assert third[:7] == ('104', '00A80500', '100', '100', '0', '0', '00000000') and third[12] is None, third
+    assert third[:7] == ('105', '00A80500', '100', '100', '0', '0', '00000000') and third[12] is None, third
     print('PASS lines: [DEFORM_SHADOW] frames, totals, [DEFORM_WHEEL], bound target')
 
     survived = []

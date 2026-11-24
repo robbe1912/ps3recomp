@@ -99,6 +99,9 @@ and the nearest brush texel.
   `cpu`, `gpu`) and the equal texels per operation (`op_fp16`, `op_fused`,
   `op_f32`). `dump=` is the number of frames written to the dump.
 - `[DEFORM_SHADOW] done` after the last compared frame: the totals.
+- `[DEFORM_SHADOW] start target=... frame=...` at the first batch end that
+  finds the GPU surface of level 0, and after each new GPU surface: the
+  private copies start as its bytes. That frame does not compare.
 - `[DEFORM_WHEEL] frame=... x=... y=... level=... cpu=... gpu=...` for each
   read of the game from its native GetDepth: the four CPU bytes next to the
   four GPU bytes. `level` is `point` or `bilinear`.
@@ -111,12 +114,31 @@ to a model of the backend names and the production texture decode. The state
 is the captured paint state. The check paints path stamps and a 2D stamp,
 reads the four bytes of a read at the bottom row, checks the pixel operation
 against an independent half rounding, the mip mean, the stamps that cover no
-pixel, the row bounds, the start of the private copies and the dump file. It
-rejects mutants of the production text.
+pixel, the row bounds, the start of the private copies as guest memory and as
+the GPU bytes, and the dump file. It rejects mutants of the production text.
 
-## Open
+## Shadow runs
 
-The first shadow run had 33 percent of the painted texels different from the
-GPU bytes. Its private copies started at zero. No run has the same start on
-both sides. The bilinear weights, the mip rounding and the position steps
+Two shadow runs of the game compared 60 frames of a 4096 x 4096 target.
+Both had texels that differ from the GPU bytes:
+
+| Run | Start of the private copies | Texels | Different | By more than one |
+|---|---|---|---|---|
+| 1 | zero | 12914 | 4259 (33 percent) | not recorded |
+| 2 | guest memory | 28179 | 19195 (68 percent) | 18186 |
+
+The dump of run 2 holds the first three compared frames (607 texels). The
+GPU destination of a texel is the GPU byte minus the CPU increment. It is
+0 to 5 at 425 of these texels. The CPU destination is 22 to 127. The two
+destinations are equal at 1 texel. So the differences start at the
+destination byte, not at the paint.
+
+The cause is in `off_rt_get`. It fills a new GPU surface with 4 guest
+bytes a texel and a row stride of `4 * width`: the B8 target is RGBA8 on
+the host and the readback takes host byte 2. The GPU surface starts as a
+distorted copy of guest memory. In run 2, 8984 of the 9993 texels with a
+difference of at most one are equal.
+
+The comparison now starts the private copies as the GPU bytes. No run has
+this start. The bilinear weights, the mip rounding and the position steps
 have no proof against the GPU.

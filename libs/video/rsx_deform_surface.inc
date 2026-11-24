@@ -600,6 +600,7 @@ typedef struct RsxDeformSurface {
     u64        texels;
     u64        compare_frame;      /* frame of the last compare                           */
     u64        compare_frames;     /* compares since the binding                          */
+    const void* level;             /* the GPU surface of level 0 at the last start          */
     u64        total_texels, total_diff;
     u32        total_diffmax;
     /* RSX_DEFORM_DUMP. Renderer thread only. */
@@ -740,8 +741,8 @@ static void deform_shadow_allocate(RsxDeformSurface* s, size_t bytes)
     int ok = mip && cols;
     for (int k = 0; ok && k < RSX_DEFORM_OP_COUNT; k++) {
         s->ops[k] = (u8*)malloc(bytes);
-        /* The GPU surface starts as a copy of guest memory: off_rt_get
-         * uploads it at creation. The private copies start the same way. */
+        /* The private copies start as guest memory. The first start of the
+         * compare makes them the GPU bytes (deform_shadow_start). */
         if (s->ops[k]) memcpy(s->ops[k], vm_base + s->guest_address, bytes);
         else ok = 0;
     }
@@ -805,6 +806,7 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
         s->mip = NULL;
         free(s->cols);
         s->cols = NULL;
+        s->level = NULL;     /* the next batch end starts the new copies */
     }
     s->offset = dr->rt_off;
     s->guest_address = address;
@@ -1419,22 +1421,70 @@ static void deform_dump_frame(RsxDeformSurface* s, u64 frame)
     fflush(f);
 }
 
+/* Shadow mode. The totals after the last compared frame. */
+static void deform_shadow_done(RsxDeformSurface* s)
+{
+    fprintf(stderr, "[DEFORM_SHADOW] done target=%08X frames=%llu texels=%llu diff=%llu"
+                    " diffmax=%u\n",
+            s->offset, (unsigned long long)s->compare_frames,
+            (unsigned long long)s->total_texels, (unsigned long long)s->total_diff,
+            s->total_diffmax);
+}
+
+/* Shadow mode. The GPU surface of level 0 is not the resource of the last
+ * start: off_rt_get created it again. The private copies start as the bytes
+ * of the GPU surface. The frame does not compare, and it counts as one of
+ * the RSX_DEFORM_LOG frames.
+ *
+ * off_rt_get fills a new GPU surface with 4 guest bytes a texel and a row
+ * stride of 4 * width: a B8 target is RGBA8 on the host, and its value is
+ * host byte 2. GPU texel (x, y) then starts with the guest byte at offset
+ * 4 * (y * width + x) + 1, not with the guest byte of (x, y). So the GPU
+ * surface does not start as guest memory, and the private copies must not
+ * either. The sequence number is odd while the bytes change. */
+static void deform_shadow_start(RsxDeformSurface* s, OffRT* level, u64 frame)
+{
+    u64 sequence = atomic_load_explicit(&s->sequence, memory_order_relaxed);
+    atomic_store_explicit(&s->sequence, sequence + 1, memory_order_relaxed);
+    cpu_surface_copy(level);
+    size_t bytes = (size_t)s->pitch * s->height;
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        memcpy(s->ops[k], vm_base + s->guest_address, bytes);
+    atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);
+    s->paint_n = 0;
+    for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);
+    s->level = level->res;
+    s->compare_frame = frame;
+    if (++s->compare_frames == s_deform.log_frames) deform_shadow_done(s);
+    fprintf(stderr, "[DEFORM_SHADOW] start target=%08X frame=%llu: the private copies start as"
+                    " the GPU bytes\n",
+            s->offset, (unsigned long long)frame);
+}
+
 /* Renderer thread, after a submitted batch. Copies the OffRT of level 0 to
  * guest memory (cpu_surface_copy waits for the GPU) and compares the columns
  * the painter changed since the last compare. A target compares at most once
- * a frame and RSX_DEFORM_LOG frames in all (300). The dump holds the frames
- * with a difference. Row 0 of level 1 is not compared: the emulator does not
- * render it, because the mip pass of the capture has positions that are not
- * finite. [DEFORM_WHEEL] holds the two bytes of it that the game reads. */
+ * a frame and RSX_DEFORM_LOG frames in all (300). The first batch end that
+ * finds the GPU surface, and each one after the backend created the GPU
+ * surface again, starts the private copies (deform_shadow_start). The dump
+ * holds the frames with a difference. Row 0 of level 1 is not compared: the
+ * emulator does not render it, because the mip pass of the capture has
+ * positions that are not finite. [DEFORM_WHEEL] holds the two bytes of it
+ * that the game reads. */
 static void deform_shadow_compare(RsxDeformSurface* s)
 {
     if (!s->ops[0] || s->compare_frames >= s_deform.log_frames) return;
     u64 frame = s_d3d.frame_count;
     if (frame == s->compare_frame) return;      /* at most one compare a frame */
     OffRT* level = deform_off_rt(s->guest_address);
+    if (!level) return;
+    if (level->res != s->level) {
+        deform_shadow_start(s, level, frame);
+        return;
+    }
     u32 rows = 0;
     for (u32 y = 0; y < s->height; y++) rows += s->cols[2 * y + 1] > s->cols[2 * y];
-    if (!level || !rows) return;
+    if (!rows) return;
     s->compare_frame = frame;
     s->compare_frames++;
     DeformDiff diff = { 0, 0, 0, 0, 0, 0, 0 };
@@ -1468,12 +1518,7 @@ static void deform_shadow_compare(RsxDeformSurface* s)
         fprintf(stderr, " op_%s=%llu", s_deform_ops[k].name, (unsigned long long)op_equal[k]);
     if (s_deform_dump_file) fprintf(stderr, " dump=%llu", (unsigned long long)s_deform_dumped);
     fprintf(stderr, "\n");
-    if (s->compare_frames == s_deform.log_frames)
-        fprintf(stderr, "[DEFORM_SHADOW] done target=%08X frames=%llu texels=%llu diff=%llu"
-                        " diffmax=%u\n",
-                s->offset, (unsigned long long)s->compare_frames,
-                (unsigned long long)s->total_texels, (unsigned long long)s->total_diff,
-                s->total_diffmax);
+    if (s->compare_frames == s_deform.log_frames) deform_shadow_done(s);
 }
 
 /* ---------------------------------------------------------------------------

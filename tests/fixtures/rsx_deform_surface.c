@@ -546,29 +546,51 @@ static void check_shadow(void)
 {
     unsigned char out[4], cpu[4] = { 1, 2, 3, 4 }, gpu[4] = { 5, 6, 7, 8 };
     configure("00A80500", "1", "1");
+    set_switch("RSX_DEFORM_LOG", "5");
     state_init();
     if (rsx_deform_mode() != 2) FAIL("RSX_DEFORM_SHADOW=1 with the buffer is the shadow mode");
     path_brush();
-    quad(0, 10, 20, 30, 40, path, 174, 0);
-    quad(6, 200, 202, 0, 2, path, 0, 0);
-    dr.vertex_count = 6;
+    /* A stamp that covers no pixel makes the record. */
+    for (u32 i = 12; i < 18; i++) vertex(i, -1.0, -1.0, 0.5, 0.5, 174);
     vm_base[BASE + 500 * PITCH + 12] = 77;
-    vm_base[MIP + 700] = 66;      /* the GPU surface starts as guest memory */
-    deform_paint(&dr, 0, 6, 0, 5);
+    vm_base[MIP + 700] = 66;      /* the private copies start as guest memory */
+    deform_paint(&dr, 12, 6, 0, 5);
     RsxDeformSurface* s = &s_deform_surface[0];
     if (!s->ops[0] || !s->ops[RSX_DEFORM_OP_COUNT - 1] || !s->mip || !s->cols)
         FAIL("no private copies");
     if (s->ops[0][500 * PITCH + 12] != 77 || s->ops[RSX_DEFORM_OP_COUNT - 1][500 * PITCH + 12] != 77
         || s->mip[700] != 66)
         FAIL("the private copies do not start as guest memory");
+    /* The GPU surface appears. Its bytes are guest memory with one change
+     * at a texel without paint. The private copies start as the GPU bytes.
+     * This frame does not compare. */
+    memcpy(gpu0, vm_base + BASE, (size_t)PITCH * ROWS);
+    gpu0[9 * PITCH + 9] = 123;
+    s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    s_d3d.frame_count = 100;
+    rsx_deform_batch_end();
+    if (!strstr(log_text, "[DEFORM_SHADOW] start target=00A80500 frame=100")
+        || strstr(log_text, "frame=100 texels="))
+        FAIL("no start line at the first batch end with a GPU surface: %s", log_text);
+    if (vm_base[BASE + 9 * PITCH + 9] != 123)
+        FAIL("the start did not copy the GPU surface to guest memory");
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        if (s->ops[k][9 * PITCH + 9] != 123) FAIL("the private copies do not start as the GPU bytes");
+    log_text[0] = 0;
+    quad(0, 10, 20, 30, 40, path, 174, 0);
+    quad(6, 200, 202, 0, 2, path, 0, 0);
+    dr.vertex_count = 6;
+    deform_paint(&dr, 0, 6, 0, 5);
     /* The stamp at rows 0 to 2 makes the painter compute row 0 of level 1. */
     deform_paint(&dr, 6, 6, 0, 5);
     current = deform_image(s);
     for (u32 i = 0; i < (size_t)PITCH * ROWS; i += 997)
-        if (vm_base[BASE + i] && i != 500 * PITCH + 12) FAIL("the shadow painter wrote guest memory");
+        if (vm_base[BASE + i] && i != 500 * PITCH + 12 && i != 9 * PITCH + 9)
+            FAIL("the shadow painter wrote guest memory");
     memset(before, 0, (size_t)PITCH * ROWS);
     memcpy(expected, before, (size_t)PITCH * ROWS);
     expected[500 * PITCH + 12] = 77;
+    expected[9 * PITCH + 9] = 123;      /* the GPU byte of the start */
     /* The brush of the fixture lies in the range of level 0: guest memory
      * holds its bytes, and so does each private copy. */
     for (u32 i = 0; i < 32; i++) expected[511 * PITCH + i] = (u8)(7 * i + 3);
@@ -625,10 +647,27 @@ static void check_shadow(void)
     if (!logged_line("102", "texels=100 equal=100 diff1=0 diffmax=0 first=00000000"))
         FAIL("the second compare line is wrong: %s", log_text);
     logged = strlen(log_text);
+    /* The GPU surface is another resource: the backend created it again. Its
+     * bytes are the private copies with one change at a texel without paint,
+     * after a stamp that is not compared. The private copies start again as
+     * the GPU bytes. This frame does not compare. */
+    quad(14, 100, 110, 30, 40, path, 174, 0);
+    deform_paint(&dr, 14, 6, 0, 5);
+    memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    gpu0[8 * PITCH + 8] = 222;
+    s_d3d.off_rt[0] = (OffRT){ (void*)2, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    s_d3d.frame_count = 103;
+    rsx_deform_batch_end();
+    if (!strstr(log_text + logged, "[DEFORM_SHADOW] start target=00A80500 frame=103")
+        || strstr(log_text + logged, "frame=103 texels="))
+        FAIL("no start line after the backend created the GPU surface again: %s", log_text + logged);
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        if (s->ops[k][8 * PITCH + 8] != 222) FAIL("the private copies do not start again as the GPU bytes");
+    logged = strlen(log_text);
     /* A frame without a painted column: no line. The GPU mip row is not a
      * reference: the emulator does not render it. */
     s_d3d.off_rt[1] = (OffRT){ (void*)1, 0x01A80500, MIP, MIP_TEXELS, 5, 0, gpu1, 1 };
-    s_d3d.frame_count = 103;
+    s_d3d.frame_count = 104;
     rsx_deform_batch_end();
     if (strlen(log_text) != logged) FAIL("a compare without a painted column");
     /* A third frame with a stamp: the third compare, the last of
@@ -637,11 +676,11 @@ static void check_shadow(void)
     deform_paint(&dr, 18, 6, 0, 5);
     memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
     s_d3d.off_rt[0].gpu_generation = 3;
-    s_d3d.frame_count = 104;
+    s_d3d.frame_count = 105;
     logged = strlen(log_text);
     rsx_deform_batch_end();
-    if (!logged_line("104", "texels=100 equal=100 diff1=0 diffmax=0 first=00000000")
-        || !strstr(log_text, "[DEFORM_SHADOW] done target=00A80500 frames=3 texels=304 diff=2 diffmax=7"))
+    if (!logged_line("105", "texels=100 equal=100 diff1=0 diffmax=0 first=00000000")
+        || !strstr(log_text, "[DEFORM_SHADOW] done target=00A80500 frames=5 texels=304 diff=2 diffmax=7"))
         FAIL("the third compare line is wrong: %s", log_text);
     logged = strlen(log_text);
     /* The periodic [DEFORM] line of the frame can come with a paint. */
@@ -649,11 +688,11 @@ static void check_shadow(void)
     deform_paint(&dr, 24, 6, 0, 5);
     memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
     s_d3d.off_rt[0].gpu_generation = 4;
-    s_d3d.frame_count = 105;
+    s_d3d.frame_count = 106;
     logged = strlen(log_text);
     rsx_deform_batch_end();
     if (strlen(log_text) != logged) FAIL("a compare past RSX_DEFORM_LOG frames");
-    puts("PASS shadow: private copies, compare once a frame, wheel line");
+    puts("PASS shadow: private copies start as the GPU bytes, compare once a frame, wheel line");
     puts(log_text);
 }
 
@@ -685,11 +724,22 @@ static void check_dump(void)
     state_init();
     if (rsx_deform_mode() != 2 || s_deform_dump_frames != 2) FAIL("RSX_DEFORM_DUMP=2 is not read");
     path_brush();
+    /* A stamp that covers no pixel makes the record. */
+    for (u32 i = 12; i < 18; i++) vertex(i, -1.0, -1.0, 0.5, 0.5, 174);
+    deform_paint(&dr, 12, 6, 0, 5);
+    RsxDeformSurface* s = &s_deform_surface[0];
+    if (!s->paints || !s_deform_dump_file) FAIL("the dump is not open");
+    current = deform_image(s);
+    /* The GPU surface appears before a compare: the private copies start as
+     * its bytes, guest memory. Nothing is written. */
+    memcpy(gpu0, current, (size_t)PITCH * ROWS);
+    s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    s_d3d.frame_count = 100;
+    rsx_deform_batch_end();
+    if (s_deform_dumped) FAIL("the start frame is written to the dump");
     quad(0, 10, 20, 30, 40, path, 174, 0);
     dr.vertex_count = 6;
     deform_paint(&dr, 0, 6, 0, 5);
-    RsxDeformSurface* s = &s_deform_surface[0];
-    if (!s->paints || !s_deform_dump_file) FAIL("the dump is not open");
     current = deform_image(s);
     /* Frame 1: one byte differs. The frame is written. */
     memcpy(gpu0, current, (size_t)PITCH * ROWS);
