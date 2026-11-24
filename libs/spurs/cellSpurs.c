@@ -463,9 +463,9 @@ static struct SpursInst {
     int kernel_live, stopping, starting;
     SRWLOCK lock;
     CONDITION_VARIABLE wake;
-    /* SPURS_KERNEL_NOTIFY=1 only: the coordinator waits here between passes,
-     * and `kicks` counts publications it has not yet scanned for. */
-    CONDITION_VARIABLE kick;
+    /* SPURS_KERNEL_NOTIFY=1 only: the coordinator waits on this timer between
+     * passes, and `kicks` counts publications it has not yet scanned for. */
+    HANDLE poll_timer;
     u32 kicks;
     HANDLE coordinator;
     struct SpursPmSlot slots[6];
@@ -542,10 +542,11 @@ static void spurs_api_unlock(struct SpursInst* si)
  * The coordinator normally scans every Sleep(1). On Windows that is 1-2 ms,
  * and a title that publishes a job batch and immediately waits for its marker
  * pays that delay on every batch. With notification on, the coordinator waits
- * on si->kick with the same period as a timeout instead. The HLE calls that
- * publish demand (ReadyCountStore/Swap/CompareAndSwap with a nonzero count)
- * and a worker returning a lane wake it at once. Inline guest stores to the
- * ready bytes are not seen here; the timed pass still finds them.
+ * on si->poll_timer until the fallback deadline instead (spurs_notify_wait.h),
+ * and a kick makes the timer expire at once. The HLE calls that publish demand
+ * (ReadyCountStore/Swap/CompareAndSwap with a nonzero count) and a worker
+ * returning a lane kick it. Inline guest stores to the ready bytes are not
+ * seen here; the timed pass still finds them.
  *
  * A notified pass only admits workloads that are actually kicked (ready count
  * or signal). Idle back-off counts timed passes only, so its cadence is the
@@ -553,6 +554,7 @@ static void spurs_api_unlock(struct SpursInst* si)
 #ifndef SPURS_KERNEL_POLL_MS
 #define SPURS_KERNEL_POLL_MS 1
 #endif
+#include "spurs_notify_wait.h"   /* the wait of the coordinator: clock and timer */
 static int spurs_kernel_notify(void)
 {
     static int v = -1;
@@ -563,7 +565,18 @@ static void spurs_kick(struct SpursInst* si)
 {
     if (!spurs_kernel_notify()) return;
     si->kicks++;
-    WakeConditionVariable(&si->kick);
+    spurs_poll_wake(si->poll_timer);
+}
+
+/* End the notify wait. The coordinator has ended. A kick reads the handle
+ * under si->lock, so the handle is cleared under it. */
+static void spurs_poll_timer_close(struct SpursInst* si)
+{
+    HANDLE timer;
+    AcquireSRWLockExclusive(&si->lock);
+    timer = si->poll_timer; si->poll_timer = NULL;
+    ReleaseSRWLockExclusive(&si->lock);
+    if (timer) CloseHandle(timer);
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
@@ -1848,15 +1861,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     ps3_spurs_scheduler_event trace_events[6];
     unsigned trace_count=0;
 #endif
-    const int notify = spurs_kernel_notify();
-    ULONGLONG next_poll = notify ? GetTickCount64() + SPURS_KERNEL_POLL_MS : 0;
+    const int notify = spurs_kernel_notify() && si->poll_timer != NULL;
+    uint64_t next_poll = notify ? spurs_kernel_now() + SPURS_KERNEL_POLL_100NS : 0;
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
         /* Reference mode keeps the periodic poller's native Sleep(1) cadence.
-         * With SPURS_KERNEL_NOTIFY=1 the same period is a timeout, and an
-         * explicit publication (spurs_kick) ends the wait early. Neither
-         * sleeping nor guest execution may hold the instance lock; the
-         * condition-variable wait releases it. */
+         * With SPURS_KERNEL_NOTIFY=1 the same period is the fallback deadline
+         * of a waitable timer, and an explicit publication (spurs_kick) makes
+         * the timer expire at once. Neither sleeping nor guest execution may
+         * hold the instance lock; the timer wait runs with the lock released. */
         int timed = 1;
         ReleaseSRWLockExclusive(&si->lock);
 #if PS3_SPURS_SCHEDULER_OBSERVATION
@@ -1870,15 +1883,20 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (notify) {
             /* kicks is checked under the lock: a publication made while this
              * thread scanned is never lost, it just skips the wait. */
-            ULONGLONG now = GetTickCount64();
+            uint64_t now = spurs_kernel_now();
             if (!si->kicks && !si->stopping && now < next_poll) {
-                DWORD remaining = (DWORD)(next_poll - now);
-                SleepConditionVariableSRW(&si->kick, &si->lock, remaining, 0);
-                now = GetTickCount64();
+                /* The lock is free during the wait: spurs_kick needs it. A
+                 * kick between the arm and the wait is not lost; it armed the
+                 * timer to expire at once. */
+                spurs_poll_arm(si->poll_timer, next_poll);
+                ReleaseSRWLockExclusive(&si->lock);
+                WaitForSingleObject(si->poll_timer, INFINITE);
+                AcquireSRWLockExclusive(&si->lock);
+                now = spurs_kernel_now();
             }
             /* Publication never postpones the periodic fallback deadline. */
             timed = now >= next_poll;
-            if (timed) next_poll = now + SPURS_KERNEL_POLL_MS;
+            if (timed) next_poll = now + SPURS_KERNEL_POLL_100NS;
             si->kicks = 0;
 #if PS3_SPURS_SCHEDULER_OBSERVATION
             /* Observer clocks never run under the instance lock. */
@@ -1963,6 +1981,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
     si->stopping = 0; si->cursor = si->pass_no = 0; si->kicks = 0;
+    /* The notify wait needs its timer. Without one the coordinator keeps the
+     * reference cadence of Sleep(1). */
+    si->poll_timer = spurs_kernel_notify() ? spurs_poll_timer_create() : NULL;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {
@@ -1977,12 +1998,13 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);
-    si->stopping = 1; WakeAllConditionVariable(&si->wake); WakeAllConditionVariable(&si->kick);
+    si->stopping = 1; WakeAllConditionVariable(&si->wake); spurs_poll_wake(si->poll_timer);
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
+    spurs_poll_timer_close(si);
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0; si->stopping = 0;
     ReleaseSRWLockExclusive(&si->lock);
@@ -1996,9 +2018,10 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     for (u32 wid = 0; wid < 16; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-    si->stopping = 1; WakeAllConditionVariable(&si->wake); WakeAllConditionVariable(&si->kick);
+    si->stopping = 1; WakeAllConditionVariable(&si->wake); spurs_poll_wake(si->poll_timer);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
+    spurs_poll_timer_close(si);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }

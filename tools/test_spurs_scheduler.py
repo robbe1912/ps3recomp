@@ -117,12 +117,15 @@ assert r is not None and r.returncode==0, 'Elapsed fallback fairness failed: '+s
 print(r.stdout,end='')
 notify_mutants=[]
 if args.mutants:
-    start=production.index('            ULONGLONG now = GetTickCount64();')
-    end=production.index('            si->kicks = 0;',start)
-    changed=production[:start]+"""            if (!si->kicks && !si->stopping)
-                SleepConditionVariableSRW(&si->kick, &si->lock, SPURS_KERNEL_POLL_MS, 0);
-            timed = !si->kicks;
-"""+production[end:]
+    # A kick that keeps the pass untimed, and is not consumed, starves the
+    # fallback under continuous kicks.
+    before=('            timed = now >= next_poll;\n'
+            '            if (timed) next_poll = now + SPURS_KERNEL_POLL_100NS;\n'
+            '            si->kicks = 0;\n')
+    assert production.count(before)==1
+    changed=production.replace(before,
+        '            timed = now >= next_poll && !si->kicks;\n'
+        '            if (timed) next_poll = now + SPURS_KERNEL_POLL_100NS;\n')
     assert changed != production
     r=notify_run(notify_build(out/'notify-starved-fallback',changed), 'fairness')
     assert r is not None and r.returncode!=0 and 'elapsed fallback starved' in r.stdout+r.stderr
@@ -133,7 +136,7 @@ if args.mutants:
         ('no-publication-kick','    if (value) spurs_kick(si);\n    {   static int _n = 0;','    {   static int _n = 0;','ReadyCountStore notification'),
         ('no-returned-lane-kick','        spurs_kick(si);   /* a lane is free: admit kicked demand now */\n','','returned-lane notification'),
         ('untimed-admits-idle','if (!kicked && (!timed || (si->pass_no','if (!kicked && ((si->pass_no','untimed pass admitted unkicked work'),
-        ('stop-without-kick','si->stopping = 1; WakeAllConditionVariable(&si->wake); WakeAllConditionVariable(&si->kick);\n    ReleaseSRWLockExclusive(&si->lock);\n    if (si->coordinator)',
+        ('stop-without-kick','si->stopping = 1; WakeAllConditionVariable(&si->wake); spurs_poll_wake(si->poll_timer);\n    ReleaseSRWLockExclusive(&si->lock);\n    if (si->coordinator)',
                               'si->stopping = 1; WakeAllConditionVariable(&si->wake);\n    ReleaseSRWLockExclusive(&si->lock);\n    if (si->coordinator)',None)]:
         assert production.count(before)==1, name
         r=notify_run(notify_build(out/('notify-'+name),production.replace(before,after)))
