@@ -10,6 +10,10 @@ extern "C" {
 #endif
 typedef void (*vm_read_sync_handler)(uint32_t address, uint32_t bytes, void *opaque);
 extern volatile unsigned char vm_read_sync_pages[1u << 20];
+/* Nonzero after `vm_read_sync_mark_range` marks its first page. No function
+ * clears a mark, so the flag stays nonzero. While it is zero,
+ * `vm_cpu_read_sync` reads no table byte. */
+extern volatile uint32_t vm_read_sync_any;
 void vm_read_sync_set_handler(vm_read_sync_handler handler, void *opaque);
 int vm_read_sync_mark_range(uint32_t address, uint64_t bytes);
 void vm_read_sync_dispatch(uint32_t address, uint32_t bytes);
@@ -48,6 +52,7 @@ static inline unsigned char vm_read_sync_page(unsigned index) {
 }
 static inline void vm_cpu_read_sync(uint32_t address, uint32_t bytes) {
     if (!bytes || (uint64_t)address+bytes > UINT64_C(0x100000000)) return;
+    if (!vm_read_sync_any) return;
     unsigned first=address>>12, last=(unsigned)(((uint64_t)address+bytes-1)>>12);
     for (unsigned page=first;page<=last;page++)
         if(vm_read_sync_page(page)) { vm_read_sync_dispatch(address,bytes); return; }

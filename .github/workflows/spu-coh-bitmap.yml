@@ -1,0 +1,32 @@
+name: SPU reserved-line bitmap
+on:
+  workflow_dispatch:
+  push:
+    branches: [combined, codex/frame60-fastmem-diet]
+    paths:
+      - 'runtime/spu/spu_coherency.c'
+      - 'runtime/spu/spu_coherency.h'
+      - 'tests/spu_coh_bitmap_harness.c'
+      - 'tests/check_spu_coh_bitmap.py'
+      - '.github/workflows/spu-coh-bitmap.yml'
+  pull_request:
+    paths:
+      - 'runtime/spu/spu_coherency.c'
+      - 'runtime/spu/spu_coherency.h'
+      - 'tests/spu_coh_bitmap_harness.c'
+      - 'tests/check_spu_coh_bitmap.py'
+      - '.github/workflows/spu-coh-bitmap.yml'
+jobs:
+  bitmap:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - run: python tests/check_spu_coh_bitmap.py

@@ -55,6 +55,21 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
 
+/* The reserved-line bitmap. One bit per 128-byte line of the 32-bit guest
+ * address space, 4 MiB in total. A bit is set by `spu_coh_reserve` and is
+ * never cleared. Bits are counted from the low end of each byte. */
+#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
+#define SPU_COH_BITMAP_BYTES  (1u << ((32 - SPU_COH_LINE_SHIFT) - 3))   /* 4 MiB */
+extern unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_BYTES];
+
+/* Bitmap lookup only, with the arithmetic of `spu_coh_is_reserved`. Callers
+ * test their own armed flag first: an unreserved title reads no bitmap byte. */
+static inline int spu_coh_bitmap_test(uint32_t addr)
+{
+    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
+    return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+}
+
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host
  * thread in case it is parked in `rdch SPU_RdEventStat`.
