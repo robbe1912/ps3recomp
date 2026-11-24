@@ -16,6 +16,7 @@
 #include "spu_workload.h"
 #include "../../runtime/platform/thread_name.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+#include "spurs_wait_priority.h"   /* SPURS_WAIT_PRIORITY: the waited workload first */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "../../runtime/ppu/ppu_context.h"
 #include <stdio.h>
@@ -1839,6 +1840,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* SPURS_WAIT_PRIORITY: the data of workload wid, or 0 when the workload is
+ * not in use in the instance at ctx. */
+static uint64_t spurs_wait_priority_data(void *ctx, unsigned wid)
+{
+    return s_workloads[wid].in_use && s_workloads[wid].spurs_ea == (u32)(uintptr_t)ctx
+        ? s_workloads[wid].data : 0;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -1893,12 +1902,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no += (u32)timed;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        /* SPURS_WAIT_PRIORITY=1: the workload of the job list that a PPU
+         * thread waits on is the first workload of the scan of each free lane. */
+        const int wanted = spurs_wait_priority_workload(spurs_wait_priority_job_list(),
+                                                        spurs_wait_priority_data, (void *)(uintptr_t)ea);
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
-            for (u32 checked = 0; checked < 16; checked++) {
-                u32 wid = si->cursor;
-                si->cursor = (wid + 1) & 15;
+            if (wanted >= 0) spurs_wait_priority_wait();
+            for (u32 checked = 0; checked < spurs_wait_priority_count(wanted); checked++) {
+                int at = spurs_wait_priority_at(wanted, &si->cursor, checked);
+                if (at < 0) continue;   /* the wanted workload had its position */
+                u32 wid = (u32)at;
                 if (!(enabled & (0x80000000u >> wid)) ||
                     vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
                     !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
@@ -1946,12 +1961,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 slot->trace=trace.info;
                 trace_events[trace_count++]=trace;
 #endif
+                if ((int)wid == wanted) spurs_wait_priority_job();
                 slot->busy = 1;
                 WakeAllConditionVariable(&si->wake);
                 break;
             }
         }
         ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        spurs_wait_priority_report(GetTickCount());
     }
     ReleaseSRWLockExclusive(&si->lock);
 #if PS3_SPURS_SCHEDULER_OBSERVATION
