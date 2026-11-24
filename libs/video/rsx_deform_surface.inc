@@ -180,6 +180,7 @@ static int deform_switch(const char* name)
  * frames with a difference to a file (section C). */
 static u64 s_deform_dump_frames;
 static FILE* s_deform_dump_file;
+static u64 s_deform_dumped;          /* frames written to the dump */
 
 static void deform_config_read(void)
 {
@@ -1050,7 +1051,8 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
                     u8* other = s->ops[k];
                     if (other != image) other[at] = s_deform_ops[k].fn(other[at], value, colour);
                 }
-                if (s->paints) deform_paint_note(s, (u32)at, dest, value, u, v, colour, brush);
+                if (s->paints && s_deform_dumped < s_deform_dump_frames)
+                    deform_paint_note(s, (u32)at, dest, value, u, v, colour, brush);
                 if ((u32)px < column[0]) column[0] = (u32)px;
                 if ((u32)px + 1 > column[1]) column[1] = (u32)px + 1;
             }
@@ -1297,7 +1299,6 @@ static OffRT* deform_off_rt(u32 address)
  *                             other values are of the last paint.
  *   0x58                     the end
  */
-static u64 s_deform_dumped;          /* frames written */
 static int s_deform_dump_edges;      /* the edges record is written */
 
 static FILE* deform_dump_open(void)

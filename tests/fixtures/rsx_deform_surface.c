@@ -722,6 +722,7 @@ static void check_dump(void)
     quad(18, 80, 90, 30, 40, path, 174, 0);
     deform_paint(&dr, 18, 6, 0, 5);
     memcpy(gpu0, deform_image(s), (size_t)PITCH * ROWS);
+    if (s->paint_n) FAIL("paint notes past the dump budget");
     gpu0[32 * PITCH + 82] = (u8)(gpu0[32 * PITCH + 82] ^ 1);
     s_d3d.off_rt[0].gpu_generation = 4;
     s_d3d.frame_count = 104;
