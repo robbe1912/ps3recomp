@@ -5625,6 +5625,7 @@ skip_dump_consider: ;
     cpu_surface_eager_submitted();
     cpu_surface_prefetch_refresh();
     cpu_surface_frame_complete();
+    rsx_deform_batch_end();
     if (perf_on()) perf_batch_finish(_rf0);
 }
 

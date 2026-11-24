@@ -17,10 +17,13 @@
  *   RSX_DEFORM_BUFFER=1                    section B: keep level 0 of the
  *                                          listed surfaces in guest memory.
  *   RSX_DEFORM_SHADOW=1                    section C: with the buffer, paint
- *                                          a private copy and compare.
+ *                                          private copies and compare them
+ *                                          with the GPU bytes.
  *   RSX_DEFORM_OP=<name>                   the pixel operation (section B).
  *   RSX_DEFORM_LOG=<frames>                one [DEFORM] line each n frames
- *                                          that paint (300).
+ *                                          that paint; n compared frames and
+ *                                          n [DEFORM_WHEEL] frames of the
+ *                                          shadow mode (300).
  *
  * rsx_d3d12_backend.c includes this file after rsx_cpu_surface.inc. It uses
  * the record type D3D12DrawRecord, rsx_state, s_d3d, vm_base, the vertex
@@ -28,6 +31,7 @@
  */
 #include <stdatomic.h>
 #include "rsx_vp_decompiler.h"
+#include "rsx_deform_surface.h"
 
 #ifndef RSX_DEFORM_TARGETS_MAX
 #define RSX_DEFORM_TARGETS_MAX 4u
@@ -45,11 +49,12 @@
 #define RSX_DEFORM_FP_UCODE_MAX 16384u
 
 /* ---- the pixel operation of a paint draw (section B) --------------------
- * dest is the byte of the target, brush the byte of the brush texture and a
- * the first colour byte of the vertex, the intensity. All are 0..255, and so
- * is the result. The names are the values of RSX_DEFORM_OP. */
-static u8 deform_op_f32(u32 dest, u32 brush, u32 a)
+ * dest is the byte of the target, brush the byte of the brush texture and
+ * colour the first colour value of the vertex, the intensity, from 0 to 1.
+ * The result is 0..255. The names are the values of RSX_DEFORM_OP. */
+static u8 deform_op_f32(u32 dest, u32 brush, float colour)
 {
+    u32 a = (u32)(colour * 255.0f + 0.5f);
     /* The program in double precision, without the half precision steps. */
     double value = ((double)brush / 255.0 - 0.25) * ((double)a / 255.0) + (double)dest / 255.0;
     if (value < 0.0) value = 0.0;
@@ -90,12 +95,14 @@ static float deform_f16(float x)
     return x;
 }
 
-/* The fragment program of the dump:
+/* The fragment program of the dump, in float steps:
  *   out = fp16(saturate(fp16(brush - 0.25) * colour.x + dest)).
  * Each float step rounds once: the product and the sum go through double,
- * so the compiler makes no fused multiply-add. */
-static u8 deform_op_fp16(u32 dest, u32 brush, u32 a)
+ * so the compiler makes no fused multiply-add. The intensity is the byte of
+ * the vertex. */
+static u8 deform_op_fp16(u32 dest, u32 brush, float colour)
 {
+    u32 a = (u32)(colour * 255.0f + 0.5f);
     float h = deform_f16((float)((double)brush / 255.0 - 0.25));
     float product = (float)((double)h * ((double)a / 255.0));
     float value = (float)((double)product + (double)dest / 255.0);
@@ -105,14 +112,28 @@ static u8 deform_op_fp16(u32 dest, u32 brush, u32 a)
     return (u8)(value * 255.0f + 0.5f);
 }
 
+/* The same program as a host shader runs it: the intensity and the
+ * destination are the float values of the bytes, and the product and the sum
+ * take one rounding (a fused multiply-add). */
+static u8 deform_op_fused(u32 dest, u32 brush, float colour)
+{
+    float h = deform_f16((float)((double)brush / 255.0 - 0.25));
+    float value = fmaf(h, colour, (float)dest / 255.0f);
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    value = deform_f16(value);
+    return (u8)(value * 255.0f + 0.5f);
+}
+
 typedef struct {
     const char* name;
-    u8 (*fn)(u32 dest, u32 brush, u32 a);
+    u8 (*fn)(u32 dest, u32 brush, float colour);
 } RsxDeformOp;
 
 static const RsxDeformOp s_deform_ops[] = {
-    { "fp16", deform_op_fp16 },
-    { "f32",  deform_op_f32 },
+    { "fp16",  deform_op_fp16 },
+    { "fused", deform_op_fused },
+    { "f32",   deform_op_f32 },
 };
 #define RSX_DEFORM_OP_COUNT ((int)(sizeof s_deform_ops / sizeof s_deform_ops[0]))
 
@@ -534,11 +555,13 @@ static void deform_capture_record(int which, const D3D12DrawRecord* dr, const rs
  *                    each texel of level k is the mean of a 2 x 2 block of
  *                    level k - 1. The CPU holds row 0 of level 1 only.
  *
- * RSX_DEFORM_SHADOW=1 with RSX_DEFORM_BUFFER=1 paints into a private copy.
- * The readback path stays, the game reads the GPU bytes, and section C
- * compares the two copies.
+ * RSX_DEFORM_SHADOW=1 with RSX_DEFORM_BUFFER=1 paints into private copies,
+ * one per pixel operation. The readback path stays, the game reads the GPU
+ * bytes, and section C compares the copies with the GPU bytes.
  *
  * RSX_DEFORM_OP=<name> selects the pixel operation. "fp16" is the program.
+ * "fused" takes one rounding for the product and the sum. "f32" has no half
+ * steps. The shadow mode paints all three and counts the equal texels of each.
  */
 
 typedef struct RsxDeformSurface {
@@ -549,12 +572,20 @@ typedef struct RsxDeformSurface {
     u32        width, height;  /* texels per row and rows of level 0                       */
     u32        mip_address;    /* guest address of texel (0, 0) of level 1                 */
     u32        mip_width;      /* texels of row 0 of level 1 that the painter holds        */
-    u8*        cpu;            /* the private copy of the shadow mode, else 0              */
+    /* Shadow mode only. A reader of the game thread reads ops and mip. */
+    u8*        ops[RSX_DEFORM_OP_COUNT]; /* level 0 as each operation paints it; all 0 else */
+    u8*        retired[RSX_DEFORM_OP_COUNT + 1]; /* ops and mip of the last binding */
+    u8*        mip;            /* row 0 of level 1: mip_width bytes                        */
+    u32*       cols;           /* per row: first painted column, last + 1, since a compare */
     /* Renderer thread only. */
-    void (*note)(struct RsxDeformSurface* s, u32 x, u32 y, u32 dest, u32 brush, u32 a);
     u32        dirty_y0, dirty_y1;
     u32        painted, skipped;
     u64        texels;
+    u64        compare_frame;      /* frame of the last compare                           */
+    u64        compare_frames;     /* compares since the binding                          */
+    u64        compare_generation; /* gpu_generation of level 1 at the last mip compare   */
+    u64        total_texels, total_diff, total_mip_texels, total_mip_diff;
+    u32        total_diffmax, total_mip_diffmax;
     u32        programs[8];
     u32        program_count;
     int        noted_state;
@@ -637,6 +668,73 @@ static u64 rsx_deform_sequence(void)
     return sum;
 }
 
+/* The image the painter paints and rsx_deform_sample reads: the private copy
+ * of the selected operation in the shadow mode, else guest memory. Call it
+ * with a published record that is not changing. */
+static u8* deform_image(const RsxDeformSurface* s)
+{
+    return s->ops[0] ? s->ops[s_deform.op] : vm_base + s->guest_address;
+}
+
+/* Row 0 of level 1: the private copy of the shadow mode, else guest memory,
+ * where the read paths of the game find it. */
+static u8* deform_mip_bytes(const RsxDeformSurface* s)
+{
+    return s->mip ? s->mip : vm_base + s->mip_address;
+}
+
+int rsx_deform_mode(void)
+{
+    return !deform_on() || !s_deform.buffer ? 0 : s_deform.shadow ? 2 : 1;
+}
+
+/* ---- the bookkeeping of the shadow comparison ---------------------------- */
+
+/* Shadow mode. Row y has no painted column since the last compare. */
+static void deform_columns_reset(RsxDeformSurface* s, u32 y)
+{
+    s->cols[2 * y] = s->width;
+    s->cols[2 * y + 1] = 0;
+}
+
+/* Shadow mode. Every row compares from its first to its last column: the GPU
+ * paints a draw the painter skips, or a clear sets every byte. */
+static void deform_columns_all(RsxDeformSurface* s)
+{
+    for (u32 y = 0; y < s->height; y++) {
+        s->cols[2 * y] = 0;
+        s->cols[2 * y + 1] = s->width;
+    }
+}
+
+/* Renderer thread. The private copies of the shadow mode: one image of
+ * `bytes` bytes per pixel operation, row 0 of level 1 and the painted columns
+ * of each row. They stay 0 when the memory is not available. */
+static void deform_shadow_allocate(RsxDeformSurface* s, size_t bytes)
+{
+    u8* mip = (u8*)malloc(s->mip_width);
+    u32* cols = (u32*)malloc((size_t)s->height * 2 * sizeof *cols);
+    int ok = mip && cols;
+    for (int k = 0; ok && k < RSX_DEFORM_OP_COUNT; k++) {
+        s->ops[k] = (u8*)malloc(bytes);
+        if (s->ops[k]) memset(s->ops[k], 0, bytes);
+        else ok = 0;
+    }
+    if (ok) {
+        memset(mip, 0, s->mip_width);
+        s->cols = cols;
+        for (u32 y = 0; y < s->height; y++) deform_columns_reset(s, y);
+        s->mip = mip;
+        return;
+    }
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++) {
+        free(s->ops[k]);
+        s->ops[k] = NULL;
+    }
+    free(mip);
+    free(cols);
+}
+
 /* Renderer thread. The record of the target of dr. The slot follows the
  * listed offset. The words cpu_surface_capture wrote into the draw record
  * give the guest address, the pitch and the size. Returns 0 for a target
@@ -663,7 +761,21 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
         return s;
     u64 sequence = atomic_load_explicit(&s->sequence, memory_order_relaxed);
     atomic_store_explicit(&s->sequence, sequence + 1, memory_order_relaxed);
-    if (s->cpu && (s->pitch != pitch || s->height != dr->rt_h)) { free(s->cpu); s->cpu = NULL; }
+    /* A reader of the game thread can still hold the private copies of the
+     * last binding. They are released at this binding, one binding later. */
+    int resized = sequence && (s->pitch != pitch || s->width != dr->rt_w || s->height != dr->rt_h);
+    if (resized) {
+        for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++) {
+            free(s->retired[k]);
+            s->retired[k] = s->ops[k];
+            s->ops[k] = NULL;
+        }
+        free(s->retired[RSX_DEFORM_OP_COUNT]);
+        s->retired[RSX_DEFORM_OP_COUNT] = s->mip;
+        s->mip = NULL;
+        free(s->cols);
+        s->cols = NULL;
+    }
     s->offset = dr->rt_off;
     s->guest_address = address;
     s->pitch = pitch;
@@ -678,15 +790,13 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
     s->program_count = 0;
     s->noted_state = s->noted_bad = 0;
     s->noted_skip = 0;
-    if (s_deform.shadow && !s->cpu) {
-        s->cpu = (u8*)malloc((size_t)pitch * dr->rt_h);
-        if (s->cpu) memset(s->cpu, 0, (size_t)pitch * dr->rt_h);
-    }
+    s->compare_generation = 0;
+    if (s_deform.shadow && !s->ops[0]) deform_shadow_allocate(s, (size_t)pitch * dr->rt_h);
     atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);
-    fprintf(stderr, "[DEFORM] target %08X: guest %08X, %ux%u, pitch %u, level 1 row 0 at %08X"
+    fprintf(stderr, "[DEFORM] target address=%08X offset=%08X: %ux%u, pitch %u, level 1 row 0 at %08X"
                     " (%u texels), mode %s\n",
-            s->offset, s->guest_address, s->width, s->height, s->pitch, s->mip_address,
-            s->mip_width, s->cpu ? "shadow" : "on");
+            s->guest_address, s->offset, s->width, s->height, s->pitch, s->mip_address,
+            s->mip_width, s->ops[0] ? "shadow" : s_deform.shadow ? "no shadow copy" : "on");
     return s;
 }
 
@@ -861,8 +971,10 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
     if (maxy > clip[3]) maxy = clip[3];
     int x0 = (int)ceil(minx - 0.5), x1 = (int)floor(maxx - 0.5);
     int y0 = (int)ceil(miny - 0.5), y1 = (int)floor(maxy - 0.5);
+    int shadow = s->ops[0] != NULL;
     for (int py = y0; py <= y1; py++) {
         u8* row = image + (size_t)py * s->pitch;
+        u32* column = shadow ? s->cols + (size_t)py * 2 : NULL;
         double wy = py + 0.5;
         for (int px = x0; px <= x1; px++) {
             double wx = px + 0.5;
@@ -875,11 +987,20 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
             double w0 = e0 / area, w1 = e1 / area, w2 = e2 / area;
             float u = (float)(w0 * a.u + w1 * b.u + w2 * c.u);
             float v = (float)(w0 * a.v + w1 * b.v + w2 * c.v);
-            u32 intensity = (u32)((w0 * a.a + w1 * b.a + w2 * c.a) * 255.0 + 0.5);
+            float colour = (float)(w0 * a.a + w1 * b.a + w2 * c.a);
             u32 dest = row[px], value = deform_brush_sample(brush, u, v);
-            row[px] = op->fn(dest, value, intensity);
+            row[px] = op->fn(dest, value, colour);
+            if (shadow) {
+                /* The shadow mode paints the texel with each other operation. */
+                size_t at = (size_t)py * s->pitch + (size_t)px;
+                for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++) {
+                    u8* other = s->ops[k];
+                    if (other != image) other[at] = s_deform_ops[k].fn(other[at], value, colour);
+                }
+                if ((u32)px < column[0]) column[0] = (u32)px;
+                if ((u32)px + 1 > column[1]) column[1] = (u32)px + 1;
+            }
             s->texels++;
-            if (s->note) s->note(s, (u32)px, (u32)py, dest, value, intensity);
             if ((u32)py < s->dirty_y0) s->dirty_y0 = (u32)py;
             if ((u32)py + 1 > s->dirty_y1) s->dirty_y1 = (u32)py + 1;
         }
@@ -890,6 +1011,8 @@ static void deform_triangle(RsxDeformSurface* s, u8* image, const DeformVertex* 
 static void deform_skip(RsxDeformSurface* s, int reason, const char* what)
 {
     s->skipped++;
+    /* The GPU paints this draw. The shadow mode compares every row. */
+    if (s->cols) deform_columns_all(s);
     if (s->noted_skip & (1u << reason)) return;
     s->noted_skip |= 1u << reason;
     fprintf(stderr, "[DEFORM] target %08X: a draw is not painted: %s\n", s->offset, what);
@@ -969,10 +1092,12 @@ static void deform_paint_draw(RsxDeformSurface* s, u8* image, const D3D12DrawRec
 }
 
 /* Renderer thread. Row 0 of level 1 from rows 0 and 1 of level 0: the mip
- * pass of the dump. Round half up. */
+ * pass of the dump. Round half up. The mode on writes guest memory, where the
+ * read paths of the game find the row. The shadow mode writes its private
+ * row. */
 static void deform_mip_row(RsxDeformSurface* s, const u8* level0)
 {
-    u8* row = vm_base + s->mip_address;
+    u8* row = deform_mip_bytes(s);
     for (u32 x = 0; x < s->mip_width; x++) {
         const u8* a = level0 + (size_t)x * 2, *b = a + s->pitch;
         row[x] = (u8)((a[0] + a[1] + b[0] + b[1] + 2) / 4);
@@ -1009,52 +1134,224 @@ static void deform_paint(const D3D12DrawRecord* dr, u32 first, u32 count, int in
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!st || !deform_listed(dr->rt_off)) return;
     RsxDeformSurface* s = deform_surface_get(dr);
-    if (!s || (s_deform.shadow && !s->cpu)) return;
+    if (!s || (s_deform.shadow && !s->ops[0])) return;
     u64 sequence = atomic_load_explicit(&s->sequence, memory_order_relaxed);
     atomic_store_explicit(&s->sequence, sequence + 1, memory_order_relaxed);
-    u8* image = s->cpu ? s->cpu : vm_base + s->guest_address;
+    u8* image = deform_image(s);
     if (dr->is_clear) {
         u32 value = dr->cc[2] <= 0.0f ? 0 : dr->cc[2] >= 1.0f ? 255 : (u32)(dr->cc[2] * 255.0f + 0.5f);
         for (u32 y = 0; y < s->height; y++) memset(image + (size_t)y * s->pitch, value, s->width);
+        /* The shadow mode clears the image of each other operation too. */
+        for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+            if (s->ops[k] && s->ops[k] != image)
+                for (u32 y = 0; y < s->height; y++)
+                    memset(s->ops[k] + (size_t)y * s->pitch, value, s->width);
+        if (s->cols) deform_columns_all(s);
         s->dirty_y0 = 0;
         s->dirty_y1 = s->height;
     } else {
         deform_paint_draw(s, image, dr, st, first, count, indexed, primitive);
     }
-    if (!s->cpu && s->dirty_y0 < 2) deform_mip_row(s, image);
+    if (s->dirty_y0 < 2) deform_mip_row(s, image);
     atomic_store_explicit(&s->sequence, sequence + 2, memory_order_release);
     deform_frame_log();
+}
+
+/* ---------------------------------------------------------------------------
+ * C. The shadow comparison.
+ *
+ * RSX_DEFORM_SHADOW=1 with RSX_DEFORM_BUFFER=1 keeps the GPU paint draws and
+ * the readback path, and paints a private copy per pixel operation. After a
+ * batch is submitted, the backend calls rsx_deform_batch_end(). It copies the
+ * OffRT of level 0 to guest memory (cpu_surface_copy waits for the GPU) and
+ * compares the columns the painter changed since the last compare. A target
+ * compares at most once a frame and RSX_DEFORM_LOG frames in all (300). When
+ * the mip pass ran since the last compare, the line also holds row 0 of
+ * level 1: the private row against the GPU bytes.
+ *
+ *   [DEFORM_SHADOW] frame= target= texels= equal= diff1= diffmax= first=
+ *                   cpu= gpu= op_<name>= ... [mip_texels= mip_equal=
+ *                   mip_diff1= mip_diffmax= neighbour=]
+ *   texels          texels compared of level 0
+ *   equal           texels where the CPU byte equals the GPU byte
+ *   diff1           texels where the two bytes differ by one
+ *   diffmax         the largest difference
+ *   first, cpu, gpu the guest address and the two bytes of the first
+ *                   difference; 0 when there is none
+ *   op_<name>       texels where the image of that operation equals the GPU
+ *   mip_*           the same counts for row 0 of level 1
+ *   neighbour       cpu/gpu of texels 0 and 1 of row 0 of level 1: the two
+ *                   bytes after the last row of level 0, which a read of
+ *                   the game at its bottom row also loads
+ * The last line, [DEFORM_SHADOW] done, holds the totals.
+ */
+
+typedef struct {
+    u64 texels, equal, diff1;
+    u32 diffmax, first, cpu, gpu;
+} DeformDiff;
+
+/* Counts the differences of two byte ranges. address is the guest address of
+ * the first byte. */
+static void deform_diff(DeformDiff* d, const u8* cpu, const u8* gpu, size_t count, u32 address)
+{
+    for (size_t i = 0; i < count; i++) {
+        u32 c = cpu[i], g = gpu[i], delta = c > g ? c - g : g - c;
+        d->texels++;
+        if (!delta) {
+            d->equal++;
+            continue;
+        }
+        if (delta == 1) d->diff1++;
+        if (delta > d->diffmax) d->diffmax = delta;
+        if (!d->first) {
+            d->first = address + (u32)i;
+            d->cpu = c;
+            d->gpu = g;
+        }
+    }
+}
+
+/* Renderer thread. The OffRT with a guest address, or 0. */
+static OffRT* deform_off_rt(u32 address)
+{
+    for (int i = 0; i < CPU_SURFACE_CAPACITY; i++) {
+        OffRT* r = &s_d3d.off_rt[i];
+        if (r->res && r->cpu_address == address) return r;
+    }
+    return NULL;
+}
+
+static void deform_shadow_compare(RsxDeformSurface* s)
+{
+    if (!s->ops[0] || s->compare_frames >= s_deform.log_frames) return;
+    u64 frame = s_d3d.frame_count;
+    if (frame == s->compare_frame) return;      /* at most one compare a frame */
+    OffRT* level = deform_off_rt(s->guest_address), *mip_rt = deform_off_rt(s->mip_address);
+    /* The mip pass ran since the last compare: level 1 has a new generation. */
+    int mipped = mip_rt && mip_rt->gpu_generation != s->compare_generation;
+    u32 rows = 0;
+    for (u32 y = 0; y < s->height; y++) rows += s->cols[2 * y + 1] > s->cols[2 * y];
+    if (!level || (!rows && !mipped)) return;
+    s->compare_frame = frame;
+    s->compare_frames++;
+    DeformDiff diff = { 0, 0, 0, 0, 0, 0, 0 }, mip = { 0, 0, 0, 0, 0, 0, 0 };
+    u64 op_equal[RSX_DEFORM_OP_COUNT] = { 0 };
+    if (rows) {
+        cpu_surface_copy(level);
+        for (u32 y = 0; y < s->height; y++) {
+            u32 x0 = s->cols[2 * y], x1 = s->cols[2 * y + 1];
+            deform_columns_reset(s, y);
+            if (x1 <= x0) continue;
+            size_t at = (size_t)y * s->pitch + x0;
+            const u8* gpu = vm_base + s->guest_address + at;
+            for (u32 k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+                for (u32 x = 0; x < x1 - x0; x++)
+                    op_equal[k] += gpu[x] == s->ops[k][at + x];
+            deform_diff(&diff, s->ops[s_deform.op] + at, gpu, x1 - x0,
+                        s->guest_address + (u32)at);
+        }
+    }
+    const u8* gpu_mip = NULL;
+    if (mipped) {
+        cpu_surface_copy(mip_rt);
+        s->compare_generation = mip_rt->gpu_generation;
+        gpu_mip = vm_base + s->mip_address;
+        deform_diff(&mip, s->mip, gpu_mip, s->mip_width, s->mip_address);
+    }
+    s->total_texels += diff.texels;
+    s->total_diff += diff.texels - diff.equal;
+    s->total_mip_texels += mip.texels;
+    s->total_mip_diff += mip.texels - mip.equal;
+    if (diff.diffmax > s->total_diffmax) s->total_diffmax = diff.diffmax;
+    if (mip.diffmax > s->total_mip_diffmax) s->total_mip_diffmax = mip.diffmax;
+    fprintf(stderr, "[DEFORM_SHADOW] frame=%llu target=%08X texels=%llu equal=%llu diff1=%llu"
+                    " diffmax=%u first=%08X cpu=%u gpu=%u",
+            (unsigned long long)frame, s->offset, (unsigned long long)diff.texels,
+            (unsigned long long)diff.equal, (unsigned long long)diff.diff1, diff.diffmax,
+            diff.first, diff.cpu, diff.gpu);
+    for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
+        fprintf(stderr, " op_%s=%llu", s_deform_ops[k].name, (unsigned long long)op_equal[k]);
+    if (mipped)
+        fprintf(stderr, " mip_texels=%llu mip_equal=%llu mip_diff1=%llu mip_diffmax=%u"
+                        " neighbour=%u/%u,%u/%u",
+                (unsigned long long)mip.texels, (unsigned long long)mip.equal,
+                (unsigned long long)mip.diff1, mip.diffmax, s->mip[0], gpu_mip[0],
+                s->mip[1], gpu_mip[1]);
+    fprintf(stderr, "\n");
+    if (s->compare_frames == s_deform.log_frames)
+        fprintf(stderr, "[DEFORM_SHADOW] done target=%08X frames=%llu texels=%llu diff=%llu"
+                        " diffmax=%u mip_texels=%llu mip_diff=%llu mip_diffmax=%u\n",
+                s->offset, (unsigned long long)s->compare_frames,
+                (unsigned long long)s->total_texels, (unsigned long long)s->total_diff,
+                s->total_diffmax, (unsigned long long)s->total_mip_texels,
+                (unsigned long long)s->total_mip_diff, s->total_mip_diffmax);
 }
 
 /* ---------------------------------------------------------------------------
  * D. Reads of the game.
  *
  * rsx_deform_sample() is the native GetDepth of the game
- * (src/motorstorm/deformation_query.cpp). It returns the 4 bytes GetDepth
- * reads, in the order of the game: (x, y), (x + 1, y), (x, y + 1),
- * (x + 1, y + 1). x and y are the indices after the clamp of the game.
- * x + 1 and y + 1 are not clamped, as in the game: a byte outside level 0
- * is not returned. The count is 0 when no record holds the surface: the
- * caller then reads the guest memory.
+ * (src/motorstorm/deformation_query.cpp). GetDepth reads four bytes of the
+ * surface at guest address `address`: byte k is at guest address
+ * address + offsets[k]. The function writes the bytes that the CPU buffer
+ * holds: level 0 and row 0 of level 1. It returns how many it wrote. The
+ * count is 0 when no record holds the surface, the buffer is off, or the
+ * record is changing: the caller then reads the guest memory. In the mode on
+ * level 0 is in guest memory, so the read paths of rsx_cpu_surface.inc serve
+ * the other reads of the game.
+ *
+ * rsx_deform_wheel_log() writes the line of the shadow mode for one read:
+ *   [DEFORM_WHEEL] frame= x= y= level= cpu= gpu=
+ * x, y          the texel of the first byte in level 0
+ * level         the sample mode of the read: point or bilinear
+ * cpu, gpu      the four bytes: cpu of the private copy, gpu of the readback
+ * The lines stop after RSX_DEFORM_LOG frames.
  */
-int rsx_deform_sample(u32 address, int x, int y, unsigned char out[4])
+int rsx_deform_sample(uint32_t address, const uint32_t offsets[4], unsigned char out[4])
 {
-    if (!deform_buffer_on()) return 0;
+    if (rsx_deform_mode() == 0) return 0;
     RsxDeformSurface* s = deform_surface_of(address, 0);
-    if (!s || s->guest_address != address || x < 0 || y < 0) return 0;
+    if (!s || s->guest_address != address) return 0;
     for (int tries = 0; tries < 4096; tries++) {
         u64 sequence = atomic_load_explicit(&s->sequence, memory_order_acquire);
         if (sequence & 1) continue;
-        const u8* image = vm_base + s->guest_address;
+        const u8* image = deform_image(s), *mip = deform_mip_bytes(s);
+        u64 begin = s->guest_address, end = begin + (u64)s->pitch * s->height;
+        u64 mip_begin = s->mip_address, mip_end = mip_begin + s->mip_width;
         int count = 0;
         for (int k = 0; k < 4; k++) {
-            int px = x + (k & 1), py = y + (k >> 1);
-            if (px >= (int)s->width || py >= (int)s->height) continue;
-            out[count++] = image[(size_t)py * s->pitch + (size_t)px];
+            u64 at = (u64)address + offsets[k];
+            if (at >= begin && at < end) out[count++] = image[at - begin];
+            else if (at >= mip_begin && at < mip_end) out[count++] = mip[at - mip_begin];
         }
         if (atomic_load_explicit(&s->sequence, memory_order_acquire) == sequence) return count;
     }
     return 0;
+}
+
+static _Atomic u64 s_deform_wheel_frame, s_deform_wheel_frames;
+
+void rsx_deform_wheel_log(uint32_t address, uint32_t offset, const char* level,
+                          const unsigned char cpu[4], const unsigned char gpu[4])
+{
+    if (rsx_deform_mode() != 2) return;
+    /* One count a frame: the first line of a frame steps the counter. */
+    u64 frame = s_d3d.frame_count;
+    u64 seen = atomic_load_explicit(&s_deform_wheel_frame, memory_order_relaxed);
+    while (seen != frame
+           && !atomic_compare_exchange_weak_explicit(&s_deform_wheel_frame, &seen, frame,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
+    }
+    if (seen != frame)
+        atomic_fetch_add_explicit(&s_deform_wheel_frames, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&s_deform_wheel_frames, memory_order_relaxed) > s_deform.log_frames) return;
+    RsxDeformSurface* s = deform_surface_of(address, 0);
+    u32 pitch = s ? s->pitch : 0;
+    fprintf(stderr, "[DEFORM_WHEEL] frame=%llu x=%u y=%u level=%s cpu=%02X%02X%02X%02X"
+                    " gpu=%02X%02X%02X%02X\n",
+            (unsigned long long)frame, pitch ? offset % pitch : 0, pitch ? offset / pitch : 0,
+            level, cpu[0], cpu[1], cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3]);
 }
 
 /* Backend init, after cpu_surface_init: the hooks of the read paths. */
@@ -1063,6 +1360,14 @@ static void rsx_deform_init(void)
     s_cpu_surface_deform.serve = rsx_deform_serve_range;
     s_cpu_surface_deform.owned = rsx_deform_owned;
     s_cpu_surface_deform.sequence = rsx_deform_sequence;
+}
+
+/* Hook of the backend: after cpu_surface_frame_complete(), when a batch is
+ * submitted and its queued reads are served. Shadow mode only. */
+static void rsx_deform_batch_end(void)
+{
+    if (!deform_on() || !s_deform.shadow) return;
+    for (int i = 0; i < s_deform.n_offsets; i++) deform_shadow_compare(&s_deform_surface[i]);
 }
 
 /* Hook of the backend: after the clear record fields are set in d3d12_clear
