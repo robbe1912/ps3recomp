@@ -93,6 +93,13 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     }
 }
 
+/* The performance clock of the backend: the test sets it. */
+static double s_now = 10.0005;
+static double perf_now(void)
+{
+    return s_now;
+}
+
 /* The readback copy of the backend: after the GPU fence, the bytes of the GPU
  * surface are in guest memory. */
 static void cpu_surface_copy(OffRT* r)
@@ -576,6 +583,8 @@ static void check_shadow(void)
         FAIL("the start did not copy the GPU surface to guest memory");
     for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
         if (s->ops[k][9 * PITCH + 9] != 123) FAIL("the private copies do not start as the GPU bytes");
+    if (!strstr(log_text, " the GPU bytes t_ms=10000.500\n"))
+        FAIL("the start line has no time: %s", log_text);
     log_text[0] = 0;
     quad(0, 10, 20, 30, 40, path, 174, 0);
     quad(6, 200, 202, 0, 2, path, 0, 0);
@@ -617,6 +626,10 @@ static void check_shadow(void)
     gpu0[a] = (u8)(gpu0[a] < 255 ? gpu0[a] + 1 : gpu0[a] - 1);
     gpu0[b] = (u8)(gpu0[b] >= 7 ? gpu0[b] - 7 : gpu0[b] + 7);
     s_d3d.off_rt[0] = (OffRT){ (void*)1, 0x00A80500, BASE, PITCH, 1, 0, gpu0, ROWS };
+    /* A read before the first compare with painted texels gives no line. */
+    rsx_deform_wheel_log(BASE, 30 * PITCH + 10, "bilinear", cpu, gpu);
+    if (strstr(log_text, "[DEFORM_WHEEL]")) FAIL("a wheel line before the first compare with painted texels");
+    s_now = 10.5;
     s_d3d.frame_count = 101;
     rsx_deform_batch_end();
     size_t logged = strlen(log_text);
@@ -626,11 +639,15 @@ static void check_shadow(void)
     if (!logged_line("101", "texels=104 equal=102 diff1=1 diffmax=7 first=0001F00")
         || strstr(log_text, "mip_") || strstr(log_text, "neighbour="))
         FAIL("the first compare line is wrong: %s", log_text);
+    if (!strstr(log_text, " t_ms=10500.000\n")) FAIL("the compare line has no time: %s", log_text);
     /* A second batch end in the frame: no line. */
     rsx_deform_batch_end();
     if (strlen(log_text) != logged) FAIL("a second compare in one frame");
+    s_now = 10.75;
     rsx_deform_wheel_log(BASE, 30 * PITCH + 10, "bilinear", cpu, gpu);
     if (strlen(log_text) == logged) FAIL("no wheel line in the shadow mode");
+    if (!strstr(log_text + logged, " gpu=05060708 t_ms=10750.000\n"))
+        FAIL("the wheel line has no time: %s", log_text + logged);
     logged = strlen(log_text);
     /* A second stamp of the frame does not compare in that frame. */
     quad(12, 40, 50, 30, 40, path, 174, 0);

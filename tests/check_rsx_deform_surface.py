@@ -101,6 +101,12 @@ MUTANTS = [
     ('start-not-counted',
      '    if (++s->compare_frames == s_deform.log_frames) deform_shadow_done(s);\n',
      '    if (s->compare_frames == s_deform.log_frames) deform_shadow_done(s);\n'),
+    ('time-in-seconds', '    return perf_now() * 1000.0;\n', '    return perf_now();\n'),
+    ('wheel-before-compare',
+     '    if (!s || !atomic_load_explicit(&s->compared, memory_order_relaxed)) return;\n',
+     '    if (!s) return;\n'),
+    ('compare-never-marks',
+     '        atomic_store_explicit(&s->compared, 1, memory_order_relaxed);\n', ''),
 ]
 
 

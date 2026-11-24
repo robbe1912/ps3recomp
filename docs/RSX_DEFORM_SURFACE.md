@@ -106,6 +106,12 @@ and the nearest brush texel.
   read of the game from its native GetDepth: the four CPU bytes next to the
   four GPU bytes. `level` is `point` or `bilinear`.
 
+Each of these lines ends with `t_ms`: the performance clock in
+milliseconds, the `t_ms` column of `rsx_phases.csv`. Its zero is the start
+of the system. The time of a run is the value minus the `t_ms` of the first
+row of the CSV. The first `[DEFORM_WHEEL]` line is the first read after a
+compare that found painted texels.
+
 ## Check
 
 Run `python tests/check_rsx_deform_surface.py`. It compiles the production
@@ -142,3 +148,11 @@ difference of at most one are equal.
 The comparison now starts the private copies as the GPU bytes. No run has
 this start. The bilinear weights, the mip rounding and the position steps
 have no proof against the GPU.
+
+Run S4 (exe `f399ecfceddc716e`, `20261124T130102.888566Z`, 181 s of frames)
+ended before the first painted texel. Its two `[DEFORM] frame=` lines
+(frames 9012 and 9072) show 12 paint draws with 0 texels. The `start`
+line is at frame 9013, 176.0 s into the run. So each batch end after it
+stopped at the return for a frame without a painted column. Run 2 has the
+same phase: its lines without texels start at frame 7939, and its first
+texel is at frame 8271, about 22 s later. A shadow run needs 300 s.

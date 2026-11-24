@@ -601,6 +601,7 @@ typedef struct RsxDeformSurface {
     u64        compare_frame;      /* frame of the last compare                           */
     u64        compare_frames;     /* compares since the binding                          */
     const void* level;             /* the GPU surface of level 0 at the last start          */
+    _Atomic int compared;           /* 1 after a compare with painted texels: the wheel lines  */
     u64        total_texels, total_diff;
     u32        total_diffmax;
     /* RSX_DEFORM_DUMP. Renderer thread only. */
@@ -1421,14 +1422,22 @@ static void deform_dump_frame(RsxDeformSurface* s, u64 frame)
     fflush(f);
 }
 
+/* The performance clock in milliseconds: the t_ms column of the phase CSV
+ * (perf_now in rsx_d3d12_backend.c). Its zero is the start of the system,
+ * so the time of a run is the value minus the value of the first CSV row. */
+static double deform_time_ms(void)
+{
+    return perf_now() * 1000.0;
+}
+
 /* Shadow mode. The totals after the last compared frame. */
 static void deform_shadow_done(RsxDeformSurface* s)
 {
     fprintf(stderr, "[DEFORM_SHADOW] done target=%08X frames=%llu texels=%llu diff=%llu"
-                    " diffmax=%u\n",
+                    " diffmax=%u t_ms=%.3f\n",
             s->offset, (unsigned long long)s->compare_frames,
             (unsigned long long)s->total_texels, (unsigned long long)s->total_diff,
-            s->total_diffmax);
+            s->total_diffmax, deform_time_ms());
 }
 
 /* Shadow mode. The GPU surface of level 0 is not the resource of the last
@@ -1457,8 +1466,8 @@ static void deform_shadow_start(RsxDeformSurface* s, OffRT* level, u64 frame)
     s->compare_frame = frame;
     if (++s->compare_frames == s_deform.log_frames) deform_shadow_done(s);
     fprintf(stderr, "[DEFORM_SHADOW] start target=%08X frame=%llu: the private copies start as"
-                    " the GPU bytes\n",
-            s->offset, (unsigned long long)frame);
+                    " the GPU bytes t_ms=%.3f\n",
+            s->offset, (unsigned long long)frame, deform_time_ms());
 }
 
 /* Renderer thread, after a submitted batch. Copies the OffRT of level 0 to
@@ -1500,6 +1509,8 @@ static void deform_shadow_compare(RsxDeformSurface* s)
                 op_equal[k] += gpu[x] == s->ops[k][at + x];
         deform_diff(&diff, s->ops[s_deform.op] + at, gpu, x1 - x0, s->guest_address + (u32)at);
     }
+    if (diff.texels)
+        atomic_store_explicit(&s->compared, 1, memory_order_relaxed);
     if (s_deform_dump_file && diff.texels != diff.equal && s_deform_dumped < s_deform_dump_frames) {
         if (!s_deform_dump_edges) deform_dump_edges(s);
         deform_dump_frame(s, frame);
@@ -1517,7 +1528,7 @@ static void deform_shadow_compare(RsxDeformSurface* s)
     for (int k = 0; k < RSX_DEFORM_OP_COUNT; k++)
         fprintf(stderr, " op_%s=%llu", s_deform_ops[k].name, (unsigned long long)op_equal[k]);
     if (s_deform_dump_file) fprintf(stderr, " dump=%llu", (unsigned long long)s_deform_dumped);
-    fprintf(stderr, "\n");
+    fprintf(stderr, " t_ms=%.3f\n", deform_time_ms());
     if (s->compare_frames == s_deform.log_frames) deform_shadow_done(s);
 }
 
@@ -1535,10 +1546,12 @@ static void deform_shadow_compare(RsxDeformSurface* s)
  * the other reads of the game.
  *
  * rsx_deform_wheel_log() writes the line of the shadow mode for one read:
- *   [DEFORM_WHEEL] frame= x= y= level= cpu= gpu=
+ *   [DEFORM_WHEEL] frame= x= y= level= cpu= gpu= t_ms=
  * x, y          the texel of the first byte in level 0
  * level         the sample mode of the read: point or bilinear
+ * t_ms          the performance clock in milliseconds (deform_time_ms)
  * cpu, gpu      the four bytes: cpu of the private copy, gpu of the readback
+ * The first line is the first read after a compare that found painted texels.
  * The lines stop after RSX_DEFORM_LOG frames.
  */
 int rsx_deform_sample(uint32_t address, const uint32_t offsets[4], unsigned char out[4])
@@ -1569,6 +1582,10 @@ void rsx_deform_wheel_log(uint32_t address, uint32_t offset, const char* level,
                           const unsigned char cpu[4], const unsigned char gpu[4])
 {
     if (rsx_deform_mode() != 2) return;
+    /* The lines start with the first compare that found painted texels: the
+     * reads before it give no information on the paint. */
+    RsxDeformSurface* s = deform_surface_of(address, 0);
+    if (!s || !atomic_load_explicit(&s->compared, memory_order_relaxed)) return;
     /* One count a frame: the first line of a frame steps the counter. */
     u64 frame = s_d3d.frame_count;
     u64 seen = atomic_load_explicit(&s_deform_wheel_frame, memory_order_relaxed);
@@ -1579,12 +1596,12 @@ void rsx_deform_wheel_log(uint32_t address, uint32_t offset, const char* level,
     if (seen != frame)
         atomic_fetch_add_explicit(&s_deform_wheel_frames, 1, memory_order_relaxed);
     if (atomic_load_explicit(&s_deform_wheel_frames, memory_order_relaxed) > s_deform.log_frames) return;
-    RsxDeformSurface* s = deform_surface_of(address, 0);
-    u32 pitch = s ? s->pitch : 0;
+    u32 pitch = s->pitch;
     fprintf(stderr, "[DEFORM_WHEEL] frame=%llu x=%u y=%u level=%s cpu=%02X%02X%02X%02X"
-                    " gpu=%02X%02X%02X%02X\n",
-            (unsigned long long)frame, pitch ? offset % pitch : 0, pitch ? offset / pitch : 0,
-            level, cpu[0], cpu[1], cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3]);
+                    " gpu=%02X%02X%02X%02X t_ms=%.3f\n",
+            (unsigned long long)frame, offset % pitch, offset / pitch,
+            level, cpu[0], cpu[1], cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3],
+            deform_time_ms());
 }
 
 /* Backend init, after cpu_surface_init: the hooks of the read paths. */
