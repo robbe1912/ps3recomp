@@ -1652,11 +1652,183 @@ static void ppu_spin_yield(void)
  * runs the inline loads of its ppu_recomp.h and the out-of-line functions
  * below. The fire halves below are the fire halves of the fast paths.
  * -----------------------------------------------------------------------*/
+#include "ps3emu/ppu_fastmem.h"   /* the accessor columns of the PPU_FM_COUNT counter */
+#ifndef _WIN32
+#include <time.h>                 /* clock_gettime */
+#endif
+
+/* Clock, thread ids and output of the PPU_FM_COUNT counter. They are outside
+ * the block below, so the check can give the counter an authored clock. */
+static uint64_t ppu_fm_count_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+
+static uint64_t ppu_fm_count_frequency(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (uint64_t)f.QuadPart;
+#else
+    return 1000000000ull;
+#endif
+}
+
+static unsigned long ppu_fm_count_host_tid(void) { return (unsigned long)GetCurrentThreadId(); }
+
+static uint64_t ppu_fm_count_guest_tid(void)
+{
+    return g_active_ctx ? (uint64_t)g_active_ctx->thread_id : 0;
+}
+
+static void ppu_fm_count_emit(const char* line)
+{
+    fputs(line, stderr);
+    fflush(stderr);
+}
+
 extern "C" volatile uint32_t ppu_fm_diag = 0;
 
 /* Hot-spin detector switch of the inline fast paths: 1 = the detector runs.
  * Only the exact value PPU_FM_SPINDET=0 turns it off. */
 extern "C" volatile uint32_t ppu_fm_spin_det = 1;
+
+/* ---- PPU_FM_COUNT: opt-in call counter of the accessors ------------------
+ * One counter per accessor and per host thread that calls the accessors. It
+ * runs only when ppu_fm_arm saw PPU_FM_COUNT. Then ppu_fm_diag is 1, every
+ * access takes the out-of-line family, and ppu_fm_count_hit counts the call
+ * before the family gets it. With the switch off, ppu_fm_count_hit returns
+ * at its first test, and the default path of the header has no code of the
+ * counter.
+ *
+ * One line per second on stderr: one line for each thread with calls in that
+ * second, then the sum of all threads. A thread reads the clock one time
+ * per PPU_FM_COUNT_PERIOD calls. The first thread that finds one second
+ * since the last line prints it, so a quiet second has no line.
+ *
+ * The class of a thread is not in the line. The [thr] lines of the log give
+ * the name of a host thread id. */
+uint64_t ppu_fm_count_now(void);          /* clock ticks; defined above */
+uint64_t ppu_fm_count_frequency(void);    /* ticks per second */
+unsigned long ppu_fm_count_host_tid(void);
+uint64_t ppu_fm_count_guest_tid(void);    /* 0 for a thread without a guest context */
+void ppu_fm_count_emit(const char* line); /* one line, with its newline */
+
+#define PPU_FM_COUNT_SLOTS  32     /* the last slot takes every thread after the first 31 */
+#define PPU_FM_COUNT_PERIOD 16384  /* one clock read per this many calls on a thread */
+struct PpuFmCountSlot {
+    uint64_t n[PPU_FM_C_COUNT + 1];   /* one counter per accessor, then the total */
+    unsigned long tid;                /* host thread id */
+    uint64_t guest;                   /* guest thread id */
+    int used;
+};
+static struct PpuFmCountSlot ppu_fm_count_slots[PPU_FM_COUNT_SLOTS];
+static uint64_t ppu_fm_count_prev[PPU_FM_COUNT_SLOTS][PPU_FM_C_COUNT + 1];
+static uint32_t ppu_fm_count_next;             /* slots handed out */
+static PPU_FM_TLS int ppu_fm_count_slot = -1;  /* the slot of this thread */
+static int64_t ppu_fm_count_last;              /* clock ticks at the start of the current second */
+static uint32_t ppu_fm_count_seq;
+
+extern "C" volatile uint32_t ppu_fm_count = 0; /* set by ppu_fm_arm */
+
+/* Appends the columns and the newline to `text`. */
+static void ppu_fm_count_columns(char* text, size_t cap, const uint64_t* n)
+{
+    static const char* const names[PPU_FM_C_COUNT + 1] = {
+        " read8", " read16", " read32", " read64",
+        " write8", " write16", " write32", " write64", " calls" };
+    size_t at = strlen(text);
+    for (int k = 0; k <= PPU_FM_C_COUNT; k++) {
+        int put = snprintf(text + at, cap - at, "%s=%llu", names[k], (unsigned long long)n[k]);
+        if (put < 0 || (size_t)put >= cap - at) break;
+        at += (size_t)put;
+    }
+    if (at + 1 < cap) { text[at] = '\n'; text[at + 1] = 0; }
+}
+
+/* The lines of one second. Only the thread that won the second is here. */
+static void ppu_fm_count_report(int64_t start, int64_t end)
+{
+    const uint32_t seq = ppu_fm_count_seq++;
+    uint64_t all[PPU_FM_C_COUNT + 1];
+    char text[512];
+    for (int k = 0; k <= PPU_FM_C_COUNT; k++) all[k] = 0;
+    for (int s = 0; s < PPU_FM_COUNT_SLOTS; s++) {
+        struct PpuFmCountSlot* slot = &ppu_fm_count_slots[s];
+        uint64_t line[PPU_FM_C_COUNT + 1];
+        int any = 0;
+        if (!__atomic_load_n(&slot->used, __ATOMIC_ACQUIRE)) continue;
+        /* Relaxed loads. Each counter only grows, so each delta is exact. */
+        for (int k = 0; k <= PPU_FM_C_COUNT; k++) {
+            uint64_t now = __atomic_load_n(&slot->n[k], __ATOMIC_RELAXED);
+            line[k] = now - ppu_fm_count_prev[s][k];
+            ppu_fm_count_prev[s][k] = now;
+            all[k] += line[k];
+            any |= line[k] != 0;
+        }
+        if (!any) continue;    /* a thread without calls in this second has no line */
+        snprintf(text, sizeof text, "[PPU_FM_COUNT] seq=%u scope=thread slot=%d tid=%lu guest=%llu",
+                 seq, s, slot->tid, (unsigned long long)slot->guest);
+        ppu_fm_count_columns(text, sizeof text, line);
+        ppu_fm_count_emit(text);
+    }
+    snprintf(text, sizeof text, "[PPU_FM_COUNT] seq=%u scope=all start=%lld end=%lld frequency=%llu",
+             seq, (long long)start, (long long)end,
+             (unsigned long long)ppu_fm_count_frequency());
+    ppu_fm_count_columns(text, sizeof text, all);
+    ppu_fm_count_emit(text);
+}
+
+static void ppu_fm_count_tick(void)
+{
+    const int64_t now = (int64_t)ppu_fm_count_now();
+    const int64_t frequency = (int64_t)ppu_fm_count_frequency();
+    int64_t last = __atomic_load_n(&ppu_fm_count_last, __ATOMIC_ACQUIRE);
+    int64_t expect;
+    if (last == 0) {
+        /* The first clock read starts the first second. */
+        __atomic_store_n(&ppu_fm_count_last, now, __ATOMIC_RELEASE);
+        return;
+    }
+    if (now - last < frequency) return;
+    expect = last;
+    if (!__atomic_compare_exchange_n(&ppu_fm_count_last, &expect, now, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;    /* another thread prints this second */
+    ppu_fm_count_report(last, now);
+}
+
+extern "C" void ppu_fm_count_hit(unsigned k)
+{
+    int s;
+    if (!ppu_fm_count) return;
+    s = ppu_fm_count_slot;
+    if (s < 0) {
+        /* The first count on this thread takes a slot. */
+        uint32_t i = __atomic_fetch_add(&ppu_fm_count_next, 1u, __ATOMIC_RELAXED);
+        struct PpuFmCountSlot* slot;
+        s = i < PPU_FM_COUNT_SLOTS ? (int)i : PPU_FM_COUNT_SLOTS - 1;
+        slot = &ppu_fm_count_slots[s];
+        slot->tid = ppu_fm_count_host_tid();
+        slot->guest = ppu_fm_count_guest_tid();
+        __atomic_store_n(&slot->used, 1, __ATOMIC_RELEASE);
+        ppu_fm_count_slot = s;
+    }
+    __atomic_fetch_add(&ppu_fm_count_slots[s].n[k], 1ull, __ATOMIC_RELAXED);
+    /* One clock read per PPU_FM_COUNT_PERIOD calls on this thread. */
+    if ((__atomic_fetch_add(&ppu_fm_count_slots[s].n[PPU_FM_C_COUNT], 1ull, __ATOMIC_RELAXED) + 1
+         & (PPU_FM_COUNT_PERIOD - 1)) == 0)
+        ppu_fm_count_tick();
+}
 
 /* Any of these in the environment routes every memory access through the
  * out-of-line family, exactly as before the fast paths existed. PPU_FM=0 is
@@ -1667,6 +1839,14 @@ extern "C" void ppu_fm_arm(void)
     if (ppu_fm_diag) return;
     const char* spindet = getenv("PPU_FM_SPINDET");
     if (spindet && spindet[0] == '0' && !spindet[1]) ppu_fm_spin_det = 0;
+    /* PPU_FM_COUNT counts the calls of the accessors (ppu_fm_count_hit). The
+     * count needs the out-of-line family, so it is a diagnostic. A value that
+     * is present and is not the exact value 0 turns it on. */
+    const char* count = getenv("PPU_FM_COUNT");
+    if (count && (count[0] != '0' || count[1])) {
+        ppu_fm_count = 1;
+        ppu_fm_count_emit("[PPU_FM_COUNT] on\n");
+    }
     static const char* const knobs[] = {
         "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "PPU_HOTMAP", "PPU_RVAL",
         "PPU_RVAL64", "YDKJ_RWATCH", "PT", "PPU_WVAL", "PPU_WVAL_LO",
@@ -1687,6 +1867,7 @@ extern "C" void ppu_fm_arm(void)
         if (is_fm) { if (e[0] == '0') { ppu_fm_diag = 1; return; } continue; }
         ppu_fm_diag = 1; return;
     }
+    if (ppu_fm_count) ppu_fm_diag = 1;
 }
 
 /* GCM_REFPOLL fire (read32 of VM_HLE_INJECT_BASE+0x2008). Env-gated,
@@ -1966,7 +2147,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_cpu_rea
  * The barrier probe in the lifted code sets g_barrier_sync_watch = sync base;
  * any PPU store into [base+0x40, base+0xC0) is then logged with its guest
  * function, catching whoever bumps the per-SPU lane counters. */
-extern "C" uint32_t g_barrier_sync_watch = 0;
+extern "C" volatile uint32_t g_barrier_sync_watch = 0;
 
 /* Window for the INLINE write-watch in ppu_memory.h (libs/ stores). Same PPU_WWATCH
  * setting as below; kept as a pair so the inline check is two compares against

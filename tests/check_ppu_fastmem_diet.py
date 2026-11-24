@@ -11,6 +11,11 @@
    must fail.
 3. Compiles the ppu_fm_arm text of the production ppu_loader.cpp. Only the
    exact value PPU_FM_SPINDET=0 turns the switch off. Mutants must fail.
+4. Compiles the production PPU_FM_COUNT counter of ppu_loader.cpp with an
+   authored clock. PPU_FM_COUNT arms the counter and the diagnostic family.
+   The lines hold the calls of each accessor per thread and for all threads.
+   A thread reads the clock one time per 16384 calls. Mutants of the header
+   and of the loader must fail.
 No game input; no performance claim."""
 import argparse
 import os
@@ -36,6 +41,8 @@ BIT_TEST = "return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;"
 LINE_SHIFT = "#define PPU_FM_COH_LINE_SHIFT   7"
 PARSE = "if (spindet && spindet[0] == '0' && !spindet[1]) ppu_fm_spin_det = 0;"
 
+ACCESSORS = ("READ8", "READ16", "READ32", "READ64", "WRITE8", "WRITE16", "WRITE32", "WRITE64")
+COUNT_HIT = ["ppu_fm_count_hit(PPU_FM_C_%s);" % name for name in ACCESSORS]
 HEADER_MUTANTS = [
     ("flag test removed", FLAG_TEST, ""),
     ("flag test ignores the switch", FLAG_TEST, "if (PPU_FM_LIKELY(ppu_fm_spin_det)) break;"),
@@ -46,17 +53,32 @@ HEADER_MUTANTS = [
     ("line shift changed", LINE_SHIFT, LINE_SHIFT.replace("7", "6")),
     ("bit mask changed", BIT_TEST, BIT_TEST.replace("line & 7", "line & 3")),
     ("byte index changed", BIT_TEST, BIT_TEST.replace("line >> 3", "line >> 2")),
-    ("read test removed", "if (PPU_FM_UNLIKELY(ppu_fm_diag))       return vm_read32(a);",
-     "if (PPU_FM_UNLIKELY(0))       return vm_read32(a);"),
-    ("write test removed", "if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { vm_write32(a, v); return; }",
-     "if (PPU_FM_UNLIKELY(g_barrier_sync_watch)) { vm_write32(a, v); return; }"),
-]
+    ("read test removed", "if (PPU_FM_UNLIKELY(ppu_fm_diag))       return ppu_fm_counted_read32(a);",
+     "if (PPU_FM_UNLIKELY(0))       return ppu_fm_counted_read32(a);"),
+    ("write test removed", "if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { ppu_fm_counted_write32(a, v); return; }",
+     "if (PPU_FM_UNLIKELY(g_barrier_sync_watch)) { ppu_fm_counted_write32(a, v); return; }"),
+] + [("count removed: " + name.lower(), hit, "") for name, hit in zip(ACCESSORS, COUNT_HIT)] + [
+    ("count of %s under %s" % (a.lower(), b.lower()), ha, hb)
+    for a, b, ha, hb in zip(ACCESSORS, ACCESSORS[1:], COUNT_HIT, COUNT_HIT[1:])]
 LOADER_MUTANTS = [
     ("parse accepts 00", PARSE, "if (spindet && spindet[0] == '0') ppu_fm_spin_det = 0;"),
     ("parse removed", PARSE, ""),
     ("parse accepts a leading zero word", PARSE, PARSE.replace("!spindet[1]", "spindet[1] != 'x'")),
     ("default off", 'extern "C" volatile uint32_t ppu_fm_spin_det = 1;',
      'extern "C" volatile uint32_t ppu_fm_spin_det = 0;'),
+    ("PPU_FM_COUNT not armed", "        ppu_fm_count = 1;\n", ""),
+    ("PPU_FM_COUNT=0 turns the counter on", "if (count && (count[0] != '0' || count[1])) {", "if (count) {"),
+    ("PPU_FM_COUNT is not a diagnostic", "    if (ppu_fm_count) ppu_fm_diag = 1;\n", ""),
+    ("counter counts with the switch off", "    if (!ppu_fm_count) return;\n", ""),
+    ("line too early", "    if (now - last < frequency) return;", "    if (now - last < frequency / 2) return;"),
+    ("period changed", "#define PPU_FM_COUNT_PERIOD 16384", "#define PPU_FM_COUNT_PERIOD 32768"),
+    ("slot of a thread not kept", "        ppu_fm_count_slot = s;\n", ""),
+    ("thread line without delta", "            line[k] = now - ppu_fm_count_prev[s][k];", "            line[k] = now;"),
+    ("all line without sum", "            all[k] += line[k];\n", ""),
+    ("thread line without calls", "        if (!any) continue;", ""),
+    ("sequence number not increased", "    const uint32_t seq = ppu_fm_count_seq++;",
+     "    const uint32_t seq = ppu_fm_count_seq;"),
+    ("first second does not start", "    if (last == 0) {", "    if (1) {"),
 ]
 
 READ_SYNC = r'''
@@ -91,6 +113,15 @@ volatile int g_spu_coh_armed = 0;
 unsigned char g_spu_coh_bitmap[PPU_FM_COH_BITMAP_BYTES];
 static int slow_reads, slow_writes, fires, refpolls;
 static std::map<std::string, std::string> environment;
+/* ---- authored clock, thread ids and output of the PPU_FM_COUNT counter ---- */
+static uint64_t fake_now = 5, fake_guest = 0x1001u;
+static unsigned long fake_tid = 11;
+static std::string fake_lines;
+uint64_t ppu_fm_count_now(void) { return fake_now; }
+uint64_t ppu_fm_count_frequency(void) { return 1000000u; }
+unsigned long ppu_fm_count_host_tid(void) { return fake_tid; }
+uint64_t ppu_fm_count_guest_tid(void) { return fake_guest; }
+void ppu_fm_count_emit(const char* line) { fake_lines += line; }
 
 extern "C" {
 uint32_t sysmem_spu_alias_fixup(uint32_t ea) { return ea; }
@@ -155,6 +186,53 @@ static int fail(const char* what, int value, int expected)
     printf("%s=%d expected=%d\n", what, value, expected);
     return 1;
 }
+
+static int fail_lines(const char* what)
+{
+    printf("%s: got\n%s", what, fake_lines.c_str());
+    return 1;
+}
+
+/* The columns of a line, authored here. */
+static std::string columns(int r8, int r16, int r32, int r64, int w8, int w16, int w32, int w64)
+{
+    char text[256];
+    snprintf(text, sizeof text,
+             "read8=%d read16=%d read32=%d read64=%d write8=%d write16=%d write32=%d write64=%d calls=%d\n",
+             r8, r16, r32, r64, w8, w16, w32, w64, r8 + r16 + r32 + r64 + w8 + w16 + w32 + w64);
+    return text;
+}
+
+static std::string thread_line(int seq, int slot, unsigned long tid, uint64_t guest, const char* tail)
+{
+    char head[160];
+    snprintf(head, sizeof head, "[PPU_FM_COUNT] seq=%d scope=thread slot=%d tid=%lu guest=%llu ",
+             seq, slot, tid, (unsigned long long)guest);
+    return std::string(head) + tail;
+}
+
+static std::string all_line(int seq, uint64_t start, uint64_t end, const char* tail)
+{
+    char head[200];
+    snprintf(head, sizeof head, "[PPU_FM_COUNT] seq=%d scope=all start=%llu end=%llu frequency=%llu ",
+             seq, (unsigned long long)start, (unsigned long long)end, 1000000ull);
+    return std::string(head) + tail;
+}
+
+static void count_calls(int r8, int r16, int r32, int r64, int w8, int w16, int w32, int w64)
+{
+    for (int i = 0; i < r8; i++)  (void)ppu_fm_read8(EA);
+    for (int i = 0; i < r16; i++) (void)ppu_fm_read16(EA);
+    for (int i = 0; i < r32; i++) (void)ppu_fm_read32(EA);
+    for (int i = 0; i < r64; i++) (void)ppu_fm_read64(EA);
+    for (int i = 0; i < w8; i++)  ppu_fm_write8(EA, 1);
+    for (int i = 0; i < w16; i++) ppu_fm_write16(EA, 1);
+    for (int i = 0; i < w32; i++) ppu_fm_write32(EA, 1);
+    for (int i = 0; i < w64; i++) ppu_fm_write64(EA, 1);
+}
+
+/* The period of the clock read, authored here. */
+static const int PERIOD = 16384;
 
 int main(int argc, char** argv)
 {
@@ -242,6 +320,69 @@ int main(int argc, char** argv)
         environment.clear(); environment["PPU_FM"] = "0";
         ppu_fm_arm();
         if (ppu_fm_diag != 1 || ppu_fm_spin_det != 1) return fail("kill_switch", ppu_fm_diag, 1);
+    } else if (!strcmp(mode, "count")) {
+        /* With the switch off nothing is counted, also not on the diagnostic path. */
+        ppu_fm_diag = 1;
+        (void)ppu_fm_read32(EA);
+        if (ppu_fm_count_slots[0].used) return fail("counted_when_off", 1, 0);
+        /* Absent or 0 is off. Any other value is on, and arms the diagnostic family. */
+        const char* values[] = {"0", "", "1", 0};
+        static const int armed[] = {0, 1, 1};
+        for (int i = 0; i < 3; i++) {
+            ppu_fm_diag = 0; ppu_fm_count = 0; fake_lines.clear();
+            environment.clear();
+            environment["PPU_FM_COUNT"] = values[i];
+            ppu_fm_arm();
+            if (ppu_fm_count != (uint32_t)armed[i] || ppu_fm_diag != (uint32_t)armed[i])
+                return fail("switch", i, armed[i]);
+            if (armed[i] ? fake_lines != "[PPU_FM_COUNT] on\n" : !fake_lines.empty())
+                return fail_lines("on_line");
+        }
+        environment.clear();
+        ppu_fm_diag = 0; ppu_fm_count = 0;
+        ppu_fm_arm();
+        if (ppu_fm_count || ppu_fm_diag) return fail("switch_absent", (int)ppu_fm_count, 0);
+        /* Armed. Every accessor gives its call to the family and is counted in its column. */
+        environment["PPU_FM_COUNT"] = "1";
+        ppu_fm_count_slot = -1; fake_lines.clear();
+        fake_now = 5; fake_tid = 11; fake_guest = 0x1001u;
+        ppu_fm_arm();
+        fake_lines.clear();              /* the on line is checked above */
+        slow_reads = slow_writes = 0;
+        count_calls(1, 2, 3, 4, 5, 6, 7, 8);
+        if (slow_reads != 10 || slow_writes != 26) return fail("count_delegates", slow_reads, 10);
+        ppu_fm_count_tick();             /* the first clock read starts the first second */
+        if (!fake_lines.empty()) return fail_lines("line_at_start");
+        fake_now += 1000000u;            /* one second */
+        ppu_fm_count_tick();
+        std::string expected = thread_line(0, 0, 11, 0x1001u, columns(1, 2, 3, 4, 5, 6, 7, 8).c_str()) +
+                               all_line(0, 5, 1000005u, columns(1, 2, 3, 4, 5, 6, 7, 8).c_str());
+        if (fake_lines != expected) return fail_lines("first_second");
+        /* A second thread takes slot 1. The slot is thread-local, so the test
+         * starts the thread by hand. The first thread has no calls in this
+         * second, so it has no line. */
+        fake_lines.clear();
+        ppu_fm_count_slot = -1; fake_tid = 12; fake_guest = 0;
+        count_calls(0, 0, 0, 1, 1, 0, 0, 0);
+        fake_now += 1000000u;
+        ppu_fm_count_tick();
+        expected = thread_line(1, 1, 12, 0, columns(0, 0, 0, 1, 1, 0, 0, 0).c_str()) +
+                   all_line(1, 1000005u, 2000005u, columns(0, 0, 0, 1, 1, 0, 0, 0).c_str());
+        if (fake_lines != expected) return fail_lines("second_second");
+        /* Less than one second since the last line: no line. */
+        fake_lines.clear();
+        fake_now += 999999u;
+        ppu_fm_count_tick();
+        if (!fake_lines.empty()) return fail_lines("line_too_early");
+        /* The periodic path reads the clock at call PPU_FM_COUNT_PERIOD of a
+         * thread. This thread has 2 calls. */
+        fake_now += 1;                   /* one second since the last line */
+        count_calls(0, 0, PERIOD - 3, 0, 0, 0, 0, 0);
+        if (!fake_lines.empty()) return fail_lines("line_before_period");
+        (void)ppu_fm_read32(EA);
+        expected = thread_line(2, 1, 12, 0, columns(0, 0, PERIOD - 2, 0, 0, 0, 0, 0).c_str()) +
+                   all_line(2, 2000005u, 3000005u, columns(0, 0, PERIOD - 2, 0, 0, 0, 0, 0).c_str());
+        if (fake_lines != expected) return fail_lines("periodic_second");
     } else if (!strcmp(mode, "agree")) {
         return 0;
     } else {
@@ -346,7 +487,7 @@ def run(exe):
 
 
 def verify(work):
-    for mode in ("spin_on", "spin_off", "store", "diag", "refpoll", "arm"):
+    for mode in ("spin_on", "spin_off", "store", "diag", "refpoll", "arm", "count"):
         result = subprocess.run([str(work / ("fixture" + EXE)), mode], capture_output=True, text=True,
                                 errors="replace", timeout=120)
         assert result.returncode == 0 and not result.stdout, (mode, result.returncode, result.stdout, result.stderr)

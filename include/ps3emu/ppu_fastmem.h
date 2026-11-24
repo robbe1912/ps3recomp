@@ -26,6 +26,11 @@
  * starving the render pump. Its fire half is out-of-line (ppu_fm_hotread*).
  * ppu_fm_spin_det turns the detector off; it is set once at boot.
  *
+ * PPU_FM_COUNT (opt-in, off by default) counts the calls of each accessor per
+ * second and per host thread. With it every access takes the out-of-line
+ * family through one ppu_fm_counted_* function per accessor. The default
+ * path has no code of the counter.
+ *
  * The lifted sources cannot be edited, so the per-game ppu_recomp.h redirects
  * the accessor NAMES to these inline bodies after including this header:
  *
@@ -100,6 +105,14 @@
 #  endif
 #endif
 
+/* A static inline function of this header that must stay out of line in the
+ * lifted code: one copy per unit, no code at the call sites. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define PPU_FM_NOINLINE __attribute__((noinline))
+#else
+#  define PPU_FM_NOINLINE __declspec(noinline)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -137,6 +150,21 @@ extern volatile uint32_t ppu_fm_spin_det;
  * PPU_FM_SPINDET=0 turns the hot-spin detector off.
  * Defined in ppu_loader.cpp. */
 void ppu_fm_arm(void);
+
+/* PPU_FM_COUNT: opt-in call counter of the accessors. ppu_fm_arm sets the
+ * switch. The diagnostic delegation of each accessor then goes through one
+ * ppu_fm_counted_* function, which counts the call and gives it to the
+ * out-of-line family. The lines go to stderr; see ppu_loader.cpp. */
+#define PPU_FM_C_READ8   0
+#define PPU_FM_C_READ16  1
+#define PPU_FM_C_READ32  2
+#define PPU_FM_C_READ64  3
+#define PPU_FM_C_WRITE8  4
+#define PPU_FM_C_WRITE16 5
+#define PPU_FM_C_WRITE32 6
+#define PPU_FM_C_WRITE64 7
+#define PPU_FM_C_COUNT   8   /* number of columns, then the total */
+extern void ppu_fm_count_hit(unsigned accessor);
 
 /* Skip-freeze barrier probe window (debug tool, set by hand at runtime).
  * volatile: flipped while the game runs. */
@@ -235,11 +263,62 @@ static __inline int ppu_fm_oob(uint32_t ea, uint32_t n)
         } else { fm_last = (uint32_t)(ea); fm_n = 0; }                     \
     } while (0)
 
+/* PPU_FM_COUNT. The diagnostic delegation of each accessor goes through one
+ * function that stays out of line: the counter is then not in the default
+ * path and not in the lifted code. */
+static __inline PPU_FM_NOINLINE uint8_t ppu_fm_counted_read8(uint64_t a)
+{
+    ppu_fm_count_hit(PPU_FM_C_READ8);
+    return vm_read8(a);
+}
+
+static __inline PPU_FM_NOINLINE uint16_t ppu_fm_counted_read16(uint64_t a)
+{
+    ppu_fm_count_hit(PPU_FM_C_READ16);
+    return vm_read16(a);
+}
+
+static __inline PPU_FM_NOINLINE uint32_t ppu_fm_counted_read32(uint64_t a)
+{
+    ppu_fm_count_hit(PPU_FM_C_READ32);
+    return vm_read32(a);
+}
+
+static __inline PPU_FM_NOINLINE uint64_t ppu_fm_counted_read64(uint64_t a)
+{
+    ppu_fm_count_hit(PPU_FM_C_READ64);
+    return vm_read64(a);
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_counted_write8(uint64_t a, uint8_t v)
+{
+    ppu_fm_count_hit(PPU_FM_C_WRITE8);
+    vm_write8(a, v);
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_counted_write16(uint64_t a, uint16_t v)
+{
+    ppu_fm_count_hit(PPU_FM_C_WRITE16);
+    vm_write16(a, v);
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_counted_write32(uint64_t a, uint32_t v)
+{
+    ppu_fm_count_hit(PPU_FM_C_WRITE32);
+    vm_write32(a, v);
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_counted_write64(uint64_t a, uint64_t v)
+{
+    ppu_fm_count_hit(PPU_FM_C_WRITE64);
+    vm_write64(a, v);
+}
+
 static __inline uint8_t ppu_fm_read8(uint64_t a)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 1))) return vm_read8(a);
-    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return vm_read8(a);
+    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return ppu_fm_counted_read8(a);
     if (PPU_FM_UNLIKELY(ea < 0x10000u))     return vm_read8(a); /* null-read report */
     vm_cpu_read_sync(ea, 1);
     PPU_FM_SPIN_DET(ea, ppu_fm_hotread8(ea, PPU_FM_RA()));
@@ -250,7 +329,7 @@ static __inline uint16_t ppu_fm_read16(uint64_t a)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 2))) return vm_read16(a);
-    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return vm_read16(a);
+    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return ppu_fm_counted_read16(a);
     vm_cpu_read_sync(ea, 2);
     uint16_t v = PPU_FM_LD16(vm_base + ea);
     PPU_FM_SPIN_DET(ea, ppu_fm_hotread16(ea, PPU_FM_RA()));
@@ -261,7 +340,7 @@ static __inline uint32_t ppu_fm_read32(uint64_t a)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 4))) return vm_read32(a);
-    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return vm_read32(a);
+    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return ppu_fm_counted_read32(a);
     if (PPU_FM_UNLIKELY(ea < 0x10000u))     return vm_read32(a); /* null-read report */
     /* Raw SPU problem state: outbound-mailbox reads POP, so they cannot be
      * served from memory. Delegate the whole access. */
@@ -278,7 +357,7 @@ static __inline uint64_t ppu_fm_read64(uint64_t a)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 8))) return vm_read64(a);
-    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return vm_read64(a);
+    if (PPU_FM_UNLIKELY(ppu_fm_diag))       return ppu_fm_counted_read64(a);
     if (PPU_FM_UNLIKELY(ea < 0x10000u))     return vm_read64(a); /* null-read report */
     vm_cpu_read_sync(ea, 8);
     uint64_t v = PPU_FM_LD64(vm_base + ea);
@@ -290,7 +369,7 @@ static __inline void ppu_fm_write8(uint64_t a, uint8_t v)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 1))) { vm_write8(a, v); return; }
-    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { vm_write8(a, v); return; }
+    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { ppu_fm_counted_write8(a, v); return; }
     if (PPU_FM_UNLIKELY(ea < 0x1000u)) { vm_write8(a, v); return; } /* null-store report/drop */
     if (PPU_FM_UNLIKELY(g_spu_coh_armed && spu_coh_bitmap_test(ea))) {
         vm_write8(a, v); return;    /* locked-line path */
@@ -302,7 +381,7 @@ static __inline void ppu_fm_write16(uint64_t a, uint16_t v)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 2))) { vm_write16(a, v); return; }
-    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { vm_write16(a, v); return; }
+    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { ppu_fm_counted_write16(a, v); return; }
     if (PPU_FM_UNLIKELY(ea < 0x1000u)) { vm_write16(a, v); return; }
     if (PPU_FM_UNLIKELY(g_spu_coh_armed && spu_coh_bitmap_test(ea))) {
         vm_write16(a, v); return;
@@ -315,7 +394,7 @@ static __inline void ppu_fm_write32(uint64_t a, uint32_t v)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 4))) { vm_write32(a, v); return; }
-    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { vm_write32(a, v); return; }
+    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { ppu_fm_counted_write32(a, v); return; }
     if (PPU_FM_UNLIKELY(ea < 0x1000u)) { vm_write32(a, v); return; }
     /* Raw SPU problem state: run control / mailboxes / signal notify have
      * store side effects. Delegate so the plain store + side effect keep the
@@ -332,7 +411,7 @@ static __inline void ppu_fm_write64(uint64_t a, uint64_t v)
 {
     uint32_t ea = ppu_fm_alias(a);
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 8))) { vm_write64(a, v); return; }
-    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { vm_write64(a, v); return; }
+    if (PPU_FM_UNLIKELY(ppu_fm_diag || g_barrier_sync_watch)) { ppu_fm_counted_write64(a, v); return; }
     if (PPU_FM_UNLIKELY(ea < 0x1000u)) { vm_write64(a, v); return; }
     if (PPU_FM_UNLIKELY(g_spu_coh_armed && spu_coh_bitmap_test(ea))) {
         vm_write64(a, v); return;

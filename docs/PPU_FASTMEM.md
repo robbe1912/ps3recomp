@@ -18,6 +18,8 @@ the code.
 - The out-of-line family of the fork (`vm_read*`, `vm_write*` in
   `runtime/ppu/ppu_loader.cpp`) has its own detectors and prints. It does not
   call the fire halves `ppu_fm_hotread*`. The game family calls them.
+- `runtime/ppu/ppu_loader.cpp` defines `g_barrier_sync_watch` as `volatile`,
+  as the game tree does. The header declares it `volatile`.
 
 ## Rules for callers
 
@@ -33,6 +35,9 @@ the code.
   does.
 - `ppu_fm_arm()` must run after the host set `ppu_vm_size`. The header reads
   `ppu_vm_size` on each access.
+- `PPU_FM_COUNT` in the environment turns the call counter on. Only the exact
+  value `0` keeps it off. The counter is a diagnostic: it sets `ppu_fm_diag`
+  to 1, so each access takes the out-of-line family.
 
 ## Layout
 
@@ -51,6 +56,29 @@ the code.
 - The store paths test the reserved-line bitmap inline. A reserved line goes
   to `vm_writeN`, which has the locked-line path.
 
+## Counter
+
+`PPU_FM_COUNT` prints lines to stderr. `ppu_fm_arm()` prints
+`[PPU_FM_COUNT] on` one time. Then each second with calls has one line for
+each thread with calls, then one line with the sum:
+
+```
+[PPU_FM_COUNT] seq=7 scope=thread slot=0 tid=4124 guest=3 read8=12 read16=0 read32=8061 read64=40 write8=0 write16=8 write32=731 write64=0 calls=8152
+[PPU_FM_COUNT] seq=7 scope=all start=90123456789 end=91123456789 frequency=10000000 read8=12 read16=0 read32=8061 read64=40 write8=0 write16=8 write32=731 write64=0 calls=8152
+```
+
+- The numbers are calls of the accessors, not guest instructions.
+- `tid` is the host thread id. The `[thr]` lines of the log give its name.
+  `guest` is the guest thread id of the context of the thread, or 0.
+- The first 31 threads have a slot of their own. All other threads share the
+  last slot.
+- A thread reads the clock at each 16384th call of that thread. The first
+  thread that sees one second or more since the last line prints the lines.
+  A second without calls has no line.
+- `start` and `end` are clock ticks. The clock is `QueryPerformanceCounter`
+  on Windows and `CLOCK_MONOTONIC` elsewhere.
+- The default path of each accessor has no code of the counter.
+
 ## Check
 
 ```
@@ -59,17 +87,24 @@ python tests/check_ppu_fastmem_diet.py
 
 The script needs clang-cl on Windows, or clang, gcc or cc with their C++
 drivers elsewhere. Set `MV_CLANG` or `CC` to select a compiler. It compiles
-the production header and the production `ppu_fm_arm` text with authored
-stubs. No game input. No performance claim.
+the production header and the production `ppu_fm_arm` text with the counter
+of the production `ppu_loader.cpp` with authored stubs and an authored clock.
+No game input. No performance claim.
 
 Mutants that the script rejects:
 
-- header (11): detector switch test removed or inverted; threshold changed;
+- header (26): detector switch test removed or inverted; threshold changed;
   equal changed to not equal; armed test removed; bitmap test inverted; line
   shift changed; bit mask changed; byte index changed; read test of
-  `ppu_fm_diag` removed; write test of `ppu_fm_diag` removed.
-- loader (4): the parse of `PPU_FM_SPINDET` accepts `00`, is removed, or
-  accepts a leading zero word; the detector is off by default.
+  `ppu_fm_diag` removed; write test of `ppu_fm_diag` removed; count removed
+  for each of the 8 accessors; the count of one accessor under the next.
+- loader (16): the parse of `PPU_FM_SPINDET` accepts `00`, is removed, or
+  accepts a leading zero word; the detector is off by default; the counter is
+  not armed, is on for `PPU_FM_COUNT=0`, or does not arm the diagnostic
+  family; it counts with the switch off; a line comes too early; the period
+  changed; a thread does not keep its slot; a thread line has no delta; the
+  sum line has no sum; a thread line without calls; the sequence number does
+  not increase; the first second does not start.
 
 Run here on Windows with clang-cl, and on Linux with GCC 13 in a container.
 clang on Linux and macOS, and the compilers of the CI hosts, are not run.
