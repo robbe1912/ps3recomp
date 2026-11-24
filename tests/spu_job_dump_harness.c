@@ -9,12 +9,35 @@
  * The harness prints "spu_job_dump: PASS <mode>". The check script reads the
  * files and compares them with the scenario below.
  */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The record buffer of the dump starts dirty, as in a debug CRT build (new
+ * heap memory is 0xCD there). The reader then sees whether the writer zeroes
+ * every reserved byte of a record. The buffer of a slot is never freed. */
+static void* jd_test_realloc(void* p, size_t n)
+{
+    unsigned char* base = p ? (unsigned char*)p - 16 : NULL;
+    size_t old = base ? *(size_t*)base : 0;
+    unsigned char* grown = (unsigned char*)malloc(n + 16);
+    if (!grown) return NULL;
+    *(size_t*)grown = n;
+    memset(grown + 16, 0xCD, n);
+    if (base) {
+        memcpy(grown + 16, p, old < n ? old : n);
+        free(base);
+    }
+    return grown + 16;
+}
+#define realloc jd_test_realloc
 #include "spu_context.h"
 #include "spu_native_owned.h"
 #ifdef JD_REAL_DMA
 #include "spu_dma.h"
 #endif
 #include "spu_job_dump.inc"
+#undef realloc
 
 #include <stdio.h>
 #include <stdlib.h>

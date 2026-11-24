@@ -478,7 +478,7 @@ static void jd_append_dma(jd_slot* s, const spu_context* ctx, uint32_t lsa,
     jd_put32(p + JD_REC_HEAD + 36, flags);
     jd_put64(p + JD_REC_HEAD + 40, jd_now_ns());
     jd_put32(p + JD_REC_HEAD + 48, s->dma_n);
-    jd_put32(p + JD_REC_HEAD + 52, 0);
+    memset(p + JD_REC_HEAD + 52, 0, JD_DMA_HEAD - 52);
     if (!flags) {
         p += JD_REC_HEAD + JD_DMA_HEAD;
         memcpy(p, bytes, size);
