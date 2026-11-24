@@ -3593,6 +3593,7 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
  * one offset), which sidesteps guessing the surface's context DMA location. */
 #define CPU_SURFACE_CAPACITY MAX_OFF_RTS
 #include "rsx_cpu_surface.inc"
+#include "rsx_deform_surface.inc"
 
 #include "rsx_surface_samples.h"
 
@@ -5777,6 +5778,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
         cpu_surface_capture(dr);
             memcpy(dr->cc, cc, sizeof(cc));
+            rsx_deform_capture(dr, 0, 0, 0);
         }
         return;
     }
@@ -6695,6 +6697,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
                 dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
         cpu_surface_capture(dr);
+                rsx_deform_capture(dr, first, count, 0);
                 if (s_d3d.current_rsx_state) {
                     dr->vp_x = s_d3d.current_rsx_state->viewport_x;
                     dr->vp_y = s_d3d.current_rsx_state->viewport_y;
@@ -6796,6 +6799,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
         cpu_surface_capture(dr);
+            rsx_deform_capture(dr, first, count, 0);
             if (s_d3d.current_rsx_state) {
                 dr->vp_x = s_d3d.current_rsx_state->viewport_x;
                 dr->vp_y = s_d3d.current_rsx_state->viewport_y;
@@ -6926,6 +6930,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
         dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
         cpu_surface_capture(dr);
+        rsx_deform_capture(dr, first, count, 1);
         if (s_d3d.current_rsx_state) {
             dr->vp_x = s_d3d.current_rsx_state->viewport_x;
             dr->vp_y = s_d3d.current_rsx_state->viewport_y;
