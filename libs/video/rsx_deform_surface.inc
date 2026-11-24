@@ -695,7 +695,7 @@ static RsxDeformSurface* deform_surface_get(const D3D12DrawRecord* dr)
 typedef struct {
     u64 key;             /* the texture words the brush was decoded from             */
     u32 width, height;
-    u8* rgba;            /* width * height * 4 bytes: the decoded base level         */
+    u8* bytes;           /* width * height bytes: blue of each texel, as B8 is stored */
     u32 wrap_s, wrap_t;  /* address mode: 1 wrap, 2 mirror, 3 clamp, 4 border, 6 once */
     int linear;
 } DeformBrush;
@@ -745,7 +745,7 @@ static u32 deform_brush_texel(const DeformBrush* b, int x, int y)
         || (b->wrap_t == 4 && (y < 0 || y >= (int)b->height))) return 0;
     x = deform_wrap(x, b->width, b->wrap_s);
     y = deform_wrap(y, b->height, b->wrap_t);
-    return b->rgba[((size_t)y * b->width + (size_t)x) * 4 + 2];
+    return b->bytes[(size_t)y * b->width + (size_t)x];
 }
 
 /* Blue of the brush at texture coordinates (u, v), 0..255. */
@@ -780,15 +780,15 @@ static const DeformBrush* deform_brush_get(const rsx_texture_state* t)
     else if (b->key != key) {
         rsx_tex_layout layout;
         rsx_texture_layout_pitched(format, width, height, t->control3 & 0xFFFFFu, &layout);
-        if (layout.compressed || !layout.bytes_per_texel) return NULL;
+        if (layout.compressed || layout.bytes_per_texel != 1 || layout.dst_bytes_per_texel != 1) return NULL;
         u32 address = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
-        u8* rgba = (u8*)malloc((size_t)width * height * 4);
-        if (!rgba) return NULL;
-        memset(rgba, 0, (size_t)width * height * 4);
-        rsx_texture_decode(rgba, width * 4, vm_base + address, width, height, &layout,
+        u8* bytes = (u8*)malloc((size_t)width * height);
+        if (!bytes) return NULL;
+        memset(bytes, 0, (size_t)width * height);
+        rsx_texture_decode(bytes, width, vm_base + address, width, height, &layout,
                            rsx_texture_argb_is_rgba());
-        free(b->rgba);
-        b->rgba = rgba;
+        free(b->bytes);
+        b->bytes = bytes;
         b->key = key;
         b->width = width;
         b->height = height;
