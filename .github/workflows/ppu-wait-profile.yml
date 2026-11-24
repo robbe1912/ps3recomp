@@ -1,0 +1,20 @@
+name: PPU wait profile
+on:
+  workflow_dispatch:
+  push:
+    branches: [combined, codex/frame60-ppu-wait-profile]
+  pull_request:
+jobs:
+  profile:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - run: python tests/check_ppu_wait_profile.py

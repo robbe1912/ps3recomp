@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "ppu_wait_profile.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -328,7 +329,9 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    PPU_WAIT_PROFILE_BEGIN(ctx, "semaphore_wait", LV2_ARG_U32(ctx, 0));
     int64_t r = sys_semaphore_wait_impl(ctx);
+    ppu_wait_profile_end();
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (n++ < 12)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",

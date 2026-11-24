@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "ppu_wait_profile.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -286,7 +287,7 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
-int64_t sys_event_queue_receive(ppu_context* ctx)
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -605,6 +606,15 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     } }
 
     return CELL_OK;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "event_queue_receive", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_event_queue_receive_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
 }
 
 int64_t sys_event_queue_tryreceive(ppu_context* ctx)
@@ -1117,7 +1127,7 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * r6 = pointer to receive result pattern (u64*)
  * r7 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
-int64_t sys_event_flag_wait(ppu_context* ctx)
+static int64_t sys_event_flag_wait_impl(ppu_context* ctx)
 {
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
@@ -1312,6 +1322,15 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_event_flag_wait(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "event_flag_wait", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_event_flag_wait_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
 }
 
 int64_t sys_event_flag_trywait(ppu_context* ctx)

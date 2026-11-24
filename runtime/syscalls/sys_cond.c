@@ -6,6 +6,7 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "ppu_wait_profile.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -118,7 +119,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     return result;
 }
 
-int64_t sys_cond_wait(ppu_context* ctx)
+static int64_t sys_cond_wait_impl(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
@@ -198,6 +199,15 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    return result;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_cond_wait(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "cond_wait", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_cond_wait_impl(ctx);
+    ppu_wait_profile_end();
     return result;
 }
 

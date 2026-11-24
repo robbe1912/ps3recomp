@@ -3,6 +3,7 @@
  */
 
 #include "sys_mutex.h"
+#include "ppu_wait_profile.h"
 #include "../platform/darwin_compat.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -177,7 +178,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
  * r3 = mutex_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
-int64_t sys_mutex_lock(ppu_context* ctx)
+static int64_t sys_mutex_lock_impl(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
@@ -238,6 +239,15 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     m->owner_tid = caller_tid;
     m->lock_count++;
     return CELL_OK;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_mutex_lock(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "mutex_lock", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_mutex_lock_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
 }
 
 /* ---------------------------------------------------------------------------
