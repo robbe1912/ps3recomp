@@ -146,6 +146,7 @@ static __attribute__((always_inline)) inline __m128i name(__m128i a, __m128i b) 
 }
 SPU_SF_FAST_OP(spu_sf_fast_add, "addps")
 SPU_SF_FAST_OP(spu_sf_fast_sub, "subps")
+SPU_SF_FAST_OP(spu_sf_fast_mul, "mulps")
 /* The lanes that must take the earlier path: an input with exponent field 255, or
  * a result of 2^127 and above. */
 static __attribute__((always_inline)) inline __m128i spu_sf_fast_bad(__m128i value, int is_result) {
@@ -161,7 +162,7 @@ static __attribute__((always_inline)) inline int spu_sf_fast_binary(uint32_t *ou
     if (!spu_sf_fast_mode()) return 0;
     __m128i av = _mm_loadu_si128((const __m128i *)a), bv = _mm_loadu_si128((const __m128i *)b);
     __m128i bad = _mm_or_si128(spu_sf_fast_bad(av, 0), spu_sf_fast_bad(bv, 0));
-    av = operation == 1 ? spu_sf_fast_sub(av, bv) : spu_sf_fast_add(av, bv);
+    av = operation == 2 ? spu_sf_fast_mul(av, bv) : operation == 1 ? spu_sf_fast_sub(av, bv) : spu_sf_fast_add(av, bv);
     bad = _mm_or_si128(bad, spu_sf_fast_bad(av, 1));
     if (_mm_movemask_epi8(bad)) return 0;
     _mm_storeu_si128((__m128i *)out, av);
