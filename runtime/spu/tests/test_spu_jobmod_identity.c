@@ -72,6 +72,18 @@ int main(int argc, char** argv)
     CHECK(stage_header_span(header, 0x4000, sizeof header) == 0);
     put_be32(header + 0x14, 0x40000);
     CHECK(stage_header_span(header, 0x4000, sizeof header) == 0);
+    /* Kind of a burst that holds at least 0x30 bytes. */
+    put_be32(header + 0x14, 0x1020);
+    CHECK(stage_burst_kind(header, 0x4000, 0) == STAGE_SPAN_LEGACY);
+    CHECK(stage_burst_kind(header, 0x4000, 1) == 0x1000);
+    CHECK(stage_burst_kind(header, 0x8000, 1) == STAGE_SPAN_LEGACY);
+    put_be32(header + 0x20, 0xC0DEC0DF);
+    CHECK(stage_burst_kind(header, 0x4000, 1) == STAGE_SPAN_DATA);
+    CHECK(stage_burst_kind(header, 0x4000, 0) == STAGE_SPAN_LEGACY);
+    put_be32(header + 0x20, 0xC0DEC0DE);
+    put_be32(header + 0x14, 0x800);
+    CHECK(stage_burst_kind(header, 0x4000, 1) == STAGE_SPAN_LEGACY);
+    CHECK(STAGE_SPAN_PENDING > 0x3E000u && STAGE_SPAN_DATA > 0x3E000u);
 #ifdef _WIN32
     CHECK(_putenv_s("SPU_JOBMOD_HEADER_FNV", "1") == 0);
     HANDLE threads[WORKERS];

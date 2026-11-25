@@ -13,6 +13,9 @@ OUT = ROOT / 'build/spu-jobmod-identity-tests'
 MUTANTS = {
     'shared-selector': ('static SPU_JOBMOD_THREAD_LOCAL int', 'static int'),
     'shared-log-counter': ('static SPU_JOBMOD_THREAD_LOCAL unsigned', 'static unsigned'),
+    'data-kind-lost': ('    if (stage_be32(base + 0x20) != 0xC0DEC0DEu) return STAGE_SPAN_DATA;\n', ''),
+    'kind-ignores-mode': ('    if (!header_identity) return STAGE_SPAN_LEGACY;\n', ''),
+    'kind-ignores-magic': ('!= 0xC0DEC0DEu) return STAGE_SPAN_DATA;', '== 0u) return STAGE_SPAN_DATA;'),
 }
 
 
