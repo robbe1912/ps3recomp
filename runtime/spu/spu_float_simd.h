@@ -88,28 +88,27 @@ static inline int spu_sf_simd_binary(uint32_t *out,const uint32_t *a,
  *  - a scope is active, so the masks are those of the scope;
  *  - a probe of the host mode proves rounding toward zero, FTZ and DAZ. The probe
  *    replaces the MXCSR read of spu_sf_simd_binary;
- *  - no input lane has exponent field 255;
- *  - no result lane reaches 2^127 (the host overflow value lies there too).
+ *  - no result lane has exponent field 254 or 255 (2^127 and above), where the
+ *    host overflow value lies. An input with exponent field 255 gives a host
+ *    result with exponent field 255 (infinity or NaN), so the same test sends
+ *    these calls to the earlier path.
  * The operation is followed by "+ (+0)", which makes every zero result +0. The
  * SPU has one zero; the host keeps the sign of a zero sum and of a flushed result.
  * Every other call takes the earlier path, out of line.
  * The probe raises the underflow and inexact flags in every call in the mode
- * of a scope. A scope restores the MXCSR of its caller at leave. In a scope
- * whose MXCSR was changed from outside, the probe raises also the precision or
- * denormal flag; the values stay exact there.
- * The fused family needs FMA3 in the host. It calls spu_sf_fma3 out of line: clang
- * does not inline a target("fma") function into a unit compiled without FMA. */
+ * of a scope. A call that takes the earlier path after the operation can also
+ * raise the overflow or invalid flag. A scope restores the MXCSR of its caller
+ * at leave. In a scope whose MXCSR was changed from outside, the probe raises
+ * also the precision or denormal flag; the values stay exact there.
+ * The fused family needs FMA3 in the host, admitted by CPUID and XGETBV
+ * (scope == 2). The FMA3 instruction is inline assembly: a unit compiled
+ * without FMA cannot inline a function with a target attribute. */
 #if (defined(__clang__) || defined(__GNUC__)) && !defined(SPU_SCALAR_HELPERS) && !(defined(SPU_FLOAT_FAST) && !SPU_FLOAT_FAST)
 #define SPU_SF_FAST 1
 #else
 #define SPU_SF_FAST 0
 #endif
 #if SPU_SF_FAST
-#include <immintrin.h>
-#if defined(__clang__)
-#include <avxintrin.h>
-#include <fmaintrin.h>
-#endif
 typedef union { uint32_t u[4]; __m128i v; } spu_sf_vec4;
 /* The tables of the probe are volatile: the compiler executes the probe for
  * every call and does not move a probe operation out of its branch.
@@ -125,10 +124,10 @@ static const volatile spu_sf_vec4 spu_sf_probe_sum = { { 0x4e800000u, 0xce800000
  * branch of step A. Lanes: the smallest denormal, its negative, the smallest
  * denormal, 1. */
 static const volatile spu_sf_vec4 spu_sf_probe_mul = { { 0x00000001u, 0x80000001u, 0x00000001u, 0x3f800000u } };
-/* 1 when a scope is active and the host mode is the mode of a scope. The compares
- * are integer compares: a float compare of a denormal raises the denormal flag. */
-static __attribute__((always_inline)) inline int spu_sf_fast_mode(void) {
-    if (!g_spu_sf_simd_scope) return 0;
+/* 1 when the host mode is the mode of a scope. The compares are integer
+ * compares: a float compare of a denormal raises the denormal flag. Call it
+ * only inside a scope: step B raises the denormal flag without DAZ. */
+static __attribute__((always_inline)) inline int spu_sf_probe(void) {
     const __m128i input = spu_sf_probe_input.v;
     const __m128i sum = _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(input), _mm_castsi128_ps(spu_sf_probe_add.v)));
     if (_mm_movemask_epi8(_mm_cmpeq_epi32(sum, spu_sf_probe_sum.v)) != 0xffff) return 0;
@@ -147,53 +146,41 @@ static __attribute__((always_inline)) inline __m128i name(__m128i a, __m128i b) 
 SPU_SF_FAST_OP(spu_sf_fast_add, "addps")
 SPU_SF_FAST_OP(spu_sf_fast_sub, "subps")
 SPU_SF_FAST_OP(spu_sf_fast_mul, "mulps")
-/* The lanes that must take the earlier path: an input with exponent field 255, or
- * a result of 2^127 and above. */
-static __attribute__((always_inline)) inline __m128i spu_sf_fast_bad(__m128i value, int is_result) {
-    if (is_result)
-        return _mm_cmpgt_epi32(_mm_and_si128(value, _mm_set1_epi32(0x7fffffff)), _mm_set1_epi32(0x7effffff));
-    const __m128i exponent = _mm_set1_epi32(0x7f800000);
-    return _mm_cmpeq_epi32(_mm_and_si128(value, exponent), exponent);
+/* a*b + c with one rounding, then "+ (+0)". Same reason for inline assembly.
+ * AT&T operand order: destination last. The caller admitted FMA3 (scope == 2). */
+static __attribute__((always_inline)) inline __m128i spu_sf_fast_fma(__m128i a, __m128i b, __m128i c) {
+    __asm__ __volatile__("vfmadd213ps %[c], %[b], %[a]\n\taddps %[z], %[a]"
+                         : [a] "+x"(a) : [b] "x"(b), [c] "x"(c), [z] "x"(_mm_setzero_ps()));
+    return a;
+}
+/* The lanes that must take the earlier path: a result of 2^127 and above. */
+static __attribute__((always_inline)) inline __m128i spu_sf_fast_bad(__m128i result) {
+    return _mm_cmpgt_epi32(_mm_and_si128(result, _mm_set1_epi32(0x7fffffff)), _mm_set1_epi32(0x7effffff));
 }
 /* operation: 0 add, 1 subtract, 2 multiply. Returns 1 and stores the result when
  * the fast form applies. */
 static __attribute__((always_inline)) inline int spu_sf_fast_binary(uint32_t *out, const uint32_t *a,
                                                                    const uint32_t *b, int operation) {
-    if (!spu_sf_fast_mode()) return 0;
+    if (!g_spu_sf_simd_scope || !spu_sf_probe()) return 0;
     __m128i av = _mm_loadu_si128((const __m128i *)a), bv = _mm_loadu_si128((const __m128i *)b);
-    __m128i bad = _mm_or_si128(spu_sf_fast_bad(av, 0), spu_sf_fast_bad(bv, 0));
     av = operation == 2 ? spu_sf_fast_mul(av, bv) : operation == 1 ? spu_sf_fast_sub(av, bv) : spu_sf_fast_add(av, bv);
-    bad = _mm_or_si128(bad, spu_sf_fast_bad(av, 1));
-    if (_mm_movemask_epi8(bad)) return 0;
+    if (_mm_movemask_epi8(spu_sf_fast_bad(av))) return 0;
     _mm_storeu_si128((__m128i *)out, av);
     return 1;
 }
-/* Tests replace the FMA3 instruction to prove that no call reaches it without the
- * CPUID admission. */
-#ifndef SPU_SF_FMADD
-#define SPU_SF_FMADD(a, b, c) _mm_fmadd_ps((a), (b), (c))
-#endif
-#if defined(__GNUC__) && !defined(__clang__)
-__attribute__((optimize("rounding-math")))
-#endif
-__attribute__((target("fma")))
-static __attribute__((noinline)) __m128 spu_sf_fma3(__m128 a, __m128 b, __m128 c) {
-    return _mm_add_ps(SPU_SF_FMADD(a, b, c), _mm_setzero_ps());
-}
-/* (+-a*b) + (+-c) with one rounding. The caller admitted FMA3 (scope == 2). */
+/* (+-a*b) + (+-c) with one rounding. Returns 1 and stores the result when the
+ * fast form applies. The caller admitted FMA3 (scope == 2). */
 static __attribute__((always_inline)) inline int spu_sf_fast_fused(uint32_t *out, const uint32_t *a,
                                                                   const uint32_t *b, const uint32_t *c,
                                                                   uint32_t negate_product, uint32_t negate_c) {
-    if (g_spu_sf_simd_scope != 2 || !spu_sf_fast_mode()) return 0;
+    if (g_spu_sf_simd_scope != 2 || !spu_sf_probe()) return 0;
     const __m128i sign = _mm_set1_epi32((int)0x80000000u);
     __m128i av = _mm_loadu_si128((const __m128i *)a), bv = _mm_loadu_si128((const __m128i *)b),
             cv = _mm_loadu_si128((const __m128i *)c);
     if (negate_product) av = _mm_xor_si128(av, sign);
     if (negate_c) cv = _mm_xor_si128(cv, sign);
-    __m128i bad = _mm_or_si128(_mm_or_si128(spu_sf_fast_bad(av, 0), spu_sf_fast_bad(bv, 0)), spu_sf_fast_bad(cv, 0));
-    const __m128i r = _mm_castps_si128(spu_sf_fma3(_mm_castsi128_ps(av), _mm_castsi128_ps(bv), _mm_castsi128_ps(cv)));
-    bad = _mm_or_si128(bad, spu_sf_fast_bad(r, 1));
-    if (_mm_movemask_epi8(bad)) return 0;
+    const __m128i r = spu_sf_fast_fma(av, bv, cv);
+    if (_mm_movemask_epi8(spu_sf_fast_bad(r))) return 0;
     _mm_storeu_si128((__m128i *)out, r);
     return 1;
 }
