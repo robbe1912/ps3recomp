@@ -22,7 +22,7 @@
 #include "../spu_ea_alias.c"
 
 /* Readers query while registration appends under its internal writer lock. */
-_Static_assert(_Generic(&s_alias_page[0], _Atomic uint8_t*: 1, default: 0),
+_Static_assert(_Generic(&sysmem_spu_alias_page[0], _Atomic uint8_t*: 1, default: 0),
                "Publish alias-page answers with C11 atomics");
 _Static_assert(_Generic(&s_alias_n, _Atomic int*: 1, default: 0),
                "Publish initialized range entries with an atomic count");
@@ -50,7 +50,7 @@ static void reset(void)
     s_alias_n = 0;
     memset(s_alias, 0, sizeof s_alias);
     for (uint32_t page = 0; page < SPU_ALIAS_PAGES; page++)
-        atomic_store_explicit(&s_alias_page[page], 0, memory_order_relaxed);
+        atomic_store_explicit(&sysmem_spu_alias_page[page], 0, memory_order_relaxed);
 }
 
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
@@ -98,13 +98,13 @@ static void sweep(const char* layout, int record)
 static int count_state(int state)
 {
     int n = 0;
-    for (uint32_t p = 0; p < SPU_ALIAS_PAGES; p++) n += s_alias_page[p] == state;
+    for (uint32_t p = 0; p < SPU_ALIAS_PAGES; p++) n += sysmem_spu_alias_page[p] == state;
     return n;
 }
 
 static void expect_state(uint32_t ea, int state, const char* layout)
 {
-    int got = s_alias_page[(ea - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT];
+    int got = sysmem_spu_alias_page[(ea - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT];
     if (got != state) {
         fprintf(stderr, "FAIL %s: page of %08X is %d, want %d\n", layout, ea, got, state);
         exit(1);
@@ -322,7 +322,7 @@ int main(void)
             record(addr, size, "random");
         }
         int mixed = 0;
-        for (uint32_t p = 0; p < SPU_ALIAS_PAGES; p++) mixed += s_alias_page[p] == SPU_ALIAS_PAGE_MIXED;
+        for (uint32_t p = 0; p < SPU_ALIAS_PAGES; p++) mixed += sysmem_spu_alias_page[p] == SPU_ALIAS_PAGE_MIXED;
         s_mixed_pages += (unsigned)mixed;
     }
     printf("PASS %llu fixup answers equal the scan reference (%llu aliased; %llu mixed pages over the random layouts)\n",

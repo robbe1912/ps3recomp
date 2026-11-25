@@ -290,6 +290,21 @@ static __inline int spu_coh_bitmap_test(uint32_t addr)
 /* LV1 dual-mapping alias window normalize (rare: descriptors carrying
  * base|0x05000000 style VAs). */
 extern uint32_t  sysmem_spu_alias_fixup(uint32_t ea);
+#if PPU_FM3
+/* PPU_FM3: the page answer of each 4 KB page of the alias window, for the
+ * gate of the accessors. sysmem_spu_alias_fixup fills it
+ * (runtime/syscalls/spu_ea_alias.c). A byte is PPU_FM_ALIAS_IDENTITY,
+ * PPU_FM_ALIAS_ALIAS or PPU_FM_ALIAS_MIXED. The two trees must agree on
+ * the number of pages. */
+#define PPU_FM_ALIAS_LO       0x45000000u
+#define PPU_FM_ALIAS_HI       0x50000000u
+#define PPU_FM_ALIAS_DELTA    0x05000000u
+#define PPU_FM_ALIAS_PAGES    ((PPU_FM_ALIAS_HI - PPU_FM_ALIAS_LO) >> PPU_FM_PAGE_SHIFT)
+#define PPU_FM_ALIAS_IDENTITY 0u
+#define PPU_FM_ALIAS_ALIAS    1u
+#define PPU_FM_ALIAS_MIXED    2u
+extern volatile unsigned char sysmem_spu_alias_page[PPU_FM_ALIAS_PAGES];
+#endif
 
 /* ---- slow paths and fire helpers (runtime/ppu/ppu_loader.cpp) ---- */
 
@@ -358,6 +373,52 @@ static __inline int ppu_fm_is_refpoll_page(uint32_t e)
  * function. The flag bits that apply to the kind, and the page byte. */
 #define PPU_FM_SLOW(ea, kind, mask)                                        \
     ((ppu_fm_slow & (mask)) | (ppu_fm_kind[(ea) >> PPU_FM_PAGE_SHIFT] & (kind)))
+
+#if PPU_FM3
+/* PPU_FM3: the gate of an accessor on the flag word that it has read. Same
+ * two terms as PPU_FM_SLOW. */
+#define PPU_FM_GATE(flags, ea, kind, mask)                                   \
+    (((flags) & (mask)) | (ppu_fm_kind[(ea) >> PPU_FM_PAGE_SHIFT] & (kind)))
+
+/* The page answer of one page of the window. Acquire, as the load of the
+ * fixup. */
+static __inline unsigned char ppu_fm_alias_state(uint32_t ea)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (unsigned char)_InterlockedCompareExchange8(
+        (volatile char*)&sysmem_spu_alias_page[(ea - PPU_FM_ALIAS_LO) >> PPU_FM_PAGE_SHIFT], 0, 0);
+#else
+    return __atomic_load_n(&sysmem_spu_alias_page[(ea - PPU_FM_ALIAS_LO) >> PPU_FM_PAGE_SHIFT],
+                           __ATOMIC_ACQUIRE);
+#endif
+}
+
+/* Proofs that the inline answer needs none of the tests of the out-of-line
+ * function: the window and its primary image (EA - 0x05000000) hold no null
+ * address and no raw SPU problem-state register. */
+typedef char ppu_fm_alias_no_null[(PPU_FM_ALIAS_LO - PPU_FM_ALIAS_DELTA >= 0x10000u) ? 1 : -1];
+typedef char ppu_fm_alias_no_raw[(SPU_RAW_BASE >= PPU_FM_ALIAS_HI) ? 1 : -1];
+
+/* PPU_FM3: the alias answer of the gate. The access is on a page that the
+ * page table flags for the kind. Returns 1 and sets *ea to the address of
+ * the body when the access stays inline: IDENTITY keeps the EA, ALIAS gives
+ * the primary (EA - 0x05000000). Returns 0 when a flag bit of mask is set,
+ * when the page is outside the window, when the page is MIXED and when the
+ * access is out of bounds: the out-of-line function then makes the tests
+ * and the reports. n is the width of the access. */
+static __inline int ppu_fm_window(uint32_t flags, uint32_t mask, uint32_t n, uint32_t* ea)
+{
+    if (flags & mask) return 0;
+    uint32_t off = *ea - PPU_FM_ALIAS_LO;
+    if (PPU_FM_UNLIKELY(off >= PPU_FM_ALIAS_HI - PPU_FM_ALIAS_LO)) return 0;
+    unsigned char state = ppu_fm_alias_state(*ea);
+    uint32_t e = state == PPU_FM_ALIAS_ALIAS ? *ea - PPU_FM_ALIAS_DELTA : *ea;
+    if (state == PPU_FM_ALIAS_MIXED) return 0;
+    if (PPU_FM_UNLIKELY(ppu_fm_oob(e, n))) return 0;
+    *ea = e;
+    return 1;
+}
+#endif
 
 #if PPU_FM3
 /* PPU_FM3: the fire half of a read that the gate passes inline. Out of line,
@@ -599,15 +660,17 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
 /* ----------------------------------------------------------------------- */
 
 #if PPU_FM3
-/* PPU_FM3: the read accessors hold no label address. Clang 17 does not
- * inline a function that holds a label address and a live TLS access
- * (remark: "blockaddress used outside of callbr"). So each read accessor
- * of the other layout stays out of line, and each lifted read is a call.
- * Here the fire half takes the caller address in ppu_fm_fireN. */
+/* PPU_FM3: the read accessors hold no label address, so Clang inlines them
+ * into the lifted code. (Clang 17 does not inline a function that holds a
+ * label address and a live TLS access: "blockaddress used outside of
+ * callbr".) The gate gives the alias answer of a page of the window inline
+ * (ppu_fm_window). The fire half takes the caller address in ppu_fm_fireN. */
 static PPU_FM_FAST uint8_t ppu_fm_read8(uint64_t a)
 {
     uint32_t ea = (uint32_t)a;
-    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+    uint32_t flags = ppu_fm_slow;
+    if (PPU_FM_UNLIKELY(PPU_FM_GATE(flags, ea, PPU_FM_K_READ, PPU_FM_S_READ))
+        && !ppu_fm_window(flags, PPU_FM_S_READ, 1, &ea))
         return ppu_fm_read8_out(a);
     return ppu_fm_read8_body(ea, PPU_FM_RA3());
 }
@@ -615,7 +678,9 @@ static PPU_FM_FAST uint8_t ppu_fm_read8(uint64_t a)
 static PPU_FM_FAST uint16_t ppu_fm_read16(uint64_t a)
 {
     uint32_t ea = (uint32_t)a;
-    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+    uint32_t flags = ppu_fm_slow;
+    if (PPU_FM_UNLIKELY(PPU_FM_GATE(flags, ea, PPU_FM_K_READ, PPU_FM_S_READ))
+        && !ppu_fm_window(flags, PPU_FM_S_READ, 2, &ea))
         return ppu_fm_read16_out(a);
     return ppu_fm_read16_body(ea, PPU_FM_RA3());
 }
@@ -623,15 +688,23 @@ static PPU_FM_FAST uint16_t ppu_fm_read16(uint64_t a)
 static PPU_FM_FAST uint32_t ppu_fm_read32(uint64_t a)
 {
     uint32_t ea = (uint32_t)a;
-    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
-        return ppu_fm_read32_out(a);
+    uint32_t flags = ppu_fm_slow;
+    if (PPU_FM_UNLIKELY(PPU_FM_GATE(flags, ea, PPU_FM_K_READ, PPU_FM_S_READ))) {
+        if (!ppu_fm_window(flags, PPU_FM_S_READ, 4, &ea)) return ppu_fm_read32_out(a);
+        /* GCM_REFPOLL: the fence runs before this read, and only the
+         * out-of-line function has it. The page table flags the page of
+         * the address, so each access of that page goes there. */
+        if (PPU_FM_UNLIKELY(ea == ppu_hle_inject_base + 0x2008u)) return ppu_fm_read32_out(a);
+    }
     return ppu_fm_read32_body(ea, PPU_FM_RA3());
 }
 
 static PPU_FM_FAST uint64_t ppu_fm_read64(uint64_t a)
 {
     uint32_t ea = (uint32_t)a;
-    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+    uint32_t flags = ppu_fm_slow;
+    if (PPU_FM_UNLIKELY(PPU_FM_GATE(flags, ea, PPU_FM_K_READ, PPU_FM_S_READ))
+        && !ppu_fm_window(flags, PPU_FM_S_READ, 8, &ea))
         return ppu_fm_read64_out(a);
     return ppu_fm_read64_body(ea, PPU_FM_RA3());
 }
@@ -669,6 +742,29 @@ static PPU_FM_FAST uint64_t ppu_fm_read64(uint64_t a)
 }
 #endif /* PPU_FM3 */
 
+#if PPU_FM3
+/* PPU_FM3: the write accessors with the alias answer of the gate. The body
+ * gets the answered EA, as in the out-of-line function. So the test of the
+ * coherent store (g_spu_coh_armed) reads the line of the answered address. */
+#define PPU_FM_WRITE3(name, type, n)                                         \
+    static PPU_FM_FAST void name(uint64_t a, type v)                         \
+    {                                                                        \
+        uint32_t ea = (uint32_t)a;                                           \
+        uint32_t flags = ppu_fm_slow;                                        \
+        if (PPU_FM_UNLIKELY(PPU_FM_GATE(flags, ea, PPU_FM_K_WRITE, PPU_FM_S_WRITE)) && \
+            !ppu_fm_window(flags, PPU_FM_S_WRITE, n, &ea)) {                 \
+            name##_out(a, v);                                                \
+            return;                                                          \
+        }                                                                    \
+        name##_body(a, ea, v);                                               \
+    }
+
+PPU_FM_WRITE3(ppu_fm_write8,  uint8_t,  1)
+PPU_FM_WRITE3(ppu_fm_write16, uint16_t, 2)
+PPU_FM_WRITE3(ppu_fm_write32, uint32_t, 4)
+PPU_FM_WRITE3(ppu_fm_write64, uint64_t, 8)
+#undef PPU_FM_WRITE3
+#else
 static PPU_FM_FAST void ppu_fm_write8(uint64_t a, uint8_t v)
 {
     uint32_t ea = (uint32_t)a;
@@ -704,5 +800,6 @@ static PPU_FM_FAST void ppu_fm_write64(uint64_t a, uint64_t v)
     }
     ppu_fm_write64_body(a, ea, v);
 }
+#endif /* PPU_FM3 */
 
 #endif /* PS3EMU_PPU_FASTMEM_H */
