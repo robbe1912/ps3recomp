@@ -35,6 +35,10 @@
  * the flag word and fills the page table. Before it runs, each bit of the
  * flag word is set, so each access takes the out-of-line function.
  *
+ * PPU_FM3 (1 by default): the read accessors hold no label address, so
+ * Clang inlines them into the lifted code. PPU_FM3 0 is the layout before
+ * this step. See the comment at the read accessors.
+ *
  * The hot-spin detector (200000 consecutive same-EA reads -> SwitchToThread)
  * stays in the fast body: it is fair-share behavior, not a diagnostic, and
  * ppu_spin_yield() is what keeps a hard-spinning guest thread from starving
@@ -132,6 +136,26 @@
 #  define PPU_FM_FAST PPU_FM_ALWAYS_INLINE
 #else
 #  define PPU_FM_FAST PPU_FM_NOINLINE
+#endif
+
+/* PPU_FM3 selects the layout of the read accessors. 1, the default: the
+ * read accessors hold no label address, so Clang inlines them into the
+ * lifted code as it inlines the write accessors. 0: the layout before
+ * this step, with the label address. */
+#ifndef PPU_FM3
+#  define PPU_FM3 1
+#endif
+
+/* PPU_FM3: the caller address that a read accessor of that layout passes
+ * to the body. Inline layout: null, so the body takes the fire function
+ * (ppu_fm_fireN), which reads its own return address: the call site in
+ * the lifted function. One copy per unit (PPU_FM_INLINE_FAST 0): the
+ * return address of the accessor. That is the call site in the lifted
+ * function too. The report gets the same guest function in each layout. */
+#if PPU_FM_INLINE_FAST
+#  define PPU_FM_RA3() ((void*)0)
+#else
+#  define PPU_FM_RA3() PPU_FM_RA_OUT()
 #endif
 
 /* Caller address for the fire helpers.
@@ -335,6 +359,39 @@ static __inline int ppu_fm_is_refpoll_page(uint32_t e)
 #define PPU_FM_SLOW(ea, kind, mask)                                        \
     ((ppu_fm_slow & (mask)) | (ppu_fm_kind[(ea) >> PPU_FM_PAGE_SHIFT] & (kind)))
 
+#if PPU_FM3
+/* PPU_FM3: the fire half of a read that the gate passes inline. Out of line,
+ * so the inline layout holds no label address. The caller address is the
+ * call site in the lifted function. It lies in the guest function that the
+ * label PPU_FM_SITE of the other layout names, so the report is the same. */
+static __inline PPU_FM_NOINLINE void ppu_fm_fire8(uint32_t ea)
+{
+    ppu_fm_hotread8(ea, PPU_FM_RA_OUT());
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_fire16(uint32_t ea)
+{
+    ppu_fm_hotread16(ea, PPU_FM_RA_OUT());
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_fire32(uint32_t ea, uint32_t v)
+{
+    ppu_fm_hotread32(ea, v, PPU_FM_RA_OUT());
+}
+
+static __inline PPU_FM_NOINLINE void ppu_fm_fire64(uint32_t ea, uint64_t v)
+{
+    ppu_fm_hotread64(ea, v, PPU_FM_RA_OUT());
+}
+
+/* The fire statement of a read body. A null caller address is a read of
+ * the inline layout (PPU_FM3): it takes the fire function above. */
+#  define PPU_FM_FIRE(ra, inline_fire, out_fire) \
+    do { if (ra) { out_fire; } else { inline_fire; } } while (0)
+#else
+#  define PPU_FM_FIRE(ra, inline_fire, out_fire) out_fire
+#endif
+
 /* Hot-spin detector bookkeeping, one TLS compare on the steady path. Mirrors
  * the slow paths: 200000 consecutive same-EA accesses through this width
  * fire once (yield + report), then restart the count. It runs only while
@@ -361,7 +418,7 @@ static __inline PPU_FM_ALWAYS_INLINE uint8_t ppu_fm_read8_body(uint32_t ea, void
 {
     vm_cpu_read_sync(ea, 1);
     static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
-    PPU_FM_SPIN_DET(&fm, ea, ppu_fm_hotread8(ea, ra));
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(ra, ppu_fm_fire8(ea), ppu_fm_hotread8(ea, ra)));
     return PPU_FM_LD8(vm_base + ea);
 }
 
@@ -370,7 +427,7 @@ static __inline PPU_FM_ALWAYS_INLINE uint16_t ppu_fm_read16_body(uint32_t ea, vo
     vm_cpu_read_sync(ea, 2);
     uint16_t v = PPU_FM_LD16(vm_base + ea);
     static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
-    PPU_FM_SPIN_DET(&fm, ea, ppu_fm_hotread16(ea, ra));
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(ra, ppu_fm_fire16(ea), ppu_fm_hotread16(ea, ra)));
     return (uint16_t)PPU_FM_BSWAP16(v);
 }
 
@@ -379,7 +436,7 @@ static __inline PPU_FM_ALWAYS_INLINE uint32_t ppu_fm_read32_body(uint32_t ea, vo
     vm_cpu_read_sync(ea, 4);
     uint32_t v = PPU_FM_LD32(vm_base + ea);
     static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
-    PPU_FM_SPIN_DET(&fm, ea, ppu_fm_hotread32(ea, v, ra));
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(ra, ppu_fm_fire32(ea, v), ppu_fm_hotread32(ea, v, ra)));
     return PPU_FM_BSWAP32(v);
 }
 
@@ -388,7 +445,7 @@ static __inline PPU_FM_ALWAYS_INLINE uint64_t ppu_fm_read64_body(uint32_t ea, vo
     vm_cpu_read_sync(ea, 8);
     uint64_t v = PPU_FM_LD64(vm_base + ea);
     static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
-    PPU_FM_SPIN_DET(&fm, ea, ppu_fm_hotread64(ea, v, ra));
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(ra, ppu_fm_fire64(ea, v), ppu_fm_hotread64(ea, v, ra)));
     return PPU_FM_BSWAP64(v);
 }
 
@@ -541,6 +598,44 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
 /* accessors: the gate, then the fast body                                  */
 /* ----------------------------------------------------------------------- */
 
+#if PPU_FM3
+/* PPU_FM3: the read accessors hold no label address. Clang 17 does not
+ * inline a function that holds a label address and a live TLS access
+ * (remark: "blockaddress used outside of callbr"). So each read accessor
+ * of the other layout stays out of line, and each lifted read is a call.
+ * Here the fire half takes the caller address in ppu_fm_fireN. */
+static PPU_FM_FAST uint8_t ppu_fm_read8(uint64_t a)
+{
+    uint32_t ea = (uint32_t)a;
+    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+        return ppu_fm_read8_out(a);
+    return ppu_fm_read8_body(ea, PPU_FM_RA3());
+}
+
+static PPU_FM_FAST uint16_t ppu_fm_read16(uint64_t a)
+{
+    uint32_t ea = (uint32_t)a;
+    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+        return ppu_fm_read16_out(a);
+    return ppu_fm_read16_body(ea, PPU_FM_RA3());
+}
+
+static PPU_FM_FAST uint32_t ppu_fm_read32(uint64_t a)
+{
+    uint32_t ea = (uint32_t)a;
+    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+        return ppu_fm_read32_out(a);
+    return ppu_fm_read32_body(ea, PPU_FM_RA3());
+}
+
+static PPU_FM_FAST uint64_t ppu_fm_read64(uint64_t a)
+{
+    uint32_t ea = (uint32_t)a;
+    if (PPU_FM_UNLIKELY(PPU_FM_SLOW(ea, PPU_FM_K_READ, PPU_FM_S_READ)))
+        return ppu_fm_read64_out(a);
+    return ppu_fm_read64_body(ea, PPU_FM_RA3());
+}
+#else
 static PPU_FM_FAST uint8_t ppu_fm_read8(uint64_t a)
 {
     uint32_t ea = (uint32_t)a;
@@ -572,6 +667,7 @@ static PPU_FM_FAST uint64_t ppu_fm_read64(uint64_t a)
         return ppu_fm_read64_out(a);
     PPU_FM_SITE return ppu_fm_read64_body(ea, PPU_FM_RA());
 }
+#endif /* PPU_FM3 */
 
 static PPU_FM_FAST void ppu_fm_write8(uint64_t a, uint8_t v)
 {

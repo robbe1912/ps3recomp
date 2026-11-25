@@ -661,9 +661,11 @@ def build(environment, work, cc, msvc_style, header, arm, vendor, inline_fast):
         (work / name).write_text(text)
     (work / "arm.inc").write_text(arm)
     directories = [work / "mut" / "include", vendor / "include", vendor / "runtime" / "spu"]
-    define = "PPU_FM_INLINE_FAST=%d" % inline_fast
+    # This check is the contract of the layout before step 3 (PPU_FM3 0).
+    # tests/check_ppu_fastmem3.py holds the contract of PPU_FM3 1.
+    defines = ["PPU_FM_INLINE_FAST=%d" % inline_fast, "PPU_FM3=0"]
     if msvc_style:
-        common = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything", "/D" + define]
+        common = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything"] + ["/D" + d for d in defines]
         common += ["/I" + str(path) for path in directories] + ["/Fo" + str(work) + os.sep]
         fixture = [str(work / "fixture.cpp"), "/Fe" + str(work / ("fixture" + EXE))]
         agree = [str(work / "coherent.cpp"), str(work / "agree.cpp"),
@@ -671,7 +673,7 @@ def build(environment, work, cc, msvc_style, header, arm, vendor, inline_fast):
     else:
         # The sources are C++. clang, cc and gcc need their C++ drivers.
         driver = {"clang": "clang++", "cc": "c++", "gcc": "g++"}.get(Path(cc).name.lower(), cc)
-        common = [driver, "-std=c++17", "-O2", "-UNDEBUG", "-Wno-everything", "-D" + define]
+        common = [driver, "-std=c++17", "-O2", "-UNDEBUG", "-Wno-everything"] + ["-D" + d for d in defines]
         common += ["-I" + str(path) for path in directories]
         fixture = [str(work / "fixture.cpp"), "-o", str(work / ("fixture" + EXE))]
         agree = [str(work / "coherent.cpp"), str(work / "agree.cpp"),
