@@ -864,8 +864,18 @@ SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, 
 SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__nv_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #else
+#if SPU_SF_FAST
+/* The earlier path of a helper, out of line and cold: the compiler must not
+ * inline it into the lifted code after the fast form. */
+static inline __attribute__((noinline, cold)) u128 spu__fa_slow(u128 a, u128 b) { u128 r; if (spu_sf_simd_binary(r._u32, a._u32, b._u32, 0)) return r; return spu__fa_s(a, b); }
+static inline __attribute__((noinline, cold)) u128 spu__fs_slow(u128 a, u128 b) { u128 r; if (spu_sf_simd_binary(r._u32, a._u32, b._u32, 1)) return r; return spu__fs_s(a, b); }
+/* Fast forms: one x86 operation inside a scope, see spu_float_simd.h. */
+static inline u128 spu_fa(u128 a, u128 b) { u128 r; if (spu_sf_fast_binary(r._u32, a._u32, b._u32, 0)) return r; return spu__fa_slow(a, b); }
+static inline u128 spu_fs(u128 a, u128 b) { u128 r; if (spu_sf_fast_binary(r._u32, a._u32, b._u32, 1)) return r; return spu__fs_slow(a, b); }
+#else
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; if (spu_sf_simd_binary(r._u32, a._u32, b._u32, 0)) return r; return spu__fa_s(a, b); }
 static inline u128 spu_fs(u128 a, u128 b) { u128 r; if (spu_sf_simd_binary(r._u32, a._u32, b._u32, 1)) return r; return spu__fs_s(a, b); }
+#endif
 #if SPU_X86_SIMD
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; if (spu_fm_simd(r._u32, a._u32, b._u32)) return r; return spu__fm_s(a, b); }
 #else
