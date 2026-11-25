@@ -153,6 +153,12 @@ static __attribute__((always_inline)) inline __m128i spu_sf_fast_fma(__m128i a, 
                          : [a] "+x"(a) : [b] "x"(b), [c] "x"(c), [z] "x"(_mm_setzero_ps()));
     return a;
 }
+/* c - a*b with one rounding: the sign of the product costs no operation. */
+static __attribute__((always_inline)) inline __m128i spu_sf_fast_fnma(__m128i a, __m128i b, __m128i c) {
+    __asm__ __volatile__("vfnmadd213ps %[c], %[b], %[a]\n\taddps %[z], %[a]"
+                         : [a] "+x"(a) : [b] "x"(b), [c] "x"(c), [z] "x"(_mm_setzero_ps()));
+    return a;
+}
 /* The lanes that must take the earlier path: a result of 2^127 and above. */
 static __attribute__((always_inline)) inline __m128i spu_sf_fast_bad(__m128i result) {
     return _mm_cmpgt_epi32(_mm_and_si128(result, _mm_set1_epi32(0x7fffffff)), _mm_set1_epi32(0x7effffff));
@@ -174,12 +180,10 @@ static __attribute__((always_inline)) inline int spu_sf_fast_fused(uint32_t *out
                                                                   const uint32_t *b, const uint32_t *c,
                                                                   uint32_t negate_product, uint32_t negate_c) {
     if (g_spu_sf_simd_scope != 2 || !spu_sf_probe()) return 0;
-    const __m128i sign = _mm_set1_epi32((int)0x80000000u);
     __m128i av = _mm_loadu_si128((const __m128i *)a), bv = _mm_loadu_si128((const __m128i *)b),
             cv = _mm_loadu_si128((const __m128i *)c);
-    if (negate_product) av = _mm_xor_si128(av, sign);
-    if (negate_c) cv = _mm_xor_si128(cv, sign);
-    const __m128i r = spu_sf_fast_fma(av, bv, cv);
+    if (negate_c) cv = _mm_xor_si128(cv, _mm_set1_epi32((int)0x80000000u));
+    const __m128i r = negate_product ? spu_sf_fast_fnma(av, bv, cv) : spu_sf_fast_fma(av, bv, cv);
     if (_mm_movemask_epi8(spu_sf_fast_bad(r))) return 0;
     _mm_storeu_si128((__m128i *)out, r);
     return 1;
