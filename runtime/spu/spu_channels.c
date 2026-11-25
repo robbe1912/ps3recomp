@@ -206,48 +206,47 @@ void spu_stop(spu_context* ctx)
 
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
+/* The three option readers of spu_native_owned.h. Each runs one time on a
+ * host thread: it reads the option and fills the thread-local word that the
+ * inline readers use. tools/spu_owned_options.py copies these three
+ * functions into the CPU harnesses, so they use only the header. */
 int spu_native_owned_enabled(void) {
-    static SPU_THREAD_LOCAL int mode=-1;
-    if (mode<0) {
-        const char* value=getenv("SPU_NATIVE_OWNED_JOBS");
-        if (!value || !strcmp(value,"0")) mode=0;
-        else if (!strcmp(value,"1")) mode=1;
-        else { fprintf(stderr,"invalid SPU_NATIVE_OWNED_JOBS: expected 0 or 1\n"); abort(); }
-    }
+    const char* value=getenv("SPU_NATIVE_OWNED_JOBS");
+    int mode;
+    if (!value || !strcmp(value,"0")) mode=0;
+    else if (!strcmp(value,"1")) mode=1;
+    else { fprintf(stderr,"invalid SPU_NATIVE_OWNED_JOBS: expected 0 or 1\n"); abort(); }
+    g_spu_native_owned_mode=mode+1;
     return mode;
 }
 int spu_native_owned_observed(void) {
+    int observed;
 #if PS3_EXECUTION_OBSERVATION || PS3_ATOMIC_OBSERVATION
-    return 1; /* retain the original interpreter observation granularity */
+    observed=1; /* retain the original interpreter observation granularity */
 #else
-    static SPU_THREAD_LOCAL int observed=-1;
-    if (observed<0) {
-        static const char* const options[]={"SPU_TRACE_CALLS","SPU_BOUNDARY_DIR",
-            "SPU_CALLTRACE","SPU_PCHIST","SPU_LS_LOWREAD","SPU_LS_WATCH",
-            "SPU_SMC_WATCH","SPU_STEPCAP","SPU_TRACE","YDKJ_SPU_TRACE","YDKJ_CRI_GATE1TRACE"};
-        observed=0;
-        for (unsigned i=0;i<sizeof(options)/sizeof(options[0]);++i)
-            observed |= getenv(options[i])!=NULL;
-    }
-    return observed;
+    static const char* const options[]={"SPU_TRACE_CALLS","SPU_BOUNDARY_DIR",
+        "SPU_CALLTRACE","SPU_PCHIST","SPU_LS_LOWREAD","SPU_LS_WATCH",
+        "SPU_SMC_WATCH","SPU_STEPCAP","SPU_TRACE","YDKJ_SPU_TRACE","YDKJ_CRI_GATE1TRACE"};
+    observed=0;
+    for (unsigned i=0;i<sizeof(options)/sizeof(options[0]);++i)
+        observed |= getenv(options[i])!=NULL;
 #endif
+    g_spu_native_owned_observed=observed+1;
+    return observed;
 }
 int spu_native_owned_image(void) {
-    static SPU_THREAD_LOCAL int image = -1;
-    if (image < 0) {
-        const char* value = getenv("SPU_NATIVE_OWNED_IMAGE");
-        if (!value) {
-            image = 0;
-        } else {
-            unsigned long id = strtoul(value, NULL, 10);
-            if (!id || id > INT_MAX ||
-                value[strspn(value, "0123456789")] != '\0') {
-                fprintf(stderr, "invalid SPU_NATIVE_OWNED_IMAGE: expected a positive decimal image ID\n");
-                abort();
-            }
-            image = (int)id;
+    const char* value = getenv("SPU_NATIVE_OWNED_IMAGE");
+    int image = 0;
+    if (value) {
+        unsigned long id = strtoul(value, NULL, 10);
+        if (!id || id > INT_MAX ||
+            value[strspn(value, "0123456789")] != '\0') {
+            fprintf(stderr, "invalid SPU_NATIVE_OWNED_IMAGE: expected a positive decimal image ID\n");
+            abort();
         }
+        image = (int)id;
     }
+    g_spu_native_owned_image=image+1;
     return image;
 }
 void spu_native_owned_interpret(spu_context* ctx) {
