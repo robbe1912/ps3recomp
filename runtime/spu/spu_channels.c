@@ -2522,7 +2522,7 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            if (spu_lane_trace() && (n <= 4 || (n % 4096) == 0))
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);

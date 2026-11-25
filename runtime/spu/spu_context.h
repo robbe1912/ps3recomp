@@ -483,9 +483,20 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
-/* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
- * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
- * until the first call reads SPU_LS_LOWREAD, then 0/1. */
+/* One gate for the probes of spu_ls_read128 and spu_ls_write128. Inlined, the
+ * probes kept every LS load a real call (~10% of GH3's FMOD mixer task).
+ *
+ * g_spu_ls_gate is -1 until the first accessor call reads the environment.
+ * Then each set bit is one armed probe, and 0 means that no probe is armed:
+ * one load and one predicted branch per call, like g_spu_ls_watch_n. An
+ * armed probe runs out of line with its old code. A probe that only a
+ * context class arms ([wws-res], [wws-code]) also needs SPU_LANE_TRACE, so
+ * that a default run does not test the context class at all. */
+
+/* SPU_LANE_TRACE: the diagnostic lines of the SPU lane hot paths. Default
+ * off. One cached read of the environment for the process. A value that is
+ * not empty and not 0 is on. Error lines, halts and [pm-end] lines do not
+ * use it. */
 
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
@@ -496,57 +507,44 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #else
 #  define SPU_GATE __attribute__((weak))
 #endif
+#define SPU_LS_GATE_LOWREAD 1   /* SPU_LS_LOWREAD: [spu-lowread]         */
+#define SPU_LS_GATE_SMC     2   /* SPU_SMC_WATCH: [spu-SMC]              */
+#define SPU_LS_GATE_TRACE   4   /* SPU_LANE_TRACE: [wws-res], [wws-code] */
+#define SPU_LS_GATE_WATCH   8   /* SPU_LS_WATCH: [spu-watch]             */
+SPU_GATE int g_spu_ls_gate    = -1;  /* the probe gate of the two accessors */
+SPU_GATE int g_spu_lane_trace = -1;  /* SPU_LANE_TRACE, then 0/1 */
 SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
-static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+static __attribute__((noinline, cold)) int spu_lane_trace_init(void)
 {
-    if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
-    /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
-     * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
-     * returns its own instruction words. Report each distinct low address once,
-     * with the pc, to find which pointer was never filled in. */
-    { static int s_lw = -1;
-      if (s_lw < 0) s_lw = getenv("SPU_LS_LOWREAD") ? 1 : 0;
-      if (s_lw && lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
-          static uint32_t seen[24]; static int n = 0; int known = 0;
-          uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
-          for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
-          if (!known && n < 24) {
-              seen[n++] = key;
-              fprintf(stderr, "[spu-lowread] img=%d read LS 0x%03X at pc=0x%05X "
-                      "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
-                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      (const void*)ctx,                      ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0],
-                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
-              fflush(stderr);
-          }
-      } }
-    /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
-     * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
-     * Log them (capped) to see which set each command -- especially RunJob --
-     * resolves to. Uses the RAW lsa before 16-byte alignment masking. */
-    if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
-        extern int g_wws_read_probe;
-        if (g_wws_read_probe < 48) {
-            g_wws_read_probe++;
-            uint32_t off = lsa - 0xDF0;
-            fprintf(stderr, "[wws-res] bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n",
-                    off >> 6, (off >> 2) & 0xF, off);
-        }
-    }
+    const char* e = getenv("SPU_LANE_TRACE");
+    g_spu_lane_trace = (e && *e && strcmp(e, "0")) ? 1 : 0;
+    return g_spu_lane_trace;
 }
-
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+static inline int spu_lane_trace(void) {
+    return __builtin_expect(g_spu_lane_trace >= 0, 1) ? g_spu_lane_trace : spu_lane_trace_init();
+}
+static __attribute__((noinline, cold)) void spu_ls_gate_init(void)
+{
+    const char* watch = getenv("SPU_LS_WATCH");
+    g_spu_ls_probe  = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+    g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+    g_spu_ls_gate = (g_spu_ls_probe ? SPU_LS_GATE_LOWREAD : 0)
+                  | (g_spu_smc_watch ? SPU_LS_GATE_SMC : 0)
+                  | (spu_lane_trace() ? SPU_LS_GATE_TRACE : 0)
+                  | (watch ? SPU_LS_GATE_WATCH : 0);
+    /* The armed path reaches spu_ls_watch_slow, which makes the owner of the
+     * list (spu_ls_watch_list) read SPU_LS_WATCH. With the variable not set,
+     * no path of the accessors reaches it any more, and the admission tests
+     * of the interpreter and of native jobs read 0 as "no watch": publish
+     * the empty list here, as that first use would have. */
+    if (!watch && g_spu_ls_watch_n < 0) g_spu_ls_watch_n = 0;
+}
+static inline u128 spu_ls_load16(const uint8_t* p)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
-    lsa &= SPU_LS_MASK & ~0xFu;
-    const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -563,7 +561,68 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 #endif
     return v;
 }
+/* The armed path of spu_ls_read128: the probes, then the load and the watch. */
+static __attribute__((noinline, cold)) u128 spu_ls_read_probes(const spu_context* ctx, uint32_t lsa)
+{
+    if (g_spu_ls_gate < 0) spu_ls_gate_init();
+    /* Both probes use the RAW lsa, before the 16-byte alignment masking. */
+    /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
+     * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
+     * returns its own instruction words. Report each distinct low address once,
+     * with the pc, to find which pointer was never filled in. */
+    if (g_spu_ls_gate & SPU_LS_GATE_LOWREAD) {
+        if (lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
+            static uint32_t seen[24]; static int n = 0; int known = 0;
+            uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
+            for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
+            if (!known && n < 24) {
+                seen[n++] = key;
+                fprintf(stderr, "[spu-lowread] img=%d read LS 0x%03X at pc=0x%05X "
+                        "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
+                        ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
+                        (const void*)ctx,                      ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0],
+                        ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+                fflush(stderr);
+            }
+        }
+    }
+    /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
+     * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
+     * Log them (capped) to see which set each command -- especially RunJob --
+     * resolves to. */
+    if (g_spu_ls_gate & SPU_LS_GATE_TRACE) {
+        if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
+            extern int g_wws_read_probe;
+            if (g_wws_read_probe < 48) {
+                g_wws_read_probe++;
+                uint32_t off = lsa - 0xDF0;
+                fprintf(stderr, "[wws-res] bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n",
+                        off >> 6, (off >> 2) & 0xF, off);
+            }
+        }
+    }
+    lsa &= SPU_LS_MASK & ~0xFu;
+    const uint8_t* p = &ctx->ls[lsa];
+    u128 v = spu_ls_load16(p);
+    if (g_spu_ls_gate & SPU_LS_GATE_WATCH)
+        spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    return v;
+}
 
+static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+{
+    if (__builtin_expect(g_spu_ls_gate != 0, 0))
+        return spu_ls_read_probes(ctx, lsa);
+    return spu_ls_load16(&ctx->ls[lsa & SPU_LS_MASK & ~0xFu]);
+}
+
+/* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
+ * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
+ * that code-buffer LS address, dump the RunJob decision inputs so we can see
+ * why it resolves to an empty buffer: the resolved address, the whole
+ * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
+ * command (commandNum==5) names the code buffer set. */
 static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
@@ -593,11 +652,11 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
         }
     }
 }
-/* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
+/* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until the first accessor
+ * call, then 0/1. */
 extern int g_spu_smc_watch;
 static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
-    if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
      * target LS line falls inside that image's CODE segment (the segment
      * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
@@ -617,18 +676,8 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+static inline void spu_ls_store16(uint8_t* p, u128 val)
 {
-    lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
-    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
-     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
-     * that code-buffer LS address, dump the RunJob decision inputs so we can see
-     * why it resolves to an empty buffer: the resolved address, the whole
-     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
-     * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -643,10 +692,32 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
+}
+/* The armed path of spu_ls_write128: the probe before the store, the store,
+ * then the watch and the probe after it. */
+static __attribute__((noinline, cold)) void spu_ls_write_probes(spu_context* ctx, uint32_t lsa, u128 val, uint8_t* p)
+{
+    if (g_spu_ls_gate < 0) spu_ls_gate_init();
+    if (g_spu_ls_gate & SPU_LS_GATE_TRACE
+        && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+        spu_ls_write_probe_pre(ctx, lsa, val);
+    spu_ls_store16(p, val);
+    if (g_spu_ls_gate & SPU_LS_GATE_WATCH)
+        spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    if (g_spu_ls_gate & SPU_LS_GATE_SMC)
         spu_ls_write_probe_smc(ctx, lsa, p);
+}
+
+static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+{
+    lsa &= SPU_LS_MASK & ~0xFu;
+    uint8_t* p = &ctx->ls[lsa];
+    if (__builtin_expect(g_spu_ls_gate != 0, 0)) {
+        spu_ls_write_probes(ctx, lsa, val, p);
+        return;
+    }
+    spu_ls_store16(p, val);
 }
 
 /* ---------------------------------------------------------------------------
