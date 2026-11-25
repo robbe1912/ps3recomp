@@ -78,6 +78,53 @@ static inline uint8x16_t spu__iota(void) {
 }
 #endif
 
+/* x86 forms of the hot helpers, for units built with SSSE3 enabled (this
+ * file: rotqby and rotqbyi; the local store swap is in spu_context.h). SSE2
+ * and SSSE3 only. Each scalar definition stays as spu_X_ref. The forms need
+ * no CPUID test and no target attribute. SPU_SCALAR_HELPERS and
+ * SPU_SCALAR_INT select the scalar forms, as for the NEON forms. */
+#if (defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)) && !defined(SPU_SCALAR_HELPERS)
+#include <emmintrin.h>
+#define SPU_X86_SIMD 1
+#else
+#define SPU_X86_SIMD 0
+#endif
+#if SPU_X86_SIMD && !defined(SPU_SCALAR_INT)
+#define SPU_X86_SIMD_INT 1
+#else
+#define SPU_X86_SIMD_INT 0
+#endif
+#if SPU_X86_SIMD_INT && defined(__SSSE3__)
+#include <tmmintrin.h>
+#define SPU_X86_SIMD_SSSE3 1
+#else
+#define SPU_X86_SIMD_SSSE3 0
+#endif
+#if SPU_X86_SIMD
+static inline __m128i spu__x86_ld(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
+static inline u128 spu__x86_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
+#endif
+#if SPU_X86_SIMD_SSSE3
+/* Control vector of the byte rotates, in host byte order: host byte j of
+ * the result is host byte SPU_W((SPU_W(j) + sh) & 15) of the operand. */
+#define SPU__X86_ROT_SRC(sh, j) (((((j) ^ 3) + (sh)) & 15) ^ 3)
+#define SPU__X86_ROT_ROW(sh) { \
+    SPU__X86_ROT_SRC(sh,  0), SPU__X86_ROT_SRC(sh,  1), SPU__X86_ROT_SRC(sh,  2), SPU__X86_ROT_SRC(sh,  3), \
+    SPU__X86_ROT_SRC(sh,  4), SPU__X86_ROT_SRC(sh,  5), SPU__X86_ROT_SRC(sh,  6), SPU__X86_ROT_SRC(sh,  7), \
+    SPU__X86_ROT_SRC(sh,  8), SPU__X86_ROT_SRC(sh,  9), SPU__X86_ROT_SRC(sh, 10), SPU__X86_ROT_SRC(sh, 11), \
+    SPU__X86_ROT_SRC(sh, 12), SPU__X86_ROT_SRC(sh, 13), SPU__X86_ROT_SRC(sh, 14), SPU__X86_ROT_SRC(sh, 15)}
+static inline __m128i spu__x86_rot_mask(int sh) {
+    static SPU_ALIGN16 const unsigned char mask[16][16] = {
+        SPU__X86_ROT_ROW( 0), SPU__X86_ROT_ROW( 1), SPU__X86_ROT_ROW( 2), SPU__X86_ROT_ROW( 3),
+        SPU__X86_ROT_ROW( 4), SPU__X86_ROT_ROW( 5), SPU__X86_ROT_ROW( 6), SPU__X86_ROT_ROW( 7),
+        SPU__X86_ROT_ROW( 8), SPU__X86_ROT_ROW( 9), SPU__X86_ROT_ROW(10), SPU__X86_ROT_ROW(11),
+        SPU__X86_ROT_ROW(12), SPU__X86_ROT_ROW(13), SPU__X86_ROT_ROW(14), SPU__X86_ROT_ROW(15)};
+    return _mm_load_si128((const __m128i*)mask + (sh & 15));
+}
+#undef SPU__X86_ROT_ROW
+#undef SPU__X86_ROT_SRC
+#endif
+
 /* Integer ops with a NEON form further down (end of file); the scalar definitions are
  * spu_X_ref, checked against the NEON forms by tests/test_spu_int_neon.c. */
 static inline u128 spu_absdb(u128 a, u128 b);
@@ -382,6 +429,8 @@ static inline u128 spu_rotqbyi_ref(u128 a, int sh) { u128 r; sh&=0x0F; for(int i
 static inline u128 spu_rotqbyi(u128 a, int sh) {
     return spu__perm(a, vandq_u8(vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)sh)), vdupq_n_u8(15)));
 }
+#elif SPU_X86_SIMD_SSSE3
+static inline u128 spu_rotqbyi(u128 a, int sh) { return spu__x86_st(_mm_shuffle_epi8(spu__x86_ld(a), spu__x86_rot_mask(sh))); }
 #else
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh); }
 #endif
@@ -972,6 +1021,8 @@ static inline u128 spu_rotqby_ref(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r
 static inline u128 spu_rotqby(u128 a, u128 b) {
     return spu__perm(a, vandq_u8(vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)b._u32[0])), vdupq_n_u8(15)));
 }
+#elif SPU_X86_SIMD_SSSE3
+static inline u128 spu_rotqby(u128 a, u128 b) { return spu__x86_st(_mm_shuffle_epi8(spu__x86_ld(a), spu__x86_rot_mask((int)b._u32[0]))); }
 #else
 static inline u128 spu_rotqby(u128 a, u128 b) { return spu_rotqby_ref(a, b); }
 #endif
