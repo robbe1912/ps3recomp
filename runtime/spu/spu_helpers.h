@@ -37,7 +37,7 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 #endif
 
 /* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
- * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
+ * SPU ISA v1.2 Â§13 (+ the per-instruction pages): order all earlier LS and
  * channel accesses before later ones; LS must be consistent "if it were\n * observed by another entity" (Table 13-6 is exactly this runtime's
  * host-thread producer -> SPU consumer handoff). A no-op is neither a
  * compiler nor a CPU barrier -- MSVC at /O2 may reorder plain LS accesses
@@ -221,7 +221,7 @@ static inline u128 spu_sfi(u128 a, int32_t imm) { return spu_sfi_ref(a, imm); }
 #endif
 static inline u128 spu_sfhi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
 
-/* ---- multiply (low halfword of each word × ... -> 32-bit, per SPU mpy) ----
+/* ---- multiply (low halfword of each word Ã— ... -> 32-bit, per SPU mpy) ----
  * Sub-lane indexing assumes a little-endian host (matches the recompiler's
  * target). The "low halfword of word i" in SPU BE semantics is _s16[2i] on
  * an LE host (NOT _s16[2i+1], which would be correct on a BE host). */
@@ -841,16 +841,17 @@ static inline uint64_t spu__d_out(double d) {
     uint64_t u; memcpy(&u, &d, 8);
     return spu__d_isnan(u) ? 0x7FF8000000000000ull : u;
 }
-#define SPU__D_V2(name, op) static inline u128 name(u128 a, u128 b) { u128 r; for (int i = 0; i < 2; i++) { \
+#define SPU__D_V2(name, op) static inline u128 name(u128 a, u128 b) { u128 r; uint32_t csr=spu_sf_host_begin(); for (int i = 0; i < 2; i++) { \
     const uint64_t x = spu__dw_get(a, i), y = spu__dw_get(b, i); \
     spu__dw_put(&r, i, (spu__d_isnan(x) || spu__d_isnan(y)) ? 0x7FF8000000000000ull \
-                       : spu__d_out(spu__d_in(x) op spu__d_in(y))); } return r; }
+                       : spu__d_out(spu__d_in(x) op spu__d_in(y))); } spu_sf_host_end(csr); return r; }
 SPU__D_V2(spu_dfa, +)
 SPU__D_V2(spu_dfs, -)
 SPU__D_V2(spu_dfm, *)
 #undef SPU__D_V2
 /* dfma = a*b + c, dfms = a*b - c, dfnms = -(a*b - c), dfnma = -(a*b + c); c is rt. Fused. */
 static inline u128 spu__dfmx(u128 a, u128 b, u128 c, int negate, int subtract) { u128 r;
+    uint32_t csr=spu_sf_host_begin();
     for (int i = 0; i < 2; i++) {
         const uint64_t x = spu__dw_get(a, i), y = spu__dw_get(b, i), z = spu__dw_get(c, i);
         if (spu__d_isnan(x) || spu__d_isnan(y) || spu__d_isnan(z)) { spu__dw_put(&r, i, 0x7FF8000000000000ull); continue; }
@@ -862,7 +863,7 @@ static inline u128 spu__dfmx(u128 a, u128 b, u128 c, int negate, int subtract) {
         const uint64_t u = spu__d_out(v);
         spu__dw_put(&r, i, (negate && !spu__d_isnan(u)) ? u ^ 0x8000000000000000ull : u);
     }
-    return r; }
+    spu_sf_host_end(csr); return r; }
 static inline u128 spu_dfma(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 0); }
 static inline u128 spu_dfms(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 1); }
 static inline u128 spu_dfnms(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 1); }
@@ -883,6 +884,7 @@ static inline u128 spu_fesd(u128 a) { u128 r;
     }
     return r; }
 static inline u128 spu_frds(u128 a) { u128 r;
+    uint32_t csr=spu_sf_host_begin();
     for (int i = 0; i < 2; i++) {
         const uint64_t u = spu__dw_get(a, i);
         if (spu__d_isnan(u)) { r._u32[2*i] = 0x7FC00000u; r._u32[2*i+1] = 0; continue; }
@@ -890,7 +892,7 @@ static inline u128 spu_frds(u128 a) { u128 r;
         uint32_t w; memcpy(&w, &f, 4);
         r._u32[2*i] = w; r._u32[2*i+1] = 0;
     }
-    return r; }
+    spu_sf_host_end(csr); return r; }
 
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
@@ -906,8 +908,8 @@ static inline void spu__dset(u128* r, int i, double d) {
 }
 /* double FMA family: c = rt (accumulator, 3-register). The SPU DFMA family is FUSED (single rounding). */
 /* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
-static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; uint32_t csr=spu_sf_host_begin(); for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } spu_sf_host_end(csr); return r; }
+static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; uint32_t csr=spu_sf_host_begin(); for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } spu_sf_host_end(csr); return r; }
 /* Singles occupy preferred words 0 and 2 when converting doubleword lanes. */
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
@@ -924,8 +926,8 @@ static inline u128 spu_avgb_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++
 static inline u128 spu_mpyhha_ref(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpyhhau_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
 /* double compare greater (RPCS3 stubs these; sane impl) -> per-lane mask. */
-static inline u128 spu_dfcgt(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcgt(u128 a, u128 b)  { u128 r; uint32_t csr=spu_sf_host_begin(); for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } spu_sf_host_end(csr); return r; }
+static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; uint32_t csr=spu_sf_host_begin(); for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } spu_sf_host_end(csr); return r; }
 /* dftsv rt,ra,I7: double test special value (Cell BE SPU ISA). Each
  * doubleword becomes all ones if it is in any class I7 selects:
  * 0x40 NaN, 0x20 +inf, 0x10 -inf, 0x08 +0, 0x04 -0, 0x02 +denorm, 0x01 -denorm.
@@ -1159,7 +1161,7 @@ static inline u128 spu_fsmbi(int32_t imm) {
 }
 
 /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
-/* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
+/* Generate-controls (cbd/chd/cwd/cdd) â€” insertion selectors for the (now
  * SPU-byte-correct) shufb. Each builds a control in TRUE SPU byte order: the
  * base selects b's SPU byte t at result SPU byte t (selector 0x10+t), and the
  * insert positions select a's preferred scalar bytes -- SPU byte 3 for a byte

@@ -300,20 +300,26 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    const uint64_t sf_mark = spu_sf_simd_mark();
     switch (setjmp(s_spu_halt_env)) {
     case 1:
+        spu_sf_simd_leave(sf_mark);
         halted = 1;
         g_spu_trampoline_fn = 0;
         break;
-    case 2:
+    case 2: {
+        spu_sf_simd_leave(sf_mark);
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         ctx->drain_ret_pc = 0;
         g_spu_trampoline_fn = 0;
+        const uint64_t sf_scope = spu_sf_simd_enter();
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
+        spu_sf_simd_leave(sf_scope);
         break;
+    }
     default:
         /* SPU_DRAIN trampoline model: the top-level entry runs until its first
          * cross-function tail transfer, which sets g_spu_trampoline_fn and
