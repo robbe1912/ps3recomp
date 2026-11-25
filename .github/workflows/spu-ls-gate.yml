@@ -1,0 +1,32 @@
+name: SPU LS probe gate
+on:
+  push:
+    branches: [master, main, combined, 'codex/**']
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
+  pull_request:
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
+  workflow_dispatch:
+jobs:
+  gate:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - run: python tools/test_spu_ls_gate.py --mutants
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spu-ls-gate-${{ matrix.os }}
+          path: |
+            temp/checks/spu-ls-gate-*/**/build.log
+            temp/checks/spu-ls-gate-*/result.json
+          retention-days: 5
