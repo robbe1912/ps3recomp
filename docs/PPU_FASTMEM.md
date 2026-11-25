@@ -44,6 +44,9 @@ the code.
 - `PPU_FM_INLINE_FAST=0` before the include puts one out-of-line copy of
   each accessor in the unit. The default `1` puts the gate and the fast body
   at each call site.
+- `PPU_FM3=0` before the include selects the layout before step 3: the
+  read accessors out of line, and the alias fixup in the out-of-line
+  function only. The default `1` is the layout of the section "Step 3".
 
 ## Layout
 
@@ -99,9 +102,38 @@ Exact tests of the out-of-line function, in order:
   The state is one TLS object per read width.
 - The store body tests the reserved-line bitmap. A reserved line goes to
   `vm_writeN` with the original address, as before.
-- With `PPU_FM_INLINE_FAST 1` the fire helpers get the address of a label at
-  the call site as caller address. It lies in the same guest function as the
-  return address of a call.
+- With `PPU_FM3 0` and `PPU_FM_INLINE_FAST 1`, the fire helpers get the
+  address of a label at the call site as caller address. With `PPU_FM3 1`,
+  the fire half is `ppu_fm_fireN`, a function that is not inline. It reads
+  its own return address: the call site in the lifted function.
+
+## Step 3: `PPU_FM3 1`
+
+The default. Two changes to the layout above.
+
+- The read accessors hold no label address. Clang 17 does not inline a
+  function that holds a label address and a live thread-local access
+  (remark: `blockaddress used outside of callbr`). With `PPU_FM3 0`, each
+  lifted read is a call of one out-of-line copy of the accessor. With
+  `PPU_FM3 1`, each read is inline at the call site, as each write is.
+- The gate gives the alias answer of a page of the window inline
+  (`ppu_fm_window`). The access stays inline for an IDENTITY page (the EA
+  stays) and for an ALIAS page (the body runs on `EA - 0x05000000`). The
+  gate makes one load of the page state for that, only on a flagged page of
+  the window. A MIXED page, each set flag bit and an access outside
+  `ppu_vm_size` go to the out-of-line function, which has the fixup and
+  the reports. The bounds test stays on the inline path. So does the
+  test of the reserved lines of the store body, on the answered EA.
+- `read32` at `ppu_hle_inject_base + 0x2008` goes to the out-of-line
+  function for the GCM ref-poll fence.
+- The page state comes from `sysmem_spu_alias_page` of
+  `runtime/syscalls/spu_ea_alias.c`: one atomic byte per 4 KB page of the
+  window, with the values `PPU_FM_ALIAS_IDENTITY`, `PPU_FM_ALIAS_ALIAS`
+  and `PPU_FM_ALIAS_MIXED`. The fixup writes each byte before it publishes
+  a record. `PPU_FM_ALIAS_PAGES` and `SPU_ALIAS_PAGES` must stay equal.
+  The header has two proofs for that path: the window and its primary
+  image hold no null address and no raw SPU register.
+- An EA with bit 31 set is a plain page for the gate, as before.
 
 ## Counter
 
@@ -167,3 +199,45 @@ Mutants that the script rejects:
 
 Run here on Windows with clang-cl, and on Linux with GCC 13 in a container.
 clang on Linux and macOS, and the compilers of the CI hosts, are not run.
+
+## Check of step 3
+
+```
+python tests/check_ppu_fastmem3.py
+```
+
+The script checks the layout of `PPU_FM3 1` against `PPU_FM3 0`. It compiles
+the production header, the production `ppu_fm_arm` text and the production
+`runtime/syscalls/spu_ea_alias.c`, with authored guest memory (a reserve of
+4 GiB) and authored stubs of the out-of-line family. Each of the three
+builds (default, `PPU_FM3=1`, `PPU_FM3=0`) runs in both layouts and in ten
+modes: no arm, each access class, each diagnostic bit, bounds, the hot-spin
+detector on and off, and the reserved-line store. The access classes are a
+plain page, an EA with bit 31, an IDENTITY page, an ALIAS page, two MIXED
+pages, the null page, a raw SPU register, the GCM ref-poll address and
+pages outside `ppu_vm_size`. Each class runs for reads and writes of each
+width. The script lists the symbols of the object: the default build in
+layout 1 has no out-of-line accessor, and `PPU_FM3=0` in layout 1 has the
+four read accessors.
+
+Mutants that the script rejects:
+
+- header (24): ALIAS page answered as IDENTITY; IDENTITY page answered as
+  ALIAS; alias delta changed; MIXED page answered inline; a flag bit does
+  not send a window page out of line; a page outside the window answered
+  inline; bounds test of the alias answer removed; window lower bound at
+  zero; window over the whole address space; upper bound past the raw SPU
+  page (the proof fails at compile time); ref-poll fence of `read32`
+  skipped; the gate without the page table; the gate without the flag
+  word; the store body on the address before the answer; the fire function
+  with a null caller address; the fire dispatch without the caller address
+  test; `PPU_FM3` defaults to 0; null caller address in layout 0; page
+  state always from the first page; a read accessor with a label address
+  again; byte order of `read32` turned; byte order of `write16` turned;
+  null test of `read32` removed; raw SPU test of `read32` removed.
+- alias file (4): ALIAS state published as MIXED; page table not updated;
+  EA bit 31 rule lost; a partly covered page published as IDENTITY.
+- arm text (1): alias pages not flagged.
+
+Run here on Windows with clang-cl. The POSIX branch of the guest memory
+(`mmap`) is not run.
