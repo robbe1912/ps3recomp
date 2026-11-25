@@ -241,3 +241,65 @@ Mutants that the script rejects:
 
 Run here on Windows with clang-cl. The POSIX branch of the guest memory
 (`mmap`) is not run.
+
+## Step 4: `PPU_FM4 1`, move 1
+
+The default. `PPU_FM3 0` forces it off. The lean gate moves the exact
+tests of the gate of step 3 into one byte per 4 KB page (`ppu_fm_kind`)
+and into the out-of-line function.
+
+- The call site makes one test. It loads the page byte of the EA with one
+  acquire load (`ppu_fm_page`). Then it computes `(byte | ppu_fm_slow) &
+  (kind | mask)` (`PPU_FM_LEAN`). A nonzero result sends the access to the
+  out-of-line function. Two `typedef` proofs state that the AND keeps only
+  the route bit of the kind and only the flag bits of the kind.
+- The route bits are `PPU_FM_K_READ` (`0x08`) and `PPU_FM_K_WRITE`
+  (`0x10`). `PPU_FM_K_SYNC` (`0x20`) names the read sync as the writer.
+  No route bit shares a position with a flag bit of the other kind, or
+  with an owner bit.
+- The bounds test is a decision of the page byte. `ppu_fm_arm` sets the
+  route bits on each page that is not entirely inside `ppu_vm_size`, and
+  on the page before the end: an access of up to 8 bytes that starts in
+  its last 7 bytes ends past `ppu_vm_size`. The out-of-line function makes
+  the exact test with the width.
+- The GCM ref-poll address of `read32` goes to the out-of-line function,
+  as in step 3.
+- The read sync is a decision of the page byte. `vm_read_sync_mark_range`
+  calls a new hook after its marks and after its flag. The hook is
+  `vm_read_sync_mark_hook` (`include/ps3emu/guest_read_sync.h`). `ppu_fm_arm`
+  installs `ppu_fm_mark_sync` (`runtime/ppu/ppu_loader.cpp`). The hook
+  sets `K_READ | K_SYNC` on the pages of the range and `K_READ` on the
+  page before the range. The out-of-line function of a read calls
+  `vm_cpu_read_sync`, then the lean body of the call site. So the rule of
+  the hot-spin detector is the same at each place.
+- The writers of the page byte at run time use `ppu_fm_page_or`: one
+  atomic OR with release order, after the state of the writer.
+- The lean body of a read at the call site has the load and the hot-spin
+  detector only. The store body at the call site is the body of step 3:
+  the test of the reserved lines is still inline.
+
+## Check of step 4
+
+```
+python tests/check_ppu_fastmem3.py
+```
+
+The script of the check of step 3 builds three paths in both layouts: the
+lean gate (default), step 3 (`PPU_FM4=0`) and the path before step 3
+(`PPU_FM3=0`). The same source must pass in each build. The lean path has
+two more modes. `leanbits` checks each bit of the page byte after the
+arm. `leansync` checks the read sync on the lean path, with its hook and
+the order of the hook. `--only` takes a list of texts. The script then
+runs the mutants with a matching name only. `--skip-actual` runs no build
+without a mutant.
+
+Mutants of step 4 that the script rejects:
+
+- header (4): the lean gate without the page byte; the lean gate without
+  the flag word; the read gate with the mask of a write; a writer that
+  sets no bit.
+- arm text (6): the page before the end not flagged; the hook not
+  installed; the page before the range not flagged; only the first page
+  of the range flagged; the hook flags stores too; the owner bit not set.
+- read sync file (2): the hook is not called; the hook runs before the
+  marks and the flag.

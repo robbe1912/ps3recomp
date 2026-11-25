@@ -1,18 +1,23 @@
-"""Checks the fast memory path of the PPU of PPU_FM3 1: the read accessors
-without a label address, and the alias answer of the gate.
+"""Checks the fast memory path of the PPU: the read accessors without a label
+address, the alias answer of the gate, and the lean gate of PPU_FM4 1.
+
+The lean gate reads one page byte at each access. The page byte holds the
+route bits and the slow classes that step 3 tested at the call site (bounds
+test, GCM ref-poll page, read sync).
 
 The fixture includes the production header and the production arm text of
-ppu_loader.cpp, and links the production runtime/syscalls/spu_ea_alias.c. It
-runs one process per mode. Each mode covers each access class for reads and
-writes of each width (8, 16, 32, 64 bits): plain page, null page, IDENTITY
-page, ALIAS page, MIXED page, EA bit 31, raw SPU problem-state register, GCM
-ref-poll address, out of bounds, and each diagnostic bit.
+ppu_loader.cpp, and links the production runtime/syscalls/spu_ea_alias.c,
+runtime/memory/guest_read_sync.c and runtime/spu/spu_coherency.c. It runs one
+process per mode. Each mode covers each access class for reads and writes of
+each width (8, 16, 32, 64 bits): plain page, null page, IDENTITY page, ALIAS
+page, MIXED page, EA bit 31, raw SPU problem-state register, GCM ref-poll
+address, out of bounds, and each diagnostic bit.
 
-The check builds three paths in two layouts (PPU_FM_INLINE_FAST 1 and 0):
-the default (PPU_FM3 1), PPU_FM3 1 and PPU_FM3 0 (the path before this
-change). The same source must pass in each build. The object of the default
-path must hold no out-of-line copy of an accessor: each lifted read is inline.
-Then each planted mutant must fail.
+The check builds three paths in two layouts (PPU_FM_INLINE_FAST 1 and 0): the
+lean gate (default), step 3 (PPU_FM4 0) and the path before step 3 (PPU_FM3
+0). The same source must pass in each build. The object of the lean gate and
+of step 3 must hold no out-of-line copy of an accessor: each lifted read is
+inline. Then each planted mutant must fail.
 """
 import argparse
 import importlib
@@ -76,7 +81,7 @@ HEADER_MUTANTS = [
     ("fire dispatch ignores the caller address",
      "    do { if (ra) { out_fire; } else { inline_fire; } } while (0)",
      "    do { out_fire; } while (0)"),
-    ("PPU_FM3 defaults to 0", "#  define PPU_FM3 1", "#  define PPU_FM3 0"),
+    ("PPU_FM3 defaults to 0", "#  define PPU_FM3 1", "#  define PPU_FM3 0", (1,), "lean"),
     ("one copy per unit: null caller address", "#  define PPU_FM_RA3() PPU_FM_RA_OUT()",
      "#  define PPU_FM_RA3() ((void*)0)", (0,)),
     ("page state always from the first page", STATE,
@@ -120,11 +125,18 @@ FIXTURE = r'''
 #else
 #include <sys/mman.h>
 #include <stdint.h>
+#include <unwind.h>
 #endif
 #include <map>
 #include <string>
 #include "ps3emu/ppu_fastmem.h"
 #include "arm.inc"
+#if PPU_FM4
+/* The window rule of the lean path of the fixture model. 1: each page of
+ * the window is flagged, so each access of the window goes out. 0: the
+ * answer of the page byte selects (step 4, move 2). */
+#define FIXTURE_WINDOW_OUT 1
+#endif
 
 /* ---- authored guest memory: a 4 GiB reserve. commit() backs 64 KB at an EA. */
 #define GUEST_BYTES 0x100010000ull
@@ -134,17 +146,15 @@ FIXTURE = r'''
 uint8_t*  vm_base;
 uint32_t  ppu_vm_size = 0;
 uint32_t  ppu_hle_inject_base = 0x7FE00000u;
-volatile int g_spu_coh_armed = 0;
-unsigned char g_spu_coh_bitmap[PPU_FM_COH_BITMAP_BYTES];
-volatile unsigned char vm_read_sync_pages[1u << 20];
-volatile uint32_t vm_read_sync_any = 0;
+/* The coherency flag and bitmap, and the marks of the read sync, come from
+   the production files runtime/spu/spu_coherency.c and
+   runtime/memory/guest_read_sync.c. The fixture links both. */
 static long long family[8], fires, refpolls, fixups, now_calls;
 static uint64_t last_family_addr, fire_v;
 static uint32_t fire_ea;
 static void* fire_ra;
 static std::map<std::string, std::string> environment;
 static std::string fake_lines;
-
 /* ---- authored clock and output of the PPU_FM_COUNT counter ---- */
 uint64_t ppu_fm_count_now(void) { now_calls++; return 5; }
 uint64_t ppu_fm_count_frequency(void) { return 1000000u; }
@@ -152,14 +162,57 @@ unsigned long ppu_fm_count_host_tid(void) { return 11; }
 uint64_t ppu_fm_count_guest_tid(void) { return 0x1001u; }
 void ppu_fm_count_emit(const char* line) { fake_lines += line; }
 
+/* The stack at the fire, as return addresses. stack_at_fire[i] lies in the
+ * function that called the i-th function below the reader. The header
+ * functions on the stack can share one frame (a tail call), so the rule on
+ * the fire address counts from the frame of the reader. */
+static void* stack_at_fire[8];
+#ifdef _WIN32
+static void capture_stack(void) { CaptureStackBackTrace(0, 8, stack_at_fire, 0); }
+#else
+struct stack_out { void** frames; int n; };
+static _Unwind_Reason_Code unwind_frame(struct _Unwind_Context* context, void* arg)
+{
+    stack_out* out = (stack_out*)arg;
+    uintptr_t ip = (uintptr_t)_Unwind_GetIP(context);
+    if (!ip) return _URC_END_OF_STACK;
+    /* The first two frames are unwind_frame and capture_stack, as the skip
+     * of the Windows form. */
+    if (out->n >= 2 && out->n < 10) out->frames[out->n - 2] = (void*)ip;
+    out->n++;
+    return out->n < 10 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+static void capture_stack(void)
+{
+    stack_out out = { stack_at_fire, 0 };
+    _Unwind_Backtrace(unwind_frame, &out);
+}
+#endif
+
 extern "C" {
 uint32_t alias_fixup_impl(uint32_t ea);
 void sysmem_alias_record(uint32_t addr, uint32_t size);
 /* The production fixup, behind a counter. The alias file is compiled with
  * sysmem_spu_alias_fixup=alias_fixup_impl. */
 uint32_t sysmem_spu_alias_fixup(uint32_t ea) { fixups++; return alias_fixup_impl(ea); }
-/* vm_read_sync_any stays 0, so the read sync never calls the dispatch. */
-void vm_read_sync_dispatch(uint32_t address, uint32_t bytes) { printf("FAIL read_sync_dispatch\n"); exit(1); }
+/* The handler of the read sync counts its calls. It runs for a read that
+ * meets a marked page. The paths before PPU_FM4 mark no page in the modes
+ * that do not say it, so it does not run there. */
+static long long syncs;
+static uint32_t sync_addr, sync_bytes;
+void sync_handler(uint32_t address, uint32_t bytes, void*)
+{
+    syncs++; sync_addr = address; sync_bytes = bytes;
+}
+/* A hook of the read sync that records the state at its call. */
+static unsigned hook_first, hook_last, hook_flag, hook_marked;
+void order_hook(unsigned first, unsigned last)
+{
+    hook_first = first; hook_last = last;
+    hook_flag = vm_read_sync_any; hook_marked = vm_read_sync_pages[first];
+}
+struct spu_context;                 /* the fixture has no SPU context */
+void spu_coh_reserve(struct spu_context* ctx, uint32_t ea);
 uint8_t  vm_read8 (uint64_t a) { family[0]++; last_family_addr = a; return 0x5Au; }
 uint16_t vm_read16(uint64_t a) { family[1]++; last_family_addr = a; return 0x5AA5u; }
 uint32_t vm_read32(uint64_t a) { family[2]++; last_family_addr = a; return 0x5AA5C35Au; }
@@ -169,10 +222,10 @@ void vm_write16(uint64_t a, uint16_t) { family[5]++; last_family_addr = a; }
 void vm_write32(uint64_t a, uint32_t) { family[6]++; last_family_addr = a; }
 void vm_write64(uint64_t a, uint64_t) { family[7]++; last_family_addr = a; }
 void ppu_fm_refpoll(void) { refpolls++; }
-void ppu_fm_hotread8 (uint32_t ea, void* ra) { fires++; fire_ea = ea; fire_v = 0; fire_ra = ra; }
-void ppu_fm_hotread16(uint32_t ea, void* ra) { fires++; fire_ea = ea; fire_v = 0; fire_ra = ra; }
-void ppu_fm_hotread32(uint32_t ea, uint32_t v, void* ra) { fires++; fire_ea = ea; fire_v = v; fire_ra = ra; }
-void ppu_fm_hotread64(uint32_t ea, uint64_t v, void* ra) { fires++; fire_ea = ea; fire_v = v; fire_ra = ra; }
+void ppu_fm_hotread8 (uint32_t ea, void* ra) { fires++; fire_ea = ea; fire_v = 0; fire_ra = ra; capture_stack(); }
+void ppu_fm_hotread16(uint32_t ea, void* ra) { fires++; fire_ea = ea; fire_v = 0; fire_ra = ra; capture_stack(); }
+void ppu_fm_hotread32(uint32_t ea, uint32_t v, void* ra) { fires++; fire_ea = ea; fire_v = v; fire_ra = ra; capture_stack(); }
+void ppu_fm_hotread64(uint32_t ea, uint64_t v, void* ra) { fires++; fire_ea = ea; fire_v = v; fire_ra = ra; capture_stack(); }
 }
 
 char* getenv(const char* name)
@@ -230,8 +283,10 @@ static const class_t classes[] = {
     {"raw",          K_RAW,         0xE0040400u},
     {"refpoll",      K_REF,         0x7FE02008u},
     {"oob",          K_OOB,         0x49000100u},
-    {"oob_window",   K_OOB,         0x4A000100u},
     {"oob_edge",     K_EDGE,        0x47FFFFFFu},
+    {"end4",         K_EDGE,        0x47FFFFFCu},   /* 8 bytes end past the end: only width 8 */
+    {"end8",         K_EDGE,        0x47FFFFF8u},   /* 8 bytes end inside the page before the end */
+    {"end_prev",     K_EDGE,        0x47FFEFFCu},   /* the page before the page of the end */
 };
 #define CLASSES (int)(sizeof classes / sizeof classes[0])
 static const int WIDTH[8] = { 1, 2, 4, 8, 1, 2, 4, 8 };
@@ -250,7 +305,7 @@ static int fail(const char* what, unsigned long long value, unsigned long long e
 static void reset(void)
 {
     memset(family, 0, sizeof family);
-    fires = refpolls = fixups = 0;
+    fires = refpolls = fixups = syncs = 0;
     last_family_addr = 0;
     ppu_vm_size = 0; g_spu_coh_armed = 0; ppu_fm_spin_det = 1;
     memset(g_spu_coh_bitmap, 0, PPU_FM_COH_BITMAP_BYTES);
@@ -283,26 +338,54 @@ static int out_family(int acc, uint32_t ea)
     return 0;
 }
 
+#if PPU_FM4
+/* The lean gate tests one page byte. Bounds rule: a page is flagged when an
+ * access of 8 bytes that starts at its last byte ends past ppu_vm_size. So
+ * the page before the end is flagged too, for each width. */
+static int page_flagged(uint32_t ea)
+{
+    return ppu_vm_size != 0
+        && (uint64_t)(ea & ~(uint32_t)0xFFFu) + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size;
+}
+#endif
+
 /* True when the access leaves the gate for the out-of-line function. */
 static int goes_out(int acc, const class_t* c)
 {
     int read = acc < 4;
     int oob = ppu_vm_size != 0 && ppu_fm_oob(c->ea, (uint32_t)WIDTH[acc]);
     if (ppu_fm_slow & (read ? PPU_FM_S_READ : PPU_FM_S_WRITE)) return 1;
+#if PPU_FM4
+    (void)oob;
+#endif
     switch (c->kind) {
     case K_PLAIN:
-    case K_BIT31: return oob;
+    case K_BIT31:
+#if PPU_FM4
+        return page_flagged(c->ea);
+#else
+        return oob;
+#endif
     case K_NULL:
     case K_RAW: return 1;                               /* the page table flags them */
     case K_REF: return read || oob;                     /* the page table flags it for reads */
     case K_OOB:
-    case K_EDGE: return oob || (!PPU_FM3 && in_window(c->ea));
+    case K_EDGE:
+#if PPU_FM4
+        return page_flagged(c->ea) || (in_window(c->ea) && FIXTURE_WINDOW_OUT);
+#else
+        return oob || (!PPU_FM3 && in_window(c->ea));
+#endif
     default:
         /* Pages of the window. PPU_FM3 1 keeps IDENTITY and ALIAS pages
          * inline. MIXED pages and an access out of bounds go out. */
+#if PPU_FM4
+        return FIXTURE_WINDOW_OUT;                      /* FIXTURE_WINDOW_RULE */
+#else
         if (!PPU_FM3) return 1;
         if (c->kind == K_MIXED_ALIAS || c->kind == K_MIXED_SELF) return 1;
         return ppu_fm_oob(c->ea, (uint32_t)WIDTH[acc]);
+#endif
     }
 }
 
@@ -492,18 +575,34 @@ extern "C" FIXTURE_NOINLINE FIXTURE_OPTNONE uint64_t spin_read##width(uint32_t e
 #endif
 SPIN(8) SPIN(16) SPIN(32) SPIN(64)
 
+/* The start of the function that holds an address. The rule on the fire
+ * address uses it, so that it does not depend on the order of the functions
+ * in the image. */
+#ifdef _WIN32
+static void* enclosing(void* pc)
+{
+    typedef const unsigned int* (WINAPI *LOOKUP)(ULONG_PTR, ULONG_PTR*, void*);
+    static LOOKUP lookup = (LOOKUP)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlLookupFunctionEntry");
+    ULONG_PTR base = 0;
+    const unsigned int* entry = lookup ? lookup((ULONG_PTR)pc, &base, 0) : 0;
+    return entry ? (void*)(base + entry[0]) : 0;
+}
+#else
+static void* enclosing(void* pc) { return _Unwind_FindEnclosingFunction(pc); }
+#endif
+
 static int spin_at(int acc, uint32_t ea, uint32_t fire_ea_want)
 {
     const char* names[4] = { "read8", "read16", "read32", "read64" };
     char what[64];
     uint64_t (*fn[4])(uint32_t) = { spin_read8, spin_read16, spin_read32, spin_read64 };
-    void* start[4] = { (void*)spin_read8, (void*)spin_read16, (void*)spin_read32, (void*)spin_read64 };
     uint64_t raw[4] = { 0, 0, vm_base[fire_ea_want] | vm_base[fire_ea_want + 1] << 8
                         | vm_base[fire_ea_want + 2] << 16 | (uint64_t)vm_base[fire_ea_want + 3] << 24,
                         (uint64_t)vm_base[fire_ea_want] | (uint64_t)vm_base[fire_ea_want + 1] << 8
                         | (uint64_t)vm_base[fire_ea_want + 2] << 16 | (uint64_t)vm_base[fire_ea_want + 3] << 24
                         | (uint64_t)vm_base[fire_ea_want + 4] << 32 | (uint64_t)vm_base[fire_ea_want + 5] << 40
                         | (uint64_t)vm_base[fire_ea_want + 6] << 48 | (uint64_t)vm_base[fire_ea_want + 7] << 56 };
+    void* start[4] = { (void*)spin_read8, (void*)spin_read16, (void*)spin_read32, (void*)spin_read64 };
     snprintf(what, sizeof what, "spin_%s", names[acc]);
     /* The first read of an address only records it. Reads after it count
      * (PPU_FM_SPIN_DET): one read comes first. */
@@ -513,19 +612,53 @@ static int spin_at(int acc, uint32_t ea, uint32_t fire_ea_want)
     if (fires != 1) return fail(what, fires, 1);
     if (fire_ea != fire_ea_want) return fail(what, fire_ea, fire_ea_want);
     if (fire_v != raw[acc]) return fail(what, fire_v, raw[acc]);
-    /* The caller address is in the function that reads, not in the
-     * out-of-line copy of the accessor. The reader is one block (optnone)
-     * and is smaller than 4096 bytes. */
-    int inside = (uintptr_t)fire_ra - (uintptr_t)start[acc] < 0x1000;
+    /* On the lean gate, an access of a page with a route bit takes the
+     * out-of-line function. The report then comes from that function or
+     * from its tail call: the reported function is one of the functions
+     * from the stub down to the reader (inclusive), and at least one
+     * function lies between the stub and the reader. */
+    int out = PPU_FM4 && (ppu_fm_kind[ea >> PPU_FM_PAGE_SHIFT] & (PPU_FM_K_READ | PPU_FM_K_WRITE));
+    /* The fire address of an inline access lies in the reader. Inline
+     * layout: the reader holds the call site (always_inline bodies are
+     * inlined into an optnone function), and the header function that
+     * reports reads its own return address. One copy per unit: the
+     * out-of-line accessor passes its own return address, which lies in
+     * the reader that called it. The stack at the fire proves the layout
+     * of the one copy per unit: at least one function (the accessor copy)
+     * lies between the reader and the function that reports. Header
+     * functions that only call the next one can share one frame, so the
+     * check does not count frames below that. */
+    int frame = 0;
+    while (frame < 8 && enclosing(stack_at_fire[frame]) != start[acc]) frame++;
+    void* found = enclosing(fire_ra);
+    int site_ok;
+    if (out) {
+        int bounded = frame >= 1 && frame < 8;
+        site_ok = 0;
+        for (int i = 0; bounded && i <= frame; i++)
+            site_ok = site_ok || enclosing(stack_at_fire[i]) == found;
+    } else if (PPU_FM3) {
+        site_ok = found == start[acc] && (PPU_FM_INLINE_FAST || frame >= 1);
+    } else {
+        /* The build before step 3. The report address is a label of the
+         * accessor, and the accessor can stay one out-of-line function next
+         * to its reader. So the rule is the rule of that build: the address
+         * lies in the 4096 bytes of the reader, and with one copy per unit
+         * not in that copy. */
+        site_ok = (uintptr_t)fire_ra - (uintptr_t)start[acc] < 0x1000;
 #if !PPU_FM_INLINE_FAST
-    /* One copy per unit: the copy of the accessor is a function of this
-     * image. Its size is below 1024 bytes. The fire address must not be in
-     * it. */
-    void* copies[4] = { (void*)ppu_fm_read8, (void*)ppu_fm_read16, (void*)ppu_fm_read32,
-                       (void*)ppu_fm_read64 };
-    if ((uintptr_t)fire_ra - (uintptr_t)copies[acc] < 0x400) inside = 0;
+        void* copies[4] = { (void*)ppu_fm_read8, (void*)ppu_fm_read16, (void*)ppu_fm_read32,
+                           (void*)ppu_fm_read64 };
+        if ((uintptr_t)fire_ra - (uintptr_t)copies[acc] < 0x400) site_ok = 0;
 #endif
-    if (!inside) return fail(what, (unsigned long long)(uintptr_t)fire_ra, (unsigned long long)(uintptr_t)start[acc]);
+    }
+    if (!site_ok) {
+        printf("stack at fire (reader %p, frame %d):", start[acc], frame);
+        for (int i = 0; i < 8; i++) printf(" %p/%p", stack_at_fire[i], enclosing(stack_at_fire[i]));
+        printf(", fire address %p\n", fire_ra);
+        return fail(what, (unsigned long long)(uintptr_t)found,
+                    out ? 0 : (unsigned long long)(uintptr_t)start[acc]);
+    }
     (void)fn[acc](ea);
     if (fires != 2) return fail(what, fires, 2);
     return 0;
@@ -589,11 +722,14 @@ static int counter(void)
     return 0;
 }
 
+/* Reserves the line of an EA as the SPU does (the production writer), or
+ * clears the line of the fixture. Production never
+ * clears a bit. */
 static void set_line(uint32_t ea, int on)
 {
+    if (on) { spu_coh_reserve(0, ea); return; }
     uint32_t line = ea >> 7;
-    if (on) g_spu_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    else    g_spu_coh_bitmap[line >> 3] &= (unsigned char)~(1u << (line & 7));
+    g_spu_coh_bitmap[line >> 3] &= (unsigned char)~(1u << (line & 7));
 }
 
 /* A store on a reserved line goes to the family with the address of the
@@ -621,6 +757,94 @@ static int coherent(void)
     }
     return 0;
 }
+
+/* ---- PPU_FM4: the lean gate ---- */
+#if PPU_FM4
+/* Each bit of the page byte: the content that the writers must set. The
+ * rules of the boot arm, of the read sync, and of the bounds. */
+static int page_byte(const char* what, uint32_t ea, unsigned char want)
+{
+    unsigned char got = ppu_fm_kind[ea >> PPU_FM_PAGE_SHIFT];
+    if (got != want) return fail(what, got, want);
+    return 0;
+}
+
+static int lean_bits(void)
+{
+    /* The boot arm: no knob, bounds off. */
+    if (page_byte("bits_plain", 0x10000100u, 0)) return 1;
+    if (page_byte("bits_null0", 0x00000000u, PPU_FM_K_READ | PPU_FM_K_WRITE)) return 1;
+    if (page_byte("bits_null1", 0x00001000u, PPU_FM_K_READ)) return 1;
+    if (page_byte("bits_raw", 0xE0040400u, PPU_FM_K_READ | PPU_FM_K_WRITE)) return 1;
+    if (page_byte("bits_refpoll", 0x7FE02008u, PPU_FM_K_READ)) return 1;
+    /* The read sync: the pages of the range get the read bit and the owner
+     * bit. The page before the range gets the read bit. No page gets the
+     * write bit. */
+    if (vm_read_sync_mark_range(0x20001000u, 0x2000u)) return fail("sync_mark", 1, 0);
+    if (page_byte("bits_sync_before", 0x20000000u, PPU_FM_K_READ)) return 1;
+    if (page_byte("bits_sync_first", 0x20001000u, PPU_FM_K_READ | PPU_FM_K_SYNC)) return 1;
+    if (page_byte("bits_sync_last", 0x20002000u, PPU_FM_K_READ | PPU_FM_K_SYNC)) return 1;
+    if (page_byte("bits_sync_after", 0x20003000u, 0)) return 1;
+    /* The bounds: the page of the end and the page before it are flagged
+     * for reads and writes. The page before that is not flagged. */
+    ppu_vm_size = 0x10010000u;
+    ppu_fm_arm();
+    if (page_byte("bits_end", 0x10010000u, PPU_FM_K_READ | PPU_FM_K_WRITE)) return 1;
+    if (page_byte("bits_end_minus1", 0x1000F000u, PPU_FM_K_READ | PPU_FM_K_WRITE)) return 1;
+    if (page_byte("bits_end_minus2", 0x1000E000u, 0)) return 1;
+    return 0;
+}
+
+/* The read sync on the lean path. The page byte sends each read of a marked
+ * page, and each read that ends in a marked page, to the out-of-line
+ * function. That function has the test of the marks: it calls the handler
+ * for that read, with the address and the width of the access. No store
+ * calls it. */
+static int lean_sync(void)
+{
+    /* Marked: [base + 0x1000, base + 0x3000). */
+    const uint32_t base = 0x21000000u;
+    const char* names[8] = { "read8", "read16", "read32", "read64", "write8", "write16",
+                             "write32", "write64" };
+    char what[64];
+    commit(base);
+    vm_read_sync_set_handler(sync_handler, 0);
+    /* Before the mark no page is flagged: no read calls the handler. */
+    syncs = 0;
+    for (int acc = 0; acc < 4; acc++) (void)read_value(acc, base + 0x1004u);
+    if (syncs) return fail("sync_unmarked", syncs, 0);
+    if (vm_read_sync_mark_range(base + 0x1000u, 0x2000u)) return fail("sync_mark", 1, 0);
+    for (int acc = 0; acc < 8; acc++) {
+        const int width = WIDTH[acc], read = acc < 4;
+        const uint32_t at[5] = { base + 0x1004u,        /* inside the range */
+                                 base + 0x1000u - width,     /* the page before: ends before the range */
+                                 base + 0x1000u - width + 1, /* the page before: its last byte is in the range */
+                                 base + 0x2FFCu,             /* the last marked page */
+                                 base + 0x3000u };           /* the page after the range */
+        const int want[5] = { read, 0, read, read, 0 };
+        for (int i = 0; i < 5; i++) {
+            snprintf(what, sizeof what, "sync_%s_%d", names[acc], i);
+            syncs = 0; sync_addr = 0; sync_bytes = 0;
+            if (read) (void)read_value(acc, at[i]);
+            else write_value(acc, at[i], (uint64_t)acc);
+            if (syncs != want[i]) return fail(what, syncs, want[i]);
+            if (want[i] && (sync_addr != at[i] || sync_bytes != (uint32_t)width))
+                return fail(what, sync_addr, at[i]);
+        }
+    }
+    /* The writer calls the hook after its marks and after its flag. A hook
+     * of the fixture records the state at the call. The pages of this
+     * range stay without a page byte: no later test reads them. */
+    vm_read_sync_set_mark_hook(order_hook);
+    hook_flag = hook_marked = 0;
+    if (vm_read_sync_mark_range(base + 0x10000u, 0x1000u)) return fail("sync_mark_hook", 1, 0);
+    if (hook_first != (base + 0x10000u) >> 12 || hook_last != hook_first)
+        return fail("sync_hook_pages", hook_first, (base + 0x10000u) >> 12);
+    if (hook_flag != 1) return fail("sync_hook_flag", hook_flag, 1);
+    if (hook_marked != 1) return fail("sync_hook_marked", hook_marked, 1);
+    return 0;
+}
+#endif
 
 int main(int argc, char** argv)
 {
@@ -666,15 +890,95 @@ int main(int argc, char** argv)
         g_spu_coh_armed = 1;
         return coherent() || probes();
     }
+#if PPU_FM4
+    if (!strcmp(mode, "leanbits")) return lean_bits();
+    if (!strcmp(mode, "leansync")) return lean_sync();
+#endif
     printf("FAIL mode %s unknown\n", mode);
     return 1;
 }
 '''
 
 MODES = ("unarmed", "all", "count", "diag", "kill", "watch", "bounds", "spin", "spinoff", "coh")
+LEAN_MODES = ("leanbits", "leansync")     # the lean gate (PPU_FM4)
 LAYOUTS = (1, 0)     # PPU_FM_INLINE_FAST: inline at each call site, then one copy per unit
-PATHS = (None, 1, 0)   # PPU_FM3: the default, 1, then the path before this change
+# The paths, as lists of defines: the lean gate (the default of the header),
+# step 3 (PPU_FM4 0), and the path before step 3 (PPU_FM3 0).
+PATHS = (("lean", ()), ("fm3", ("PPU_FM3=1", "PPU_FM4=0")), ("fm0", ("PPU_FM3=0",)))
 WIDTHS = ("8", "16", "32", "64")
+SYNC = Path("runtime/memory/guest_read_sync.c")
+COHERENCY = Path("runtime/spu/spu_coherency.c")
+
+# The lean gate (PPU_FM4): (name, anchor, replacement, layouts, path).
+HEADER_LEAN_MUTANTS = [
+    ("lean gate ignores the page byte",
+     "((unsigned char)((k) | (unsigned char)ppu_fm_slow) & (unsigned char)((kind) | (mask)))",
+     "((unsigned char)(ppu_fm_slow) & (unsigned char)((kind) | (mask)))", (1,), "lean"),
+    ("lean gate ignores the flag word",
+     "((unsigned char)((k) | (unsigned char)ppu_fm_slow) & (unsigned char)((kind) | (mask)))",
+     "((unsigned char)(k) & (unsigned char)((kind) | (mask)))", (1,), "lean"),
+    ("lean read gate takes the mask of a write",
+     "PPU_FM_LEAN(k, PPU_FM_K_READ, PPU_FM_S_READ)))",
+     "PPU_FM_LEAN(k, PPU_FM_K_WRITE, PPU_FM_S_WRITE)))", (1,), "lean"),
+    ("page byte: the writer sets no bit",
+     "    __atomic_fetch_or(&ppu_fm_kind[page], bits, __ATOMIC_RELEASE);\n", "    (void)bits;\n",
+     (1,), "lean"),
+]
+
+ARM_LEAN_MUTANTS = [
+    ("lean bounds: the page before the end not flagged",
+     "        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)\n",
+     "        if (0)\n", (1,), "lean"),
+    ("sync hook not installed", "    vm_read_sync_set_mark_hook(ppu_fm_mark_sync);\n", "", (1,), "lean"),
+    ("sync hook: the page before the range not flagged",
+     "    if (first > 0) ppu_fm_page_or(first - 1u, (unsigned char)PPU_FM_K_READ);\n", "", (1,), "lean"),
+    ("sync hook: the last pages of the range not flagged",
+     "    for (unsigned p = first; p <= last; p++)\n"
+     "        ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));\n",
+     "    ppu_fm_page_or(first, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));\n", (1,), "lean"),
+    ("sync hook flags stores too",
+     "        ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));\n",
+     "        ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE | PPU_FM_K_SYNC));\n",
+     (1,), "lean"),
+    ("sync hook: owner bit not set",
+     "        ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));\n",
+     "        ppu_fm_page_or(p, (unsigned char)PPU_FM_K_READ);\n", (1,), "lean"),
+]
+
+SYNC_MUTANTS = [
+    ("sync: the hook is not called", "    if(s_mark_hook)s_mark_hook(first,last);\n", "", (1,), "lean"),
+    ("sync: the hook runs before the marks and the flag",
+     "    for(unsigned page=first;page<=last;page++) {\n",
+     (("    for(unsigned page=first;page<=last;page++) {\n",
+       "    if(s_mark_hook)s_mark_hook(first,last);\n    for(unsigned page=first;page<=last;page++) {\n"),
+      ("    if(s_mark_hook)s_mark_hook(first,last);\n    return 0;\n", "    return 0;\n")),
+     (1,), "lean"),
+]
+
+COHERENCY_MUTANTS = []
+
+# The mutants of the paths before PPU_FM4 that must fail on the lean path too:
+# their code is the same there.
+ALSO_LEAN = ("read32: ref-poll fence skipped", "fire helper passes a null caller address",
+             "fire dispatch ignores the caller address", "one copy per unit: null caller address",
+             "byte order of write16 turned", "null test of read32 removed", "raw SPU test of read32 removed",
+             "ALIAS state published as MIXED", "page table not updated", "EA bit 31 rule lost",
+             "partly covered page published as IDENTITY")
+# (group, mutants, key of the file text). The anchor of a mutant must occur
+# once, in the header at least once.
+GROUPS = (("header", HEADER_MUTANTS, "header"), ("alias", ALIAS_MUTANTS, "alias"),
+          ("arm", ARM_MUTANTS, "arm"), ("header", HEADER_LEAN_MUTANTS, "header"),
+          ("arm", ARM_LEAN_MUTANTS, "arm"), ("sync", SYNC_MUTANTS, "sync"),
+          ("coherency", COHERENCY_MUTANTS, "coh"))
+
+# The externals of the coherency file that the fixture does not use. The
+# file links whole: its reserve function is a writer of the page byte.
+COHERENCY_STUB = r'''
+#include <stdint.h>
+void spu_ch_wake(void);
+void spu_ch_wake(void) {}
+uint64_t g_spu_lane_trace, g_spu_ls_gate;
+'''
 
 
 def arm_text(loader):
@@ -698,37 +1002,48 @@ def run_command(environment, work, command):
     return result
 
 
-def build(environment, work, cc, msvc_style, header, arm, alias, vendor, fm3, inline_fast):
-    """Writes the header, the arm text and the alias file into `work`, then
-    builds `fixture` there. fm3: None (the default of the header), 1 or 0."""
+def build(environment, work, cc, msvc_style, texts, path_defines, vendor, inline_fast=1):
+    """Writes the header copy, the arm text and the production files into
+    `work`, then builds `fixture` there. texts: the keys of GROUPS.
+    path_defines: the defines of the path. inline_fast: PPU_FM_INLINE_FAST."""
     work.mkdir(parents=True, exist_ok=True)
     target = work / "mut" / FASTMEM
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(header)
+    target.write_text(texts["header"])
     (work / "fixture.cpp").write_text(FIXTURE)
-    (work / "arm.inc").write_text(arm)
-    (work / "alias.c").write_text(alias)
+    (work / "arm.inc").write_text(texts["arm"])
+    (work / "alias.c").write_text(texts["alias"])
+    (work / "sync.c").write_text(texts["sync"])
+    (work / "coh.c").write_text(texts["coh"])
+    (work / "cohstub.c").write_text(COHERENCY_STUB)
+    defines = ["PPU_FM_INLINE_FAST=%d" % inline_fast] + list(path_defines)
     directories = [work / "mut" / "include", vendor / "include", vendor / "runtime" / "spu"]
-    defines = ["PPU_FM_INLINE_FAST=%d" % inline_fast] + ([] if fm3 is None else ["PPU_FM3=%d" % fm3])
     if msvc_style:
         common = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything"]
         common += ["/D" + d for d in defines] + ["/I" + p for p in map(str, directories)]
         fixture = common + ["/c", "fixture.cpp", "/Fofixture.obj"]
-        alias = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything",
-                 "/Dsysmem_spu_alias_fixup=alias_fixup_impl"] \
-            + ["/I" + p for p in map(str, directories)] + ["/c", "alias.c", "/Foalias.obj"]
-        link = [cc, "/nologo", "fixture.obj", "alias.obj", "/Fefixture" + EXE]
+        plain = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything"] \
+            + ["/I" + p for p in map(str, directories)]
+        alias = plain + ["/Dsysmem_spu_alias_fixup=alias_fixup_impl", "/c", "alias.c", "/Foalias.obj"]
+        sync = plain + ["/c", "sync.c", "/Fosync.obj"]
+        coh = plain + ["/c", "coh.c", "/Focoh.obj"]
+        stub = plain + ["/c", "cohstub.c", "/Focohstub.obj"]
+        link = [cc, "/nologo", "fixture.obj", "alias.obj", "sync.obj", "coh.obj", "cohstub.obj",
+                "/Fefixture" + EXE]
     else:
         # The fixture is C++. clang, cc and gcc need their C++ drivers.
         driver = {"clang": "clang++", "cc": "c++", "gcc": "g++"}.get(Path(cc).name.lower(), cc)
         options = ["-std=c++17", "-O2", "-UNDEBUG", "-Wno-everything"]
         common = [driver] + options + ["-D" + d for d in defines] + ["-I" + p for p in map(str, directories)]
         fixture = common + ["-c", "fixture.cpp", "-o", "fixture.o"]
-        alias = [cc, "-O2", "-Wno-everything", "-Dsysmem_spu_alias_fixup=alias_fixup_impl"] \
-            + ["-I" + p for p in map(str, directories)] + ["-c", "alias.c", "-o", "alias.o"]
-        link = [driver] + ["fixture.o", "alias.o", "-o", "fixture" + EXE]
-    run_command(environment, work, fixture)
-    run_command(environment, work, alias)
+        plain = [cc, "-O2", "-Wno-everything"] + ["-I" + p for p in map(str, directories)]
+        alias = plain + ["-Dsysmem_spu_alias_fixup=alias_fixup_impl", "-c", "alias.c", "-o", "alias.o"]
+        sync = plain + ["-c", "sync.c", "-o", "sync.o"]
+        coh = plain + ["-c", "coh.c", "-o", "coh.o"]
+        stub = plain + ["-c", "cohstub.c", "-o", "cohstub.o"]
+        link = [driver, "fixture.o", "alias.o", "sync.o", "coh.o", "cohstub.o", "-o", "fixture" + EXE]
+    for command in (fixture, alias, sync, coh, stub):
+        run_command(environment, work, command)
     obj = "fixture.obj" if msvc_style else "fixture.o"
     copies = accessor_copies(environment, cc, work / obj)
     run_command(environment, work, link)
@@ -753,20 +1068,24 @@ def accessor_copies(environment, cc, obj):
     return sorted(set(found))
 
 
-def expected_copies(fm3, inline_fast):
+def expected_copies(path, inline_fast):
     if inline_fast == 0:
         return sorted((kind, width) for kind in ("read", "write") for width in WIDTHS)
-    if fm3 == 0:
+    if path == "fm0":
         return sorted(("read", width) for width in WIDTHS)
     return []
 
 
-def verify(work):
-    for mode in MODES:
+def modes_of(path):
+    return MODES + (LEAN_MODES if path == "lean" else ())
+
+
+def verify(work, modes, path):
+    for mode in modes:
         result = subprocess.run(QUIET + [str(work / ("fixture" + EXE)), mode], capture_output=True,
                                 text=True, errors="replace", timeout=240)
         assert result.returncode == 0 and not result.stdout, \
-            (mode, result.returncode, result.stdout.strip()[-700:], result.stderr.strip()[-300:])
+            (path, mode, result.returncode, result.stdout.strip()[-700:], result.stderr.strip()[-300:])
 
 
 def reason(error):
@@ -779,20 +1098,48 @@ def reason(error):
     return (lines[0] if lines else text)[:150]
 
 
+def pairs_of(anchor, replacement):
+    """The (old, new) pairs of a mutant. A tuple holds the pairs; else the
+    pair is (anchor, replacement)."""
+    return replacement if isinstance(replacement, tuple) else ((anchor, replacement),)
+
+
+def mutant_paths(name, mutant):
+    """The paths of a mutant: its own path, or the path of step 3 and, for
+    ALSO_LEAN, the lean path too."""
+    if len(mutant) > 4:
+        return (mutant[4],)
+    return ("fm3", "lean") if name in ALSO_LEAN else ("fm3",)
+
+
+def apply_edits(name, text, anchor, replacement):
+    for old, new in pairs_of(anchor, replacement):
+        assert text.count(old) >= 1, (name, old)
+        text = text.replace(old, new)
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vendor", type=Path, default=VENDOR)
+    parser.add_argument("--only", default="",
+                        help="commas: the mutants with one of these texts in the name")
+    parser.add_argument("--skip-actual", action="store_true",
+                        help="no build of the texts without a mutant")
     args = parser.parse_args()
-    header = (args.vendor / FASTMEM).read_text()
-    loader = (args.vendor / LOADER).read_text()
-    alias = (args.vendor / ALIAS).read_text()
-    arm = arm_text(loader)
-    for name, anchor, *_ in HEADER_MUTANTS:
-        assert header.count(anchor) >= 1, (name, anchor)
-    for name, anchor, *_ in ALIAS_MUTANTS:
-        assert alias.count(anchor) == 1, (name, anchor)
-    for name, anchor, *_ in ARM_MUTANTS:
-        assert arm.count(anchor) == 1, (name, anchor)
+    key_of = dict((group, key) for group, group_mutants, key in GROUPS)
+    texts = {"header": (args.vendor / FASTMEM).read_text(),
+             "arm": arm_text((args.vendor / LOADER).read_text()),
+             "alias": (args.vendor / ALIAS).read_text(),
+             "sync": (args.vendor / SYNC).read_text(),
+             "coh": (args.vendor / COHERENCY).read_text()}
+    mutants = [(group, mutant) for group, group_mutants, key in GROUPS for mutant in group_mutants
+               if mutant[2] is not None]
+    for group, mutant in mutants:
+        name = mutant[0]
+        for old, new in pairs_of(mutant[1], mutant[2]):
+            found = texts[key_of[group]].count(old)
+            assert found >= 1 and (group == "header" or found == 1), (name, old)
     assert FIXTURE.count("#include \"ps3emu/ppu_fastmem.h\"") == 1
     assert FIXTURE.count('"arm.inc"') == 1
 
@@ -803,42 +1150,41 @@ def main():
     cc = environment.get("MV_CLANG") or compiler()
     msvc_style = Path(cc).name.lower() in ("cl", "cl.exe", "clang-cl", "clang-cl.exe")
 
-    def make(root, fm3, inline_fast, header_text, arm_text_, alias_text):
-        copies = build(environment, root, cc, msvc_style, header_text, arm_text_, alias_text,
-                       args.vendor, fm3, inline_fast)
-        assert copies == expected_copies(fm3, inline_fast), \
-            "out-of-line accessors %s, want %s" % (copies, expected_copies(fm3, inline_fast))
-        verify(root)
+    def make(root, path, inline_fast, parts):
+        copies = build(environment, root, cc, msvc_style, parts, list(dict(PATHS)[path]), args.vendor,
+                       inline_fast)
+        assert copies == expected_copies(path, inline_fast), \
+            "out-of-line accessors %s, want %s" % (copies, expected_copies(path, inline_fast))
+        verify(root, modes_of(path), path)
 
-    rejected = []
+    rejections = 0
     with tempfile.TemporaryDirectory(prefix="ppu-fastmem3-") as directory:
         root = Path(directory)
-        for fm3 in PATHS:
-            for inline_fast in LAYOUTS:
-                make(root / "actual", fm3, inline_fast, header, arm, alias)
-        groups = (("header", HEADER_MUTANTS, (header, arm, alias)),
-                  ("alias", ALIAS_MUTANTS, (header, arm, alias)),
-                  ("arm", ARM_MUTANTS, (header, arm, alias)))
-        for group, mutants, texts in groups:
-            for mutant in mutants:
-                name, anchor, replacement = mutant[:3]
-                layouts = mutant[3] if len(mutant) > 3 else (1,)
-                parts = list(texts)
-                position = {"header": 0, "alias": 2, "arm": 1}[group]
-                changed = parts[position].replace(anchor, replacement)
-                assert changed != parts[position], name
-                parts[position] = changed
+        if not args.skip_actual:
+            for path, defines in PATHS:
+                for inline_fast in LAYOUTS:
+                    make(root / "actual", path, inline_fast, texts)
+        for group, mutant in mutants:
+            if args.only and not any(text in mutant[0] for text in args.only.split(",")):
+                continue
+            name, anchor, replacement = mutant[:3]
+            layouts = mutant[3] if len(mutant) > 3 else (1,)
+            parts = dict(texts)
+            parts[key_of[group]] = apply_edits(name, texts[key_of[group]], anchor, replacement)
+            for path in mutant_paths(name, mutant):
                 for inline_fast in layouts:
                     try:
-                        make(root / "mutant", None, inline_fast, parts[0], parts[1], parts[2])
+                        make(root / "mutant", path, inline_fast, parts)
                     except AssertionError as error:
-                        rejected.append(name)
-                        print("rejected: %s (layout %d): %s" % (name, inline_fast, reason(error)))
+                        rejections += 1
+                        print("rejected: %s (path %s, layout %d): %s"
+                              % (name, path, inline_fast, reason(error)))
                     else:
-                        raise AssertionError("mutant accepted: " + name)
-        count = len(HEADER_MUTANTS) + len(ALIAS_MUTANTS) + len(ARM_MUTANTS)
-    print("PASS: PPU_FM3 fast memory path, %d paths x %d layouts, %d mutants rejected"
-          % (len(PATHS), len(LAYOUTS), count))
+                        raise AssertionError("mutant accepted: %s (path %s, layout %d)"
+                                             % (name, path, inline_fast))
+    print("PASS%s: PPU fast memory path (PPU_FM3 and the PPU_FM4 lean gate), %d paths x %d layouts, "
+          "%d mutants rejected" % ("" if not args.only and not args.skip_actual else " (batch)",
+                                   len(PATHS), len(LAYOUTS), rejections))
 
 
 if __name__ == "__main__":

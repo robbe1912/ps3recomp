@@ -1836,6 +1836,21 @@ extern "C" void ppu_fm_count_hit(unsigned k)
         ppu_fm_count_tick();
 }
 
+#if PPU_FM4
+/* PPU_FM4: sets the page bytes of the fast memory path for a range that the
+ * read sync marks. The lean gate of a PPU read has no inline test of the
+ * marks: it sends each read of a flagged page to the out-of-line function,
+ * and that function has the test. Reads get the route bit: the sync is for
+ * reads only. The page before the range gets it too: an access of up to 8
+ * bytes that starts there can end in the range. */
+static void ppu_fm_mark_sync(unsigned first, unsigned last)
+{
+    if (first > 0) ppu_fm_page_or(first - 1u, (unsigned char)PPU_FM_K_READ);
+    for (unsigned p = first; p <= last; p++)
+        ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));
+}
+#endif
+
 /* Decides at boot which memory accesses leave the fast paths: sets the flag
  * word ppu_fm_slow and fills the page table ppu_fm_kind. A second call
  * computes the same state.
@@ -1856,12 +1871,22 @@ extern "C" void ppu_fm_arm(void)
     const char* spindet;
     const char* count;
     const char* atom;
+#if PPU_FM4
+    vm_read_sync_set_mark_hook(ppu_fm_mark_sync);
+#endif
     for (uint32_t p = 0; p < PPU_FM_PAGES; p++) {
         uint32_t e = p << PPU_FM_PAGE_SHIFT;
         unsigned char kind = 0;
         /* Bounds: each page that is not entirely inside ppu_vm_size. */
         if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE > ppu_vm_size)
             kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+#if PPU_FM4
+        /* The lean gate has no exact bounds test at the call site. So the
+         * page before the end is flagged too: an access of up to 8 bytes
+         * that starts in its last 7 bytes ends past ppu_vm_size. */
+        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)
+            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+#endif
         if (e < 0x10000u) kind |= (unsigned char)PPU_FM_K_READ;   /* null-read report */
         if (e < 0x1000u)  kind |= (unsigned char)PPU_FM_K_WRITE;  /* null-store report */
         if (ppu_fm_in_alias(e))

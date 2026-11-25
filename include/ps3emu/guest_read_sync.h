@@ -17,6 +17,15 @@ extern volatile uint32_t vm_read_sync_any;
 void vm_read_sync_set_handler(vm_read_sync_handler handler, void *opaque);
 int vm_read_sync_mark_range(uint32_t address, uint64_t bytes);
 void vm_read_sync_dispatch(uint32_t address, uint32_t bytes);
+/* Hook of the fast memory path of the PPU (PPU_FM4). After
+ * `vm_read_sync_mark_range` marked its pages and set the flag, it calls
+ * the hook with the first and the last page of the range. The hook sets
+ * the page byte of the fast memory path for these pages, and for the page
+ * before the range. NULL (the start): only the marks are set. The paths
+ * of the fast memory before PPU_FM4 test the marks inline, so they need
+ * no hook. Install it before the first mark, as the handler. */
+typedef void (*vm_read_sync_mark_hook)(unsigned first_page, unsigned last_page);
+void vm_read_sync_set_mark_hook(vm_read_sync_mark_hook hook);
 
 /* Small immutable native views. The provider must establish device visibility
  * before filling the staging buffer. No installed provider means unavailable;

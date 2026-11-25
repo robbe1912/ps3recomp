@@ -146,6 +146,20 @@
 #  define PPU_FM3 1
 #endif
 
+/* PPU_FM4 selects the lean gate. 1, the default: the call site holds one
+ * test of the flag word and of the page byte, then the access. The exact
+ * tests that the gate of PPU_FM3 made inline are decisions of the page
+ * byte: the bounds, the GCM ref-poll address and the read sync. 0: the
+ * layout of PPU_FM3. The lean gate needs PPU_FM3, so PPU_FM3 0 forces it
+ * off. See the comment at the lean gate. */
+#ifndef PPU_FM4
+#  define PPU_FM4 1
+#endif
+#if !PPU_FM3
+#  undef PPU_FM4
+#  define PPU_FM4 0
+#endif
+
 /* PPU_FM3: the caller address that a read accessor of that layout passes
  * to the body. Inline layout: null, so the body takes the fire function
  * (ppu_fm_fireN), which reads its own return address: the call site in
@@ -227,17 +241,31 @@ extern volatile uint32_t ppu_fm_slow;
 
 /* Page table: one byte per 4 KB guest page, zero-initialized. ppu_fm_arm()
  * flags the pages that hold an address with a slow-path reason: the null
- * pages, the alias window, the raw-SPU MMIO window, the GCM ref-poll page,
- * and each page that is not entirely inside ppu_vm_size. The table only
- * selects the route. The
- * out-of-line function makes the exact tests, so a flagged page that holds
- * a fast address gets the fast body there. It is written at boot only, so
- * it is not volatile. */
+ * pages, the raw-SPU MMIO window, the GCM ref-poll page, and each page
+ * that is not entirely inside ppu_vm_size. The table only selects the
+ * route. The out-of-line function makes the exact tests, so a flagged
+ * page that holds a fast address gets the fast body there.
+ *
+ * PPU_FM4 1 has one writer at run time: the read sync (K_SYNC). It sets
+ * its bits with one atomic operation after it wrote its own state. The
+ * lean gate reads the byte with an acquire load at each access
+ * (ppu_fm_page). The paths before PPU_FM4 read the byte with a plain
+ * load. They have no writer at run time, and ppu_fm_arm() writes the
+ * table before guest code runs. */
 #define PPU_FM_PAGE_SHIFT 12
 #define PPU_FM_PAGE_SIZE  (1u << PPU_FM_PAGE_SHIFT)
 #define PPU_FM_PAGES      (1u << (32 - PPU_FM_PAGE_SHIFT))
-#define PPU_FM_K_READ  1u
-#define PPU_FM_K_WRITE 2u
+/* Route bits of a page byte: a set bit sends each access of that kind to
+ * the out-of-line function. The values let the lean gate fold its two
+ * masks into one AND (PPU_FM_LEAN): no route bit shares a position with
+ * a flag bit of the other kind, or with an owner bit. */
+#define PPU_FM_K_READ  0x08u
+#define PPU_FM_K_WRITE 0x10u
+#if PPU_FM4
+/* Owner bits of the lean gate. They name the writer that set the route
+ * bits. The gate tests only the route bits. */
+#define PPU_FM_K_SYNC  0x20u   /* a page of a marked range of the read sync */
+#endif
 extern unsigned char ppu_fm_kind[PPU_FM_PAGES];
 
 /* Hot-spin detector switch. 1 by default: the detector runs. ppu_fm_arm sets
@@ -420,6 +448,50 @@ static __inline int ppu_fm_window(uint32_t flags, uint32_t mask, uint32_t n, uin
 }
 #endif
 
+#if PPU_FM4
+/* Sets bits of the page byte of one page, as one atomic operation. The
+ * reader sees the byte with or without the bits, never a part of them.
+ * The release order keeps the state of the writer (its marks, its bitmap
+ * bit, its page answer) before the byte. A plain load comes first: the
+ * usual case is that an earlier writer set the bits. */
+static __inline void ppu_fm_page_or(uint32_t page, unsigned char bits)
+{
+    if ((ppu_fm_kind[page] & bits) == bits) return;
+#if defined(_MSC_VER) && !defined(__clang__)
+    _InterlockedOr8((volatile char*)&ppu_fm_kind[page], (char)bits);
+#else
+    __atomic_fetch_or(&ppu_fm_kind[page], bits, __ATOMIC_RELEASE);
+#endif
+}
+
+/* The page byte of the lean gate: a volatile acquire load. Volatile: the
+ * compiler keeps one load at each access, in program order. It cannot
+ * cache the byte in a register across the iterations of a loop, and it
+ * cannot move a load or a store of the access above the load of the byte.
+ * Acquire: on a host that reorders loads, the access that follows sees the
+ * state that the writer put before its release store. On x86 the load is
+ * one plain mov. */
+static __inline unsigned char ppu_fm_page(uint32_t index)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (unsigned char)_InterlockedCompareExchange8((volatile char*)&ppu_fm_kind[index], 0, 0);
+#else
+    return __atomic_load_n((const volatile unsigned char*)&ppu_fm_kind[index], __ATOMIC_ACQUIRE);
+#endif
+}
+
+/* PPU_FM4: the lean gate of an accessor. `k` is the page byte of the EA,
+ * from ppu_fm_page. One test: the page byte and the flag word, each
+ * reduced to the bits of the kind by one mask. The byte holds the answer
+ * of each exact test that the gate of PPU_FM3 made inline. The proofs
+ * below state that the mask keeps only the route bit of the kind from the
+ * byte, and only the flag bits of the mask from the word. */
+#define PPU_FM_LEAN(k, kind, mask)                                              \
+    ((unsigned char)((k) | (unsigned char)ppu_fm_slow) & (unsigned char)((kind) | (mask)))
+typedef char ppu_fm_lean_read_mask[((PPU_FM_K_READ | PPU_FM_S_READ) & (PPU_FM_K_WRITE | PPU_FM_K_SYNC)) == 0 ? 1 : -1];
+typedef char ppu_fm_lean_write_mask[((PPU_FM_K_WRITE | PPU_FM_S_WRITE) & (PPU_FM_K_READ | PPU_FM_K_SYNC)) == 0 ? 1 : -1];
+#endif
+
 #if PPU_FM3
 /* PPU_FM3: the fire half of a read that the gate passes inline. Out of line,
  * so the inline layout holds no label address. The caller address is the
@@ -510,6 +582,52 @@ static __inline PPU_FM_ALWAYS_INLINE uint64_t ppu_fm_read64_body(uint32_t ea, vo
     return PPU_FM_BSWAP64(v);
 }
 
+#if PPU_FM4
+/* PPU_FM4: the fast body of a read at the call site. The gate sends each
+ * access that needs an exact test to the out-of-line function. So the body
+ * has the load and the detector only. */
+static __inline PPU_FM_ALWAYS_INLINE uint8_t ppu_fm_read8_lean(uint32_t ea)
+{
+    static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(PPU_FM_RA3(), ppu_fm_fire8(ea), ppu_fm_hotread8(ea, PPU_FM_RA3())));
+    return PPU_FM_LD8(vm_base + ea);
+}
+
+static __inline PPU_FM_ALWAYS_INLINE uint16_t ppu_fm_read16_lean(uint32_t ea)
+{
+    uint16_t v = PPU_FM_LD16(vm_base + ea);
+    static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(PPU_FM_RA3(), ppu_fm_fire16(ea), ppu_fm_hotread16(ea, PPU_FM_RA3())));
+    return (uint16_t)PPU_FM_BSWAP16(v);
+}
+
+static __inline PPU_FM_ALWAYS_INLINE uint32_t ppu_fm_read32_lean(uint32_t ea)
+{
+    uint32_t v = PPU_FM_LD32(vm_base + ea);
+    static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(PPU_FM_RA3(), ppu_fm_fire32(ea, v), ppu_fm_hotread32(ea, v, PPU_FM_RA3())));
+    return PPU_FM_BSWAP32(v);
+}
+
+static __inline PPU_FM_ALWAYS_INLINE uint64_t ppu_fm_read64_lean(uint32_t ea)
+{
+    uint64_t v = PPU_FM_LD64(vm_base + ea);
+    static PPU_FM_TLS struct PPU_FM_SPIN fm = { 0xFFFFFFFFu, 0 };
+    PPU_FM_SPIN_DET(&fm, ea, PPU_FM_FIRE(PPU_FM_RA3(), ppu_fm_fire64(ea, v), ppu_fm_hotread64(ea, v, PPU_FM_RA3())));
+    return PPU_FM_BSWAP64(v);
+}
+#endif
+
+/* The fast body of a read in the out-of-line function. PPU_FM4: the read
+ * sync is a test of that function, then the body of the call site follows.
+ * So the detector rule is the same at each place. Before PPU_FM4: the body
+ * with the read sync and the detector of those paths. */
+#if PPU_FM4
+#define PPU_FM_OUT_READ(name, n, ea) (vm_cpu_read_sync((ea), (n)), name##_lean(ea))
+#else
+#define PPU_FM_OUT_READ(name, n, ea) name##_body(ea, PPU_FM_RA_OUT())
+#endif
+
 /* The store bodies take the fixed address and the original address: a
  * reserved line goes to the family with the original address. */
 static __inline PPU_FM_ALWAYS_INLINE void ppu_fm_write8_body(uint64_t a, uint32_t ea, uint8_t v)
@@ -560,7 +678,7 @@ static __inline PPU_FM_NOINLINE uint8_t ppu_fm_read8_out(uint64_t a)
     }
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 1))) return vm_read8(a);
     if (PPU_FM_UNLIKELY(ea < 0x10000u))     return vm_read8(a); /* null-read report */
-    return ppu_fm_read8_body(ea, PPU_FM_RA_OUT());
+    return PPU_FM_OUT_READ(ppu_fm_read8, 1, ea);
 }
 
 static __inline PPU_FM_NOINLINE uint16_t ppu_fm_read16_out(uint64_t a)
@@ -571,7 +689,7 @@ static __inline PPU_FM_NOINLINE uint16_t ppu_fm_read16_out(uint64_t a)
         return vm_read16(a);
     }
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 2))) return vm_read16(a);
-    return ppu_fm_read16_body(ea, PPU_FM_RA_OUT());
+    return PPU_FM_OUT_READ(ppu_fm_read16, 2, ea);
 }
 
 static __inline PPU_FM_NOINLINE uint32_t ppu_fm_read32_out(uint64_t a)
@@ -588,7 +706,7 @@ static __inline PPU_FM_NOINLINE uint32_t ppu_fm_read32_out(uint64_t a)
     if (PPU_FM_UNLIKELY(spu_raw_is_reg(ea))) return vm_read32(a);
     /* GCM_REFPOLL: read-driven fence publication BEFORE the read (default on). */
     if (PPU_FM_UNLIKELY(ea == ppu_hle_inject_base + 0x2008u)) ppu_fm_refpoll();
-    return ppu_fm_read32_body(ea, PPU_FM_RA_OUT());
+    return PPU_FM_OUT_READ(ppu_fm_read32, 4, ea);
 }
 
 static __inline PPU_FM_NOINLINE uint64_t ppu_fm_read64_out(uint64_t a)
@@ -600,7 +718,7 @@ static __inline PPU_FM_NOINLINE uint64_t ppu_fm_read64_out(uint64_t a)
     }
     if (PPU_FM_UNLIKELY(ppu_fm_oob(ea, 8))) return vm_read64(a);
     if (PPU_FM_UNLIKELY(ea < 0x10000u))     return vm_read64(a); /* null-read report */
-    return ppu_fm_read64_body(ea, PPU_FM_RA_OUT());
+    return PPU_FM_OUT_READ(ppu_fm_read64, 8, ea);
 }
 
 static __inline PPU_FM_NOINLINE void ppu_fm_write8_out(uint64_t a, uint8_t v)
@@ -659,7 +777,59 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
 /* accessors: the gate, then the fast body                                  */
 /* ----------------------------------------------------------------------- */
 
-#if PPU_FM3
+#if PPU_FM4
+/* PPU_FM4: the lean gate. The site loads the page byte of the EA once, and
+ * makes one test: the route bits of the byte for the kind, and the flag
+ * bits that apply to the kind. A set bit sends the access to the
+ * out-of-line function. That function has each exact test: the flag word,
+ * the alias fixup, the bounds, the null pages, the raw SPU registers, the
+ * GCM ref-poll address (read32) and the read sync. A test that is true
+ * sends the access to the family. Else the access gets the fast body
+ * there. The page byte holds the answer of the tests that the gate of
+ * PPU_FM3 made inline:
+ *   - bounds: ppu_fm_arm flags each page that is not entirely inside
+ *     ppu_vm_size, and the page before the end. An access of up to 8
+ *     bytes that starts in its last 7 bytes ends past ppu_vm_size;
+ *   - GCM ref-poll: the page of the address, for reads;
+ *   - read sync: vm_read_sync_mark_range sets K_SYNC and the read bit on
+ *     the pages of its range, and the read bit on the page before the
+ *     range. It calls a hook; ppu_fm_arm installs it.
+ * Before ppu_fm_arm each bit of the flag word is set: each access takes
+ * the out-of-line function. */
+
+#define PPU_FM_LEAN_READ(name, type)                                          \
+    static PPU_FM_FAST type name(uint64_t a)                                  \
+    {                                                                         \
+        uint32_t ea = (uint32_t)a;                                            \
+        unsigned char k = ppu_fm_page(ea >> PPU_FM_PAGE_SHIFT);               \
+        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_READ, PPU_FM_S_READ)))    \
+            return name##_out(a);                                             \
+        return name##_lean(ea);                                               \
+    }
+
+#define PPU_FM_LEAN_WRITE(name, type)                                         \
+    static PPU_FM_FAST void name(uint64_t a, type v)                          \
+    {                                                                         \
+        uint32_t ea = (uint32_t)a;                                            \
+        unsigned char k = ppu_fm_page(ea >> PPU_FM_PAGE_SHIFT);               \
+        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_WRITE, PPU_FM_S_WRITE))) { \
+            name##_out(a, v);                                                 \
+            return;                                                           \
+        }                                                                     \
+        name##_body(a, ea, v);                                                \
+    }
+
+PPU_FM_LEAN_READ(ppu_fm_read8, uint8_t)
+PPU_FM_LEAN_READ(ppu_fm_read16, uint16_t)
+PPU_FM_LEAN_READ(ppu_fm_read32, uint32_t)
+PPU_FM_LEAN_READ(ppu_fm_read64, uint64_t)
+PPU_FM_LEAN_WRITE(ppu_fm_write8, uint8_t)
+PPU_FM_LEAN_WRITE(ppu_fm_write16, uint16_t)
+PPU_FM_LEAN_WRITE(ppu_fm_write32, uint32_t)
+PPU_FM_LEAN_WRITE(ppu_fm_write64, uint64_t)
+#undef PPU_FM_LEAN_READ
+#undef PPU_FM_LEAN_WRITE
+#elif PPU_FM3
 /* PPU_FM3: the read accessors hold no label address, so Clang inlines them
  * into the lifted code. (Clang 17 does not inline a function that holds a
  * label address and a live TLS access: "blockaddress used outside of
@@ -742,7 +912,7 @@ static PPU_FM_FAST uint64_t ppu_fm_read64(uint64_t a)
 }
 #endif /* PPU_FM3 */
 
-#if PPU_FM3
+#if PPU_FM3 && !PPU_FM4
 /* PPU_FM3: the write accessors with the alias answer of the gate. The body
  * gets the answered EA, as in the out-of-line function. So the test of the
  * coherent store (g_spu_coh_armed) reads the line of the answered address. */
@@ -764,7 +934,7 @@ PPU_FM_WRITE3(ppu_fm_write16, uint16_t, 2)
 PPU_FM_WRITE3(ppu_fm_write32, uint32_t, 4)
 PPU_FM_WRITE3(ppu_fm_write64, uint64_t, 8)
 #undef PPU_FM_WRITE3
-#else
+#elif !PPU_FM3
 static PPU_FM_FAST void ppu_fm_write8(uint64_t a, uint8_t v)
 {
     uint32_t ea = (uint32_t)a;
