@@ -168,6 +168,35 @@ static __attribute__((always_inline)) inline int spu_sf_fast_binary(uint32_t *ou
     _mm_storeu_si128((__m128i *)out, av);
     return 1;
 }
+/* Tests replace the FMA3 instruction to prove that no call reaches it without the
+ * CPUID admission. */
+#ifndef SPU_SF_FMADD
+#define SPU_SF_FMADD(a, b, c) _mm_fmadd_ps((a), (b), (c))
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("rounding-math")))
+#endif
+__attribute__((target("fma")))
+static __attribute__((noinline)) __m128 spu_sf_fma3(__m128 a, __m128 b, __m128 c) {
+    return _mm_add_ps(SPU_SF_FMADD(a, b, c), _mm_setzero_ps());
+}
+/* (+-a*b) + (+-c) with one rounding. The caller admitted FMA3 (scope == 2). */
+static __attribute__((always_inline)) inline int spu_sf_fast_fused(uint32_t *out, const uint32_t *a,
+                                                                  const uint32_t *b, const uint32_t *c,
+                                                                  uint32_t negate_product, uint32_t negate_c) {
+    if (g_spu_sf_simd_scope != 2 || !spu_sf_fast_mode()) return 0;
+    const __m128i sign = _mm_set1_epi32((int)0x80000000u);
+    __m128i av = _mm_loadu_si128((const __m128i *)a), bv = _mm_loadu_si128((const __m128i *)b),
+            cv = _mm_loadu_si128((const __m128i *)c);
+    if (negate_product) av = _mm_xor_si128(av, sign);
+    if (negate_c) cv = _mm_xor_si128(cv, sign);
+    __m128i bad = _mm_or_si128(_mm_or_si128(spu_sf_fast_bad(av, 0), spu_sf_fast_bad(bv, 0)), spu_sf_fast_bad(cv, 0));
+    const __m128i r = _mm_castps_si128(spu_sf_fma3(_mm_castsi128_ps(av), _mm_castsi128_ps(bv), _mm_castsi128_ps(cv)));
+    bad = _mm_or_si128(bad, spu_sf_fast_bad(r, 1));
+    if (_mm_movemask_epi8(bad)) return 0;
+    _mm_storeu_si128((__m128i *)out, r);
+    return 1;
+}
 #else
 static inline int spu_sf_fast_binary(uint32_t *out, const uint32_t *a, const uint32_t *b, int operation) {
     (void)out; (void)a; (void)b; (void)operation; return 0;

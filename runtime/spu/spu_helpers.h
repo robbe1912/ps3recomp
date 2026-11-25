@@ -892,9 +892,20 @@ static inline u128 spu_fm(u128 a, u128 b) { u128 r; if (spu_fm_simd(r._u32, a._u
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; if (spu_sf_simd_binary(r._u32, a._u32, b._u32, 2)) return r; return spu__fm_s(a, b); }
 #endif
 #endif
+#if SPU_SF_FAST
+/* The earlier path of the fused family: the scoped host form with the CPUID
+ * admission, else the exact integer helper. It stays as the fallback. */
+static inline __attribute__((noinline, cold)) u128 spu__fma_slow(u128 a, u128 b, u128 c) { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0, 0)) return r; return spu__fma_s(a, b, c); }
+static inline __attribute__((noinline, cold)) u128 spu__fms_slow(u128 a, u128 b, u128 c) { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0, 0x80000000u)) return r; return spu__fms_s(a, b, c); }
+static inline __attribute__((noinline, cold)) u128 spu__fnms_slow(u128 a, u128 b, u128 c) { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0x80000000u, 0)) return r; return spu__fnms_s(a, b, c); }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; if (spu_sf_fast_fused(r._u32, a._u32, b._u32, c._u32, 0, 0)) return r; return spu__fma_slow(a, b, c); }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; if (spu_sf_fast_fused(r._u32, a._u32, b._u32, c._u32, 0, 0x80000000u)) return r; return spu__fms_slow(a, b, c); }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; if (spu_sf_fast_fused(r._u32, a._u32, b._u32, c._u32, 0x80000000u, 0)) return r; return spu__fnms_slow(a, b, c); }
+#else
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0, 0)) return r; return spu__fma_s(a, b, c); }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0, 0x80000000u)) return r; return spu__fms_s(a, b, c); }
 static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; if (spu_sf_simd_fused(r._u32, a._u32, b._u32, c._u32, 0x80000000u, 0)) return r; return spu__fnms_s(a, b, c); }
+#endif
 #endif
 /* The exact path alone, for tests that check the fast path against it. */
 SPU__SF_V2(spu_fa_ref, spu__fa_lane(x, y))
