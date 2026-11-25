@@ -303,3 +303,57 @@ Mutants of step 4 that the script rejects:
   of the range flagged; the hook flags stores too; the owner bit not set.
 - read sync file (2): the hook is not called; the hook runs before the
   marks and the flag.
+
+## Step 4, move 2: the alias answer in the page byte
+
+The window answer of step 3 was an inline test of the page state at each
+call site. The lean gate moves it into the page byte.
+
+- `PPU_FM_K_ALIAS` (`0x40`) is on a window page whose page answer is
+  ALIAS. The bit shares no position with a route bit, with the owner bit
+  of the read sync or with a flag bit (a `typedef` proof).
+- The first test of the call site has `PPU_FM_K_ALIAS` in its mask. A
+  plain page costs no instruction more. A page with the bit goes to the
+  second block: `ppu_fm_alias_ea` subtracts `0x05000000`, loads the page
+  byte of the primary address and makes the same lean test there. A
+  nonzero result sends the original address to the out-of-line function.
+  Else the access runs on the primary address, inline.
+- A MIXED page keeps the route bits. The access goes to the out-of-line
+  function, as in step 3.
+- An IDENTITY page has the bits of the arm rule only. The access is
+  inline, as in step 3.
+
+The writer is `spu_alias_page_update` (`runtime/syscalls/spu_ea_alias.c`).
+It calls `ppu_fm_window_begin(ea_page)` before it stores the page answer,
+and `ppu_fm_window_end(ea_page, state)` after it. Both functions are in
+`runtime/ppu/ppu_loader.cpp` and are empty when `PPU_FM4` is 0.
+
+- `ppu_fm_window_begin` sets the route bits. Then each access of the page
+  goes to the out-of-line function until the page byte holds the new
+  answer. That function reads the page answer through the exact fixup.
+  The old and the new answer are both correct: the record is in the table
+  before the refresh of the pages starts.
+- `ppu_fm_window_end` makes the final form with one compare-and-swap loop.
+  MIXED keeps the route bits. ALIAS sets `PPU_FM_K_ALIAS` and clears the
+  route bits. IDENTITY sets the bits of the arm rule. The bits of the read
+  sync stay.
+- The arm sets no bit on a page that has `PPU_FM_K_ALIAS`, so a second
+  arm keeps the answer of the window.
+
+Mutants of move 2 that the script rejects:
+
+- header (4): a read gate that ignores the alias bit; a write gate that
+  ignores the alias bit; an alias answer that ignores the page byte of the
+  primary address; an alias answer with the masks of a store.
+- arm text (5): IDENTITY sets the alias bit; ALIAS keeps the route bits;
+  the begin function sets no route bit; the bits of the read sync are
+  lost; MIXED keeps the alias answer. And (1): an alias page is flagged
+  by its own address at a second arm.
+- alias file (4): the end function is not called; the begin function is
+  not called; the end function runs before the store of the page answer;
+  the index in the window is used as the EA page.
+
+Mode `leanalias` checks the form of the page byte after each record, the
+access through each page answer, the bits of the read sync on an alias
+ page and on its primary, the bounds rule through an alias page, and the
+order of the two calls.

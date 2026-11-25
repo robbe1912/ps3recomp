@@ -1836,6 +1836,35 @@ extern "C" void ppu_fm_count_hit(unsigned k)
         ppu_fm_count_tick();
 }
 
+/* The page of the GCM ref-poll address. ppu_fm_arm sets it before its loop. */
+static uint32_t ppu_fm_refpoll_page;
+
+/* The bits of the arm rule for one page: each page that is not entirely
+ * inside ppu_vm_size, the null pages, the raw SPU problem-state registers
+ * and the GCM ref-poll page. ppu_fm_arm sets them on each page. PPU_FM4:
+ * before the end of the memory. ppu_fm_window_end sets them on a page of
+ * the alias window whose page answer is IDENTITY. */
+static unsigned char ppu_fm_page_kind(uint32_t e)
+{
+    unsigned char kind = 0;
+    /* Bounds: each page that is not entirely inside ppu_vm_size. */
+    if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE > ppu_vm_size)
+        kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+#if PPU_FM4
+    /* The lean gate has no exact bounds test at the call site. So the
+     * page before the end is flagged too: an access of up to 8 bytes
+     * that starts in its last 7 bytes ends past ppu_vm_size. */
+    if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)
+        kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+#endif
+    if (e < 0x10000u) kind |= (unsigned char)PPU_FM_K_READ;   /* null-read report */
+    if (e < 0x1000u)  kind |= (unsigned char)PPU_FM_K_WRITE;  /* null-store report */
+    if (spu_raw_is_reg(e))
+        kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+    if (e == ppu_fm_refpoll_page) kind |= (unsigned char)PPU_FM_K_READ;   /* GCM ref-poll */
+    return kind;
+}
+
 #if PPU_FM4
 /* PPU_FM4: sets the page bytes of the fast memory path for a range that the
  * read sync marks. The lean gate of a PPU read has no inline test of the
@@ -1849,6 +1878,49 @@ static void ppu_fm_mark_sync(unsigned first, unsigned last)
     for (unsigned p = first; p <= last; p++)
         ppu_fm_page_or(p, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_SYNC));
 }
+
+/* PPU_FM4: the page byte of a page of the alias window. The alias table
+ * (runtime/syscalls/spu_ea_alias.c) calls the two functions when it
+ * computes the page answer of a page: begin, then it stores the answer,
+ * then end. A page answer is IDENTITY, ALIAS or MIXED
+ * (PPU_FM_ALIAS_IDENTITY, PPU_FM_ALIAS_ALIAS, PPU_FM_ALIAS_MIXED). The
+ * form of the page byte for each answer:
+ *   IDENTITY  the bits of the arm rule (ppu_fm_page_kind);
+ *   ALIAS     PPU_FM_K_ALIAS: the call site gives the alias answer;
+ *   MIXED     the route bits: each access goes out of line.
+ * ppu_fm_window_begin sets the route bits. From there to the end of
+ * ppu_fm_window_end, each access of the page takes the out-of-line
+ * function. That function reads the page answer itself. So no access
+ * runs on the page byte of an old answer after the new answer is stored.
+ * The bits of the read sync stay: PPU_FM_K_SYNC names that writer, and
+ * the page stays out of line. */
+extern "C" void ppu_fm_window_begin(unsigned page)
+{
+    ppu_fm_page_or(page, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE));
+}
+
+extern "C" void ppu_fm_window_end(unsigned page, int state)
+{
+    const unsigned char sync = (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE | PPU_FM_K_SYNC);
+    const unsigned char arm = ppu_fm_page_kind(page << PPU_FM_PAGE_SHIFT);
+    unsigned char old;
+    unsigned char next;
+    do {
+        old = ppu_fm_kind[page];
+        next = (old & PPU_FM_K_SYNC) ? (unsigned char)(old & sync) : 0;
+        if (state == PPU_FM_ALIAS_MIXED)
+            next |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+        else if (state == PPU_FM_ALIAS_ALIAS)
+            next |= (unsigned char)PPU_FM_K_ALIAS;
+        else
+            next |= arm;
+    } while (!__atomic_compare_exchange_n(&ppu_fm_kind[page], &old, next, 0,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+}
+#else
+/* The alias table calls the two functions in each layout. */
+extern "C" void ppu_fm_window_begin(unsigned page) { (void)page; }
+extern "C" void ppu_fm_window_end(unsigned page, int state) { (void)page; (void)state; }
 #endif
 
 /* Decides at boot which memory accesses leave the fast paths: sets the flag
@@ -1874,26 +1946,19 @@ extern "C" void ppu_fm_arm(void)
 #if PPU_FM4
     vm_read_sync_set_mark_hook(ppu_fm_mark_sync);
 #endif
+    ppu_fm_refpoll_page = refpoll;
     for (uint32_t p = 0; p < PPU_FM_PAGES; p++) {
         uint32_t e = p << PPU_FM_PAGE_SHIFT;
-        unsigned char kind = 0;
-        /* Bounds: each page that is not entirely inside ppu_vm_size. */
-        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE > ppu_vm_size)
-            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
-#if PPU_FM4
-        /* The lean gate has no exact bounds test at the call site. So the
-         * page before the end is flagged too: an access of up to 8 bytes
-         * that starts in its last 7 bytes ends past ppu_vm_size. */
-        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)
-            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
-#endif
-        if (e < 0x10000u) kind |= (unsigned char)PPU_FM_K_READ;   /* null-read report */
-        if (e < 0x1000u)  kind |= (unsigned char)PPU_FM_K_WRITE;  /* null-store report */
+        unsigned char kind = ppu_fm_page_kind(e);
+#if !PPU_FM4
         if (ppu_fm_in_alias(e))
             kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
-        if (spu_raw_is_reg(e))
-            kind |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
-        if (e == refpoll) kind |= (unsigned char)PPU_FM_K_READ;   /* GCM ref-poll */
+#else
+        /* A page with the alias bit keeps that form: its access runs on the
+         * primary address, and the page byte of that address has the bounds
+         * rule. */
+        if (ppu_fm_kind[p] & PPU_FM_K_ALIAS) kind = 0;
+#endif
         ppu_fm_kind[p] |= kind;
     }
     spindet = getenv("PPU_FM_SPINDET");

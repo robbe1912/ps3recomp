@@ -134,8 +134,8 @@ FIXTURE = r'''
 #if PPU_FM4
 /* The window rule of the lean path of the fixture model. 1: each page of
  * the window is flagged, so each access of the window goes out. 0: the
- * answer of the page byte selects (step 4, move 2). */
-#define FIXTURE_WINDOW_OUT 1
+ * page byte holds the answer of the window (step 4, move 2). */
+#define FIXTURE_WINDOW_OUT 0
 #endif
 
 /* ---- authored guest memory: a 4 GiB reserve. commit() backs 64 KB at an EA. */
@@ -195,6 +195,27 @@ void sysmem_alias_record(uint32_t addr, uint32_t size);
 /* The production fixup, behind a counter. The alias file is compiled with
  * sysmem_spu_alias_fixup=alias_fixup_impl. */
 uint32_t sysmem_spu_alias_fixup(uint32_t ea) { fixups++; return alias_fixup_impl(ea); }
+/* Step 4, move 2: the writer of the page byte of a window page
+ * (runtime/syscalls/spu_ea_alias.c, compiled with
+ * ppu_fm_window_begin=fixture_window_begin and
+ * ppu_fm_window_end=fixture_window_end). The end call records an error
+ * when the page answer is not the new one, or when the route bits are not
+ * set. The lean gate needs both: then each access of the page takes the
+ * out-of-line function until the new answer is in the page byte. */
+unsigned begin_calls, end_calls, window_errors;
+void fixture_window_begin(unsigned page) { begin_calls++; ppu_fm_window_begin(page); }
+void fixture_window_end(unsigned page, int state)
+{
+#if PPU_FM4
+    /* A page there is an EA page: EA >> 12. */
+    if ((page << 12) < 0x45000000u || (page << 12) >= 0x50000000u) window_errors |= 4;
+    if (sysmem_spu_alias_page[page - 0x45000u] != (unsigned char)state) window_errors |= 1;
+    if ((ppu_fm_kind[page] & (PPU_FM_K_READ | PPU_FM_K_WRITE)) != (PPU_FM_K_READ | PPU_FM_K_WRITE))
+        window_errors |= 2;
+#endif
+    end_calls++;
+    ppu_fm_window_end(page, state);
+}
 /* The handler of the read sync counts its calls. It runs for a read that
  * meets a marked page. The paths before PPU_FM4 mark no page in the modes
  * that do not say it, so it does not run there. */
@@ -349,6 +370,17 @@ static int page_flagged(uint32_t ea)
 }
 #endif
 
+/* Step 4, move 2: the arm rule for the page of an EA
+ * (runtime/ppu/ppu_loader.cpp, ppu_fm_page_kind), as the fixture computes
+ * it. It does not read the page table. */
+static int arm_rule(uint32_t ea)
+{
+    const uint32_t page = ea & ~(uint32_t)0xFFFu;
+    const uint32_t refpoll = (ppu_hle_inject_base + 0x2008u) & ~(PPU_FM_PAGE_SIZE - 1u);
+    return (ppu_vm_size != 0 && (uint64_t)page + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)
+        || ea < 0x10000u || spu_raw_is_reg(ea) || page == refpoll;
+}
+
 /* True when the access leaves the gate for the out-of-line function. */
 static int goes_out(int acc, const class_t* c)
 {
@@ -377,10 +409,16 @@ static int goes_out(int acc, const class_t* c)
         return oob || (!PPU_FM3 && in_window(c->ea));
 #endif
     default:
-        /* Pages of the window. PPU_FM3 1 keeps IDENTITY and ALIAS pages
-         * inline. MIXED pages and an access out of bounds go out. */
+        /* Pages of the window. The page byte holds the answer of the
+         * window (move 2). MIXED: out of line. ALIAS: inline on the
+         * primary, unless the arm rule flags the page of the primary
+         * address. IDENTITY: out of line when the arm rule flags the
+         * page. */
 #if PPU_FM4
-        return FIXTURE_WINDOW_OUT;                      /* FIXTURE_WINDOW_RULE */
+        if (FIXTURE_WINDOW_OUT) return 1;              /* FIXTURE_WINDOW_RULE */
+        if (c->kind == K_MIXED_ALIAS || c->kind == K_MIXED_SELF) return 1;
+        if (c->kind == K_ALIAS) return arm_rule(c->ea - 0x05000000u);
+        return arm_rule(c->ea);
 #else
         if (!PPU_FM3) return 1;
         if (c->kind == K_MIXED_ALIAS || c->kind == K_MIXED_SELF) return 1;
@@ -844,6 +882,107 @@ static int lean_sync(void)
     if (hook_marked != 1) return fail("sync_hook_marked", hook_marked, 1);
     return 0;
 }
+/* Step 4, move 2: the alias window answer of the call site. The page byte
+ * of a window page holds the answer: the alias bit, the route bits, or
+ * no bit. */
+static int lean_alias(void)
+{
+    static const uint32_t alias = 0x45300100u;       /* ALIAS: the primary is 0x40300100 */
+    static const uint32_t page = 0x45300000u;
+    const unsigned char route = (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);
+    unsigned char got;
+    /* After the records of the fixture: ALIAS has the alias bit and no
+     * route bit. MIXED has the route bits. IDENTITY has no bit. The
+     * primary pages have no bit. */
+    if (page_byte("win_alias", alias, PPU_FM_K_ALIAS)) return 1;
+    if (page_byte("win_ident", 0x46000100u, 0)) return 1;
+    if (page_byte("win_ident0", 0x47000100u, 0)) return 1;
+    if (page_byte("win_mixed", 0x45400100u, route)) return 1;
+    if (page_byte("win_mixed_self", 0x46400100u, route)) return 1;
+    if (page_byte("primary_alias", 0x40300100u, 0)) return 1;
+    /* The writer: begin, the page answer, end. The wrappers of the fixture
+     * record an error when the order is not that one, or when the page is
+     * not an EA page of the window. The page 0x47000000 goes ALIAS, MIXED,
+     * IDENTITY. A record inside the window changes two pages: its own page
+     * and the image of it. */
+    begin_calls = end_calls = window_errors = 0;
+    sysmem_alias_record(0x42000000u, 0x1000u);
+    if (begin_calls != 1 || end_calls != 1) return fail("win_publish_calls", begin_calls * 10u + end_calls, 11u);
+    if (window_errors) return fail("win_publish_order", window_errors, 0);
+    if (page_byte("win_to_alias", 0x47000100u, PPU_FM_K_ALIAS)) return 1;
+    begin_calls = end_calls = window_errors = 0;
+    sysmem_alias_record(0x47000800u, 0x800u);
+    if (begin_calls != 2 || end_calls != 2) return fail("win_publish_mixed_calls", begin_calls * 10u + end_calls, 22u);
+    if (window_errors) return fail("win_publish_mixed_order", window_errors, 0);
+    if (page_byte("win_to_mixed", 0x47000100u, route)) return 1;
+    begin_calls = end_calls = window_errors = 0;
+    sysmem_alias_record(0x47000000u, 0x1000u);
+    if (begin_calls != 2 || end_calls != 2) return fail("win_publish_ident_calls", begin_calls * 10u + end_calls, 22u);
+    if (window_errors) return fail("win_publish_ident_order", window_errors, 0);
+    if (page_byte("win_to_ident", 0x47000100u, 0)) return 1;
+    /* The page byte of the primary address decides too. A second ALIAS
+     * page: 0x45500000, primary 0x40500000. The read sync flags the
+     * primary page for reads. A read through the alias goes out of line,
+     * and its handler runs with the primary address. A store keeps the
+     * inline answer and lands on the primary. */
+    commit(0x40500000u);
+    sysmem_alias_record(0x40500000u, 0x1000u);
+    if (page_byte("win2_alias", 0x45500100u, PPU_FM_K_ALIAS)) return 1;
+    vm_read_sync_set_handler(sync_handler, 0);
+    if (vm_read_sync_mark_range(0x40500000u, 0x1000u)) return fail("win_sync_mark", 1, 0);
+    if (page_byte("win2_primary", 0x40500100u, PPU_FM_K_READ | PPU_FM_K_SYNC)) return 1;
+    if (page_byte("win2_alias_marked", 0x45500100u, PPU_FM_K_ALIAS)) return 1;
+    syncs = 0; sync_addr = sync_bytes = 0;
+    fixups = 0;
+    (void)ppu_fm_read32(0x45500100u);
+    if (fixups != 1 || syncs != 1 || sync_addr != 0x40500100u || sync_bytes != 4)
+        return fail("win_alias_sync_read", fixups * 1000000ull + syncs * 1000ull + sync_bytes, 1001004ull);
+    fixups = 0; syncs = 0;
+    ppu_fm_write32(0x45500100u, 0x11223344u);
+    if (fixups || syncs) return fail("win_alias_sync_write", fixups + syncs, 0);
+    if (word_at(0x40500100u, 4) != 0x11223344u) return fail("win_alias_store_landed", word_at(0x40500100u, 4), 0x11223344u);
+    /* An ALIAS page whose primary page is flagged by the arm rule. The
+     * access goes out of line with its own address. The out-of-line
+     * function answers the alias: an access in bounds gets the fast body
+     * there, an access out of bounds goes to the family with the address
+     * of the access. The window page keeps its alias bit. The arm sets
+     * bits and clears none, so this part runs after the part above. */
+    ppu_vm_size = 0x40300800u;
+    ppu_fm_arm();
+    if (page_byte("win_alias_bounds", alias, PPU_FM_K_ALIAS)) return 1;
+    if (page_byte("primary_bounds", 0x40300100u, route)) return 1;
+    for (int acc = 0; acc < 8; acc++) {
+        memset(family, 0, sizeof family);
+        last_family_addr = 0;
+        fixups = 0;
+        if (acc < 4) (void)read_value(acc, alias);
+        else write_value(acc, alias, (uint64_t)acc);
+        if (fixups != 1) return fail("win_alias_bounds_fixups", fixups, 1);
+        if (family[acc]) return fail("win_alias_bounds_family", family[acc], 0);
+        memset(family, 0, sizeof family);
+        last_family_addr = 0;
+        fixups = 0;
+        /* The primary is 0x40300800: each width ends past ppu_vm_size. */
+        const uint32_t oob = 0x45300800u;
+        if (acc < 4) (void)read_value(acc, oob);
+        else write_value(acc, oob, (uint64_t)acc);
+        if (fixups != 1) return fail("win_oob_fixups", fixups, 1);
+        if (family[acc] != 1 || last_family_addr != oob) return fail("win_oob_family", family[acc], 1);
+    }
+    ppu_vm_size = 0;
+    /* The bits of the read sync stay when the page answer changes: on an
+     * ALIAS page and on a MIXED page. */
+    if (vm_read_sync_mark_range(page, 0x1000u)) return fail("win_sync_mark_page", 1, 0);
+    got = ppu_fm_kind[page >> PPU_FM_PAGE_SHIFT];
+    if (got != (PPU_FM_K_ALIAS | PPU_FM_K_READ | PPU_FM_K_SYNC))
+        return fail("win_alias_marked_bits", got, PPU_FM_K_ALIAS | PPU_FM_K_READ | PPU_FM_K_SYNC);
+    sysmem_alias_record(page + 0x800u, 0x800u);       /* the page is MIXED now */
+    got = ppu_fm_kind[page >> PPU_FM_PAGE_SHIFT];
+    if (got != (route | PPU_FM_K_READ | PPU_FM_K_SYNC))
+        return fail("win_mixed_keeps_sync", got, route | PPU_FM_K_READ | PPU_FM_K_SYNC);
+    return 0;
+}
+
 #endif
 
 int main(int argc, char** argv)
@@ -893,6 +1032,7 @@ int main(int argc, char** argv)
 #if PPU_FM4
     if (!strcmp(mode, "leanbits")) return lean_bits();
     if (!strcmp(mode, "leansync")) return lean_sync();
+    if (!strcmp(mode, "leanalias")) return lean_alias();
 #endif
     printf("FAIL mode %s unknown\n", mode);
     return 1;
@@ -900,7 +1040,7 @@ int main(int argc, char** argv)
 '''
 
 MODES = ("unarmed", "all", "count", "diag", "kill", "watch", "bounds", "spin", "spinoff", "coh")
-LEAN_MODES = ("leanbits", "leansync")     # the lean gate (PPU_FM4)
+LEAN_MODES = ("leanbits", "leansync", "leanalias")     # the lean gate (PPU_FM4)
 LAYOUTS = (1, 0)     # PPU_FM_INLINE_FAST: inline at each call site, then one copy per unit
 # The paths, as lists of defines: the lean gate (the default of the header),
 # step 3 (PPU_FM4 0), and the path before step 3 (PPU_FM3 0).
@@ -918,8 +1058,8 @@ HEADER_LEAN_MUTANTS = [
      "((unsigned char)((k) | (unsigned char)ppu_fm_slow) & (unsigned char)((kind) | (mask)))",
      "((unsigned char)(k) & (unsigned char)((kind) | (mask)))", (1,), "lean"),
     ("lean read gate takes the mask of a write",
-     "PPU_FM_LEAN(k, PPU_FM_K_READ, PPU_FM_S_READ)))",
-     "PPU_FM_LEAN(k, PPU_FM_K_WRITE, PPU_FM_S_WRITE)))", (1,), "lean"),
+     "PPU_FM_LEAN(k, PPU_FM_K_ALIAS | PPU_FM_K_READ,",
+     "PPU_FM_LEAN(k, PPU_FM_K_WRITE,", (1,), "lean"),
     ("page byte: the writer sets no bit",
      "    __atomic_fetch_or(&ppu_fm_kind[page], bits, __ATOMIC_RELEASE);\n", "    (void)bits;\n",
      (1,), "lean"),
@@ -927,8 +1067,8 @@ HEADER_LEAN_MUTANTS = [
 
 ARM_LEAN_MUTANTS = [
     ("lean bounds: the page before the end not flagged",
-     "        if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)\n",
-     "        if (0)\n", (1,), "lean"),
+     "    if (ppu_vm_size != 0 && (uint64_t)e + PPU_FM_PAGE_SIZE + 7u > ppu_vm_size)\n",
+     "    if (0)\n", (1,), "lean"),
     ("sync hook not installed", "    vm_read_sync_set_mark_hook(ppu_fm_mark_sync);\n", "", (1,), "lean"),
     ("sync hook: the page before the range not flagged",
      "    if (first > 0) ppu_fm_page_or(first - 1u, (unsigned char)PPU_FM_K_READ);\n", "", (1,), "lean"),
@@ -955,7 +1095,60 @@ SYNC_MUTANTS = [
      (1,), "lean"),
 ]
 
-COHERENCY_MUTANTS = []
+# Step 4, move 2: the alias window answer in the page byte.
+# (name, anchor, replacement, layouts, path)
+WINDOW_HEADER_MUTANTS = [
+    ("window: the read gate ignores the alias bit",
+     "PPU_FM_LEAN(k, PPU_FM_K_ALIAS | PPU_FM_K_READ,",
+     "PPU_FM_LEAN(k, PPU_FM_K_READ,", (1,), "lean"),
+    ("window: the write gate ignores the alias bit",
+     "PPU_FM_LEAN(k, PPU_FM_K_ALIAS | PPU_FM_K_WRITE,",
+     "PPU_FM_LEAN(k, PPU_FM_K_WRITE,", (1,), "lean"),
+    ("window: the alias answer ignores the page byte of the primary",
+     "    if (PPU_FM_LEAN(ppu_fm_page(e >> PPU_FM_PAGE_SHIFT), kind, mask)) return 0;\n",
+     "    if (0) return 0;\n", (1,), "lean"),
+    ("window: the alias answer takes the masks of a store",
+     "!ppu_fm_alias_ea(PPU_FM_K_READ, PPU_FM_S_READ, &ea)",
+     "!ppu_fm_alias_ea(PPU_FM_K_WRITE, PPU_FM_S_WRITE, &ea)", (1,), "lean"),
+]
+
+WINDOW_ARM_MUTANTS = [
+    ("window end: IDENTITY sets the alias bit", "            next |= arm;\n",
+     "            next |= arm | (unsigned char)PPU_FM_K_ALIAS;\n", (1,), "lean"),
+    ("window end: ALIAS flags the route bits",
+     "            next |= (unsigned char)PPU_FM_K_ALIAS;\n",
+     "            next |= (unsigned char)(PPU_FM_K_ALIAS | PPU_FM_K_READ | PPU_FM_K_WRITE);\n",
+     (1,), "lean"),
+    ("window begin sets no route bit",
+     "    ppu_fm_page_or(page, (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE));\n",
+     "    (void)page;\n", (1,), "lean"),
+    ("window end: the bits of the read sync are lost",
+     "        next = (old & PPU_FM_K_SYNC) ? (unsigned char)(old & sync) : 0;\n",
+     "        next = 0;\n", (1,), "lean"),
+    ("window end: MIXED keeps the alias answer",
+     "            next |= (unsigned char)(PPU_FM_K_READ | PPU_FM_K_WRITE);\n",
+     "            next |= (unsigned char)PPU_FM_K_ALIAS;\n", (1,), "lean"),
+]
+
+WINDOW_ALIAS_MUTANTS = [
+    ("window: end before the page answer is stored",
+     "    ppu_fm_window_begin(ea_page);\n"
+     "    atomic_store_explicit(&sysmem_spu_alias_page[page], state, memory_order_release);\n"
+     "    ppu_fm_window_end(ea_page, state);\n",
+     "    ppu_fm_window_begin(ea_page);\n"
+     "    ppu_fm_window_end(ea_page, state);\n"
+     "    atomic_store_explicit(&sysmem_spu_alias_page[page], state, memory_order_release);\n",
+     (1,), "lean"),
+    ("window: begin not called", "    ppu_fm_window_begin(ea_page);\n", "", (1,), "lean"),
+    ("window: end not called", "    ppu_fm_window_end(ea_page, state);\n", "", (1,), "lean"),
+    ("window: the index in the window used as the EA page",
+     "    ppu_fm_window_begin(ea_page);\n", "    ppu_fm_window_begin(page);\n", (1,), "lean"),
+]
+
+ARM_WINDOW_MUTANTS = [
+    ("arm: an alias page is flagged by its own address",
+     "        if (ppu_fm_kind[p] & PPU_FM_K_ALIAS) kind = 0;\n", "        if (0) kind = 0;\n", (1,), "lean"),
+]
 
 # The mutants of the paths before PPU_FM4 that must fail on the lean path too:
 # their code is the same there.
@@ -969,7 +1162,8 @@ ALSO_LEAN = ("read32: ref-poll fence skipped", "fire helper passes a null caller
 GROUPS = (("header", HEADER_MUTANTS, "header"), ("alias", ALIAS_MUTANTS, "alias"),
           ("arm", ARM_MUTANTS, "arm"), ("header", HEADER_LEAN_MUTANTS, "header"),
           ("arm", ARM_LEAN_MUTANTS, "arm"), ("sync", SYNC_MUTANTS, "sync"),
-          ("coherency", COHERENCY_MUTANTS, "coh"))
+          ("header", WINDOW_HEADER_MUTANTS, "header"), ("arm", WINDOW_ARM_MUTANTS, "arm"),
+          ("alias", WINDOW_ALIAS_MUTANTS, "alias"), ("arm", ARM_WINDOW_MUTANTS, "arm"))
 
 # The externals of the coherency file that the fixture does not use. The
 # file links whole: its reserve function is a writer of the page byte. The
@@ -1036,7 +1230,10 @@ def build(environment, work, cc, msvc_style, texts, path_defines, vendor, inline
         fixture = common + ["/c", "fixture.cpp", "/Fofixture.obj"]
         plain = [cc, "/nologo", "/O2", "/UNDEBUG", "/clang:-Wno-everything"] \
             + ["/I" + p for p in map(str, directories)]
-        alias = plain + ["/Dsysmem_spu_alias_fixup=alias_fixup_impl", "/c", "alias.c", "/Foalias.obj"]
+        alias = plain + ["/Dsysmem_spu_alias_fixup=alias_fixup_impl",
+                         "/Dppu_fm_window_begin=fixture_window_begin",
+                         "/Dppu_fm_window_end=fixture_window_end",
+                         "/c", "alias.c", "/Foalias.obj"]
         sync = plain + ["/c", "sync.c", "/Fosync.obj"]
         coh = plain + ["/c", "coh.c", "/Focoh.obj"]
         stub = plain + ["/c", "cohstub.c", "/Focohstub.obj"]
@@ -1049,7 +1246,10 @@ def build(environment, work, cc, msvc_style, texts, path_defines, vendor, inline
         common = [driver] + options + ["-D" + d for d in defines] + ["-I" + p for p in map(str, directories)]
         fixture = common + ["-c", "fixture.cpp", "-o", "fixture.o"]
         plain = [cc, "-O2", "-Wno-everything"] + ["-I" + p for p in map(str, directories)]
-        alias = plain + ["-Dsysmem_spu_alias_fixup=alias_fixup_impl", "-c", "alias.c", "-o", "alias.o"]
+        alias = plain + ["-Dsysmem_spu_alias_fixup=alias_fixup_impl",
+                         "-Dppu_fm_window_begin=fixture_window_begin",
+                         "-Dppu_fm_window_end=fixture_window_end",
+                         "-c", "alias.c", "-o", "alias.o"]
         sync = plain + ["-c", "sync.c", "-o", "sync.o"]
         coh = plain + ["-c", "coh.c", "-o", "coh.o"]
         stub = plain + ["-c", "cohstub.c", "-o", "cohstub.o"]

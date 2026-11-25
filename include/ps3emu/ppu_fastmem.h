@@ -246,9 +246,13 @@ extern volatile uint32_t ppu_fm_slow;
  * route. The out-of-line function makes the exact tests, so a flagged
  * page that holds a fast address gets the fast body there.
  *
- * PPU_FM4 1 has one writer at run time: the read sync (K_SYNC). It sets
- * its bits with one atomic operation after it wrote its own state. The
- * lean gate reads the byte with an acquire load at each access
+ * PPU_FM4 1 has two writers at run time. The read sync (K_SYNC) sets its
+ * bits with one atomic operation after it wrote its own state. The alias
+ * table (runtime/syscalls/spu_ea_alias.c) sets the bits of a page of its
+ * window when the page answer of that page changes; it makes each access
+ * of the page go out of line until the new answer is stored
+ * (ppu_fm_window_begin, ppu_fm_window_end in runtime/ppu/ppu_loader.cpp).
+ * The lean gate reads the byte with an acquire load at each access
  * (ppu_fm_page). The paths before PPU_FM4 read the byte with a plain
  * load. They have no writer at run time, and ppu_fm_arm() writes the
  * table before guest code runs. */
@@ -265,6 +269,13 @@ extern volatile uint32_t ppu_fm_slow;
 /* Owner bits of the lean gate. They name the writer that set the route
  * bits. The gate tests only the route bits. */
 #define PPU_FM_K_SYNC  0x20u   /* a page of a marked range of the read sync */
+/* Not a route bit. A page of the alias window whose page answer is ALIAS.
+ * The call site subtracts PPU_FM_ALIAS_DELTA, tests the page byte of the
+ * primary address, and runs the fast body there. The lean gate folds the
+ * bit into the mask of its one test, so a plain page has no instruction
+ * for it. Valid when no route bit is set: a set route bit sends the
+ * access out of line, which has the exact answer. */
+#define PPU_FM_K_ALIAS 0x40u
 #endif
 extern unsigned char ppu_fm_kind[PPU_FM_PAGES];
 
@@ -488,8 +499,25 @@ static __inline unsigned char ppu_fm_page(uint32_t index)
  * byte, and only the flag bits of the mask from the word. */
 #define PPU_FM_LEAN(k, kind, mask)                                              \
     ((unsigned char)((k) | (unsigned char)ppu_fm_slow) & (unsigned char)((kind) | (mask)))
-typedef char ppu_fm_lean_read_mask[((PPU_FM_K_READ | PPU_FM_S_READ) & (PPU_FM_K_WRITE | PPU_FM_K_SYNC)) == 0 ? 1 : -1];
-typedef char ppu_fm_lean_write_mask[((PPU_FM_K_WRITE | PPU_FM_S_WRITE) & (PPU_FM_K_READ | PPU_FM_K_SYNC)) == 0 ? 1 : -1];
+typedef char ppu_fm_lean_read_mask[((PPU_FM_K_READ | PPU_FM_S_READ) & (PPU_FM_K_WRITE | PPU_FM_K_SYNC | PPU_FM_K_ALIAS)) == 0 ? 1 : -1];
+typedef char ppu_fm_lean_write_mask[((PPU_FM_K_WRITE | PPU_FM_S_WRITE) & (PPU_FM_K_READ | PPU_FM_K_SYNC | PPU_FM_K_ALIAS)) == 0 ? 1 : -1];
+typedef char ppu_fm_lean_alias_bit[(PPU_FM_K_ALIAS & (PPU_FM_K_READ | PPU_FM_K_WRITE | PPU_FM_K_SYNC | PPU_FM_S_ALL)) == 0 ? 1 : -1];
+/* PPU_FM4: the alias answer of the call site. The site comes here with the
+ * page byte of the EA, a set K_ALIAS, and no route bit and no flag bit
+ * for the kind: the lean gate has made that test. The access runs on the
+ * primary address, EA - 0x05000000, as the window of PPU_FM3 answers it.
+ * The page byte of the primary address decides the route of the access:
+ * a set route bit or flag bit for the kind returns 0, and the site sends
+ * the original address to the out-of-line function. That function makes
+ * the exact tests. The test ignores K_ALIAS of the primary page: the
+ * answer of the window is one step, as in sysmem_spu_alias_fixup. */
+static __inline int ppu_fm_alias_ea(uint32_t kind, uint32_t mask, uint32_t* ea)
+{
+    uint32_t e = *ea - PPU_FM_ALIAS_DELTA;
+    if (PPU_FM_LEAN(ppu_fm_page(e >> PPU_FM_PAGE_SHIFT), kind, mask)) return 0;
+    *ea = e;
+    return 1;
+}
 #endif
 
 #if PPU_FM3
@@ -793,7 +821,13 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
  *   - GCM ref-poll: the page of the address, for reads;
  *   - read sync: vm_read_sync_mark_range sets K_SYNC and the read bit on
  *     the pages of its range, and the read bit on the page before the
- *     range. It calls a hook; ppu_fm_arm installs it.
+ *   range. It calls a hook; ppu_fm_arm installs it;
+ *   - alias window: a page of the window with the page answer ALIAS has
+ *     K_ALIAS. The one test of the site includes that bit, so a plain
+ *     page pays no instruction for it. The block of the test sends a set
+ *     route bit or flag bit out of line, with the original address. Else
+ *     the access runs on the primary address, EA - 0x05000000, after one
+ *     test of the page byte of that address (ppu_fm_alias_ea).
  * Before ppu_fm_arm each bit of the flag word is set: each access takes
  * the out-of-line function. */
 
@@ -802,7 +836,10 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
     {                                                                         \
         uint32_t ea = (uint32_t)a;                                            \
         unsigned char k = ppu_fm_page(ea >> PPU_FM_PAGE_SHIFT);               \
-        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_READ, PPU_FM_S_READ)))    \
+        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_ALIAS | PPU_FM_K_READ,    \
+                                        PPU_FM_S_READ))                       \
+            && (PPU_FM_LEAN(k, PPU_FM_K_READ, PPU_FM_S_READ)                  \
+                || !ppu_fm_alias_ea(PPU_FM_K_READ, PPU_FM_S_READ, &ea)))      \
             return name##_out(a);                                             \
         return name##_lean(ea);                                               \
     }
@@ -812,12 +849,16 @@ static __inline PPU_FM_NOINLINE void ppu_fm_write64_out(uint64_t a, uint64_t v)
     {                                                                         \
         uint32_t ea = (uint32_t)a;                                            \
         unsigned char k = ppu_fm_page(ea >> PPU_FM_PAGE_SHIFT);               \
-        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_WRITE, PPU_FM_S_WRITE))) { \
+        if (PPU_FM_UNLIKELY(PPU_FM_LEAN(k, PPU_FM_K_ALIAS | PPU_FM_K_WRITE,   \
+                                        PPU_FM_S_WRITE))                      \
+            && (PPU_FM_LEAN(k, PPU_FM_K_WRITE, PPU_FM_S_WRITE)                \
+                || !ppu_fm_alias_ea(PPU_FM_K_WRITE, PPU_FM_S_WRITE, &ea))) {  \
             name##_out(a, v);                                                 \
             return;                                                           \
         }                                                                     \
         name##_body(a, ea, v);                                                \
     }
+
 
 PPU_FM_LEAN_READ(ppu_fm_read8, uint8_t)
 PPU_FM_LEAN_READ(ppu_fm_read16, uint16_t)
