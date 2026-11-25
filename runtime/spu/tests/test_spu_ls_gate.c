@@ -165,32 +165,38 @@ void vm_write8(uint64_t addr, uint8_t v)
 
 /* ---- Boundaries of runtime/syscalls/sys_semaphore.c. The two hooks are
  * no-ops here. A wait that takes a token at once does not call the others. */
+static void unexpected(const char* what)
+{
+    fprintf(stderr, "FAIL unexpected call: %s\n", what);
+    abort();
+}
 static const char* wait_begin_kind;
 void ps3_spu_job_complete_pending(void) {}
 void ppu_thread_wait_begin(ppu_context* c, const char* kind, uint64_t a, uint64_t b) { (void)c; (void)a; (void)b; wait_begin_kind = kind; }
-void lbp_breadcrumb_dump(const char* tag) { (void)tag; abort(); }
-void ppu_log_host_chain(const char* tag) { (void)tag; abort(); }
-int64_t lv2_usec_deadline(uint64_t usec) { (void)usec; abort(); }
-int lv2_deadline_passed(int64_t deadline) { (void)deadline; abort(); }
+void lbp_breadcrumb_dump(const char* tag) { (void)tag; unexpected("lbp_breadcrumb_dump"); }
+void ppu_log_host_chain(const char* tag) { (void)tag; unexpected("ppu_log_host_chain"); }
+int64_t lv2_usec_deadline(uint64_t usec) { (void)usec; unexpected("lv2_usec_deadline"); abort(); }
+int lv2_deadline_passed(int64_t deadline) { (void)deadline; unexpected("lv2_deadline_passed"); abort(); }
 
 /* ---- Link-only boundaries of the SPU runtime outside this fixture. Fail if
  * any is reached. The fixture runs its own contexts: no LV2 SPU thread, no
- * guest memory aliasing, no DMA watch query. */
-void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
-void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
-void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
-unsigned long long ps3_ms_now(void) { abort(); }
+ * DMA watch query. The alias fixup is the identity rule of the vendor
+ * runtime/syscalls/spu_ea_alias.c: an EA below 0x45000000 maps to itself. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; unexpected("spu_thread_publish_ctx"); abort(); }
+void ppu_resv_break_store(uint64_t ea) { (void)ea; unexpected("ppu_resv_break_store"); abort(); }
+void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; unexpected("ps3_ww_report_inline"); abort(); }
+unsigned long long ps3_ms_now(void) { unexpected("ps3_ms_now"); abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_tasksetid;
-void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
+uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; unexpected("spurs_ef_set_from_spu"); abort(); }
+void ydkj_wake_all_event_flags(void) { unexpected("ydkj_wake_all_event_flags"); abort(); }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
-uint32_t sysmem_spu_alias_fixup(uint32_t ea) { (void)ea; abort(); }
-uint32_t spu_thread_register_phantom(void) { abort(); }
-unsigned int mainspin_watch_n(void) { abort(); }
-unsigned int mainspin_watch_at(int i) { (void)i; abort(); }
+uint32_t spu_thread_register_phantom(void) { unexpected("spu_thread_register_phantom"); abort(); }
+unsigned int mainspin_watch_n(void) { unexpected("mainspin_watch_n"); abort(); }
+unsigned int mainspin_watch_at(int i) { (void)i; unexpected("mainspin_watch_at"); abort(); }
+uint32_t sysmem_spu_alias_fixup(uint32_t ea) { LANE_CHECK(ea < 0x45000000u); return ea; }
 
 static int armed_probes(void)
 {
