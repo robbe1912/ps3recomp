@@ -69,6 +69,11 @@ static inline int spu_coh_bitmap_test(uint32_t addr)
     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
     return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
 }
+/* Exported (not static like the bitmap): the PPU store fast paths gate on it
+ * INLINE -- one predicted compare against a global that stays zero until SPU
+ * code takes its first line reservation -- instead of paying a call into this
+ * file on every guest store. */
+extern volatile int g_spu_coh_armed;
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host

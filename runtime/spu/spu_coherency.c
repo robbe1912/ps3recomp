@@ -73,12 +73,13 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
 
 unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_BYTES];
 
-/* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+/* Zero until the first GETLLAR anywhere. Keeps the PPU store fast path off
+ * the bitmap entirely for a title that runs no SPU code. Exported as
+ * g_spu_coh_armed (see spu_coherency.h): the inline store paths gate on it
+ * with one predicted compare instead of a call into this file. Written once,
+ * under the lock; read unlocked, where a stale zero costs at most one missed
+ * event on the very first reservation of the run. */
+volatile int g_spu_coh_armed;
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -95,7 +96,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     g_spu_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    g_spu_coh_armed = 1;
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -168,7 +169,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
+    if (!g_spu_coh_armed) return 0;
     return spu_coh_bitmap_test(addr);
 }
 
