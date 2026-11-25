@@ -1,4 +1,4 @@
-"""Compile the real float helpers and reject three scope-state mutants."""
+"""Compile the real float helpers and reject five scope-state mutants."""
 import json
 import os
 from pathlib import Path
@@ -21,16 +21,18 @@ def main():
         (out/'commands.json').write_text(json.dumps(records,indent=2))
         return result
     mutants=[('scope',None,None,None),
-             ('held-host','spu_float_simd.h',b'g_spu_sf_simd_scope && spu_sf_csr_is_spu(csr)',b'0'),
-             ('outside-scope','spu_float_simd.h',b'g_spu_sf_simd_scope && spu_sf_csr_is_spu(csr)',b'spu_sf_csr_is_spu(csr)'),
-             ('nested-overwrite','spu_float_simd.c',b'if (!g_spu_sf_simd_scope) g_spu_sf_host_csr=csr;',b'if (!spu_sf_csr_is_spu(csr)) g_spu_sf_host_csr=csr;')]
+             ('held-host','spu_float_simd.h',b'    _mm_setcsr((g_spu_sf_host_csr',b'    if (0) _mm_setcsr((g_spu_sf_host_csr'),
+             ('not-restored','spu_float_simd.h',b'if (held) _mm_setcsr(held);',b'(void)held;'),
+             ('outside-scope','spu_float_simd.h',b' || !g_spu_sf_simd_scope) return 0;',b') return 0;'),
+             ('nested-overwrite','spu_float_simd.c',b'if (!g_spu_sf_simd_scope) g_spu_sf_host_csr=csr;',b'if (!spu_sf_csr_is_spu(csr)) g_spu_sf_host_csr=csr;'),
+             ('spu-caller-not-captured','spu_float_simd.c',b'if (!g_spu_sf_simd_scope) g_spu_sf_host_csr=csr;',b'if (!g_spu_sf_simd_scope && !spu_sf_csr_is_spu(csr)) g_spu_sf_host_csr=csr;')]
     for name,file,old,new in mutants:
         private=out/name
         private.mkdir()
         for source in ['spu_helpers.h','spu_float_simd.h','spu_float_simd.c']:
             data=(SPU/source).read_bytes()
             if source==file:
-                assert data.count(old)==(2 if source.endswith('.h') else 1),(name,source)
+                assert data.count(old)==1,(name,source)
                 data=data.replace(old,new)
             (private/source).write_bytes(data)
         exe=private/('test.exe' if os.name=='nt' else 'test')
@@ -45,7 +47,7 @@ def main():
         result=run([exe])
         assert result.returncode==(0 if name=='scope' else 1),(name,result.stdout,result.stderr)
         assert ('scope failures=0' in result.stdout)==(name=='scope'),(name,result.stdout)
-    print('PASS real float scope and three compiled mutants:',out)
+    print('PASS real float scope and five compiled mutants:',out)
 
 if __name__=='__main__':
     main()

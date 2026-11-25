@@ -35,14 +35,15 @@ static inline uint32_t spu_sf_simd_round_begin(void) {
     _mm_setcsr(saved|SPU_SF_CSR_SPU);
     return saved;
 }
+/* Zero means that no switch occurs. A held MXCSR is never zero. */
 static inline uint32_t spu_sf_host_begin(void) {
     uint32_t csr=_mm_getcsr();
-    if (g_spu_sf_simd_scope && spu_sf_csr_is_spu(csr))
-        _mm_setcsr((g_spu_sf_host_csr & ~0x3fu)|(csr & 0x3fu));
+    if (!spu_sf_csr_is_spu(csr) || !g_spu_sf_simd_scope) return 0;
+    _mm_setcsr((g_spu_sf_host_csr & ~0x3fu)|(csr & 0x3fu));
     return csr;
 }
-static inline void spu_sf_host_end(uint32_t csr) {
-    if (g_spu_sf_simd_scope && spu_sf_csr_is_spu(csr)) _mm_setcsr(csr);
+static inline void spu_sf_host_end(uint32_t held) {
+    if (held) _mm_setcsr(held);
 }
 static inline int spu_sf_simd_extended(__m128i a) {
     const __m128i exponent = _mm_set1_epi32(0x7f800000);

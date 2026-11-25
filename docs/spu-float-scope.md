@@ -25,8 +25,8 @@ Set `MV_CLANG` or `CC` to select the compiler.
 The check compiles actual helpers for all four caller rounding modes.
 It covers double arithmetic, comparisons, conversions, held SIMD arithmetic,
 a caller that already uses SPU controls, and nested entry after controls change.
-Three compiled mutants remove the host guard, switch outside a scope, or
-replace the outer caller during nested entry.
+Five compiled mutants remove the host switch or its restoration, switch outside
+a scope, replace the outer caller, or skip capture of a caller with SPU controls.
 The game carry also checks actual halt/reset landings with five mutants.
 No check uses game input.
 
