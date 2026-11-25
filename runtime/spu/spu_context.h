@@ -483,6 +483,16 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
+/* A unit that the compiler builds with SSSE3 enabled swaps a quadword of the
+ * local store with one byte shuffle. SPU_SCALAR_HELPERS selects the form
+ * above. */
+#if defined(__SSSE3__) && !defined(SPU_SCALAR_HELPERS)
+#include <tmmintrin.h>
+#define SPU_LS_SSSE3 1
+#else
+#define SPU_LS_SSSE3 0
+#endif
+
 /* One gate for the probes of spu_ls_read128 and spu_ls_write128. Inlined, the
  * probes kept every LS load a real call (~10% of GH3's FMOD mixer task).
  *
@@ -544,10 +554,21 @@ static __attribute__((noinline, cold)) void spu_ls_gate_init(void)
      * the empty list here, as that first use would have. */
     if (!watch && g_spu_ls_watch_n < 0) g_spu_ls_watch_n = 0;
 }
+/* Host byte i of a quadword of the local store is SPU byte i ^ 3. The same
+ * control vector swaps a load and a store. */
+#if SPU_LS_SSSE3
+static inline __m128i spu__ls_swap(void) {
+    static const SPU_ALIGN16 unsigned char mask[16] = {
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
+    return _mm_load_si128((const __m128i*)mask);
+}
+#endif
 static inline u128 spu_ls_load16(const uint8_t* p)
 {
     u128 v;
-#if SPU_LS_FAST
+#if SPU_LS_SSSE3
+    _mm_storeu_si128((__m128i*)v._u8, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p), spu__ls_swap()));
+#elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
     memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
@@ -680,7 +701,10 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
 
 static inline void spu_ls_store16(uint8_t* p, u128 val)
 {
-#if SPU_LS_FAST
+#if SPU_LS_SSSE3
+    __m128i v; memcpy(&v, &val, 16);
+    _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(v, spu__ls_swap()));
+#elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
