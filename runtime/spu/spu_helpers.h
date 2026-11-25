@@ -78,11 +78,13 @@ static inline uint8x16_t spu__iota(void) {
 }
 #endif
 
-/* x86 forms of the hot helpers, for units built with SSSE3 enabled (this
- * file: rotqby and rotqbyi; the local store swap is in spu_context.h). SSE2
- * and SSSE3 only. Each scalar definition stays as spu_X_ref. The forms need
- * no CPUID test and no target attribute. SPU_SCALAR_HELPERS and
- * SPU_SCALAR_INT select the scalar forms, as for the NEON forms. */
+/* x86 forms of the hot helpers (this file: rotqby, rotqbyi, cwd, cwx; the
+ * local store swap is in spu_context.h). SSE2 and SSSE3 only. Each scalar
+ * definition stays as spu_X_ref. The forms are gated by the feature macros
+ * of the unit: they need no CPUID test and no target attribute. An SSSE3
+ * form exists only in a unit that the compiler builds with SSSE3 enabled.
+ * SPU_SCALAR_HELPERS and SPU_SCALAR_INT select the scalar forms, as for
+ * the NEON forms. */
 #if (defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)) && !defined(SPU_SCALAR_HELPERS)
 #include <emmintrin.h>
 #define SPU_X86_SIMD 1
@@ -103,6 +105,19 @@ static inline uint8x16_t spu__iota(void) {
 #if SPU_X86_SIMD
 static inline __m128i spu__x86_ld(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
 static inline u128 spu__x86_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
+#endif
+#if SPU_X86_SIMD_INT
+/* The four values of spu_cwd_pos(pos) as host dwords. Word w of the table
+ * holds the value for (pos >> 2) & 3 == w: 0x10 + t at SPU byte t, and
+ * 0..3 at SPU bytes 4*w .. 4*w+3. SPU byte t is host byte t ^ 3. */
+static inline __m128i spu__x86_cwd_table(uint32_t pos) {
+    static SPU_ALIGN16 const uint32_t table[4][4] = {
+        {0x00010203u, 0x14151617u, 0x18191A1Bu, 0x1C1D1E1Fu},
+        {0x10111213u, 0x00010203u, 0x18191A1Bu, 0x1C1D1E1Fu},
+        {0x10111213u, 0x14151617u, 0x00010203u, 0x1C1D1E1Fu},
+        {0x10111213u, 0x14151617u, 0x18191A1Bu, 0x00010203u}};
+    return _mm_load_si128((const __m128i*)table + ((pos >> 2) & 3));
+}
 #endif
 #if SPU_X86_SIMD_SSSE3
 /* Control vector of the byte rotates, in host byte order: host byte j of
@@ -1253,13 +1268,20 @@ static inline u128 spu_cwd(u128 a, int i7) {
     uint32x4_t m = vceqq_u32(vld1q_u32(lane), vdupq_n_u32((((uint32_t)a._u32[0] + (uint32_t)i7) >> 2) & 3));
     return spu__st(vbslq_u32(m, vdupq_n_u32(0x00010203u), vld1q_u32(base)));
 }
+#elif SPU_X86_SIMD_INT
+static inline u128 spu_cwd(u128 a, int i7) { return spu__x86_st(spu__x86_cwd_table(a._u32[0] + (uint32_t)i7)); }
 #else
 static inline u128 spu_cwd(u128 a, int i7) { return spu_cwd_ref(a, i7); }
 #endif
 static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b._u32[0])); }
-static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
+static inline u128 spu_cwx_ref(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
+#if SPU_X86_SIMD_INT
+static inline u128 spu_cwx(u128 a, u128 b){ return spu__x86_st(spu__x86_cwd_table(a._u32[0] + b._u32[0])); }
+#else
+static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwx_ref(a, b); }
+#endif
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
 
 /* ---- Phase 3: rotate-and-mask family ---- */
