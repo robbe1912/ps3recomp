@@ -65,8 +65,7 @@ HEADER_MUTANTS = [
     ("upper bound past the raw SPU page", "#define PPU_FM_ALIAS_HI       0x50000000u",
      "#define PPU_FM_ALIAS_HI       0xFFFFFFFFu"),
     ("read32: ref-poll fence skipped",
-     "        if (PPU_FM_UNLIKELY(ea == ppu_hle_inject_base + 0x2008u)) "
-     "return ppu_fm_read32_out(a);\n", ""),
+     "    if (PPU_FM_UNLIKELY(ea == ppu_hle_inject_base + 0x2008u)) ppu_fm_refpoll();\n", ""),
     ("gate ignores the page table", GATE, "    ((flags) & (mask))"),
     ("gate ignores the flag word", GATE,
      "    (ppu_fm_kind[(ea) >> PPU_FM_PAGE_SHIFT] & (kind))"),
@@ -431,6 +430,8 @@ static int alias_probes(void)
         { 0x50000000u, 0x50000000u },
         { 0xFFFFFFFFu, 0xFFFFFFFFu },
     };
+    /* The public alias table is part of the PPU_FM3 path only. */
+#if PPU_FM3
     static const struct { uint32_t page; unsigned char want; } state[] = {
         { 0x46000000u, PPU_FM_ALIAS_IDENTITY }, { 0x46001000u, PPU_FM_ALIAS_IDENTITY },
         { 0x47000000u, PPU_FM_ALIAS_IDENTITY },
@@ -441,11 +442,14 @@ static int alias_probes(void)
         unsigned char got = sysmem_spu_alias_page[(state[i].page - PPU_FM_ALIAS_LO) >> PPU_FM_PAGE_SHIFT];
         if (got != state[i].want) return fail("page_state", got, state[i].want);
     }
+#endif
     for (unsigned i = 0; i < sizeof fix / sizeof fix[0]; i++) {
         uint32_t got = sysmem_spu_alias_fixup(fix[i].ea);
         if (got != fix[i].want) return fail("fixup", got, fix[i].want);
     }
+#if PPU_FM3
     if (sizeof sysmem_spu_alias_page != 0xB000u) return fail("alias_pages", sizeof sysmem_spu_alias_page, 0xB000u);
+#endif
     return 0;
 }
 
@@ -467,17 +471,24 @@ static int unarmed(void)
  * gets the EA of the body, the guest word and a caller address in the
  * lifted function (here: in the function that reads). */
 #define SPIN(width)                                                                    \
-extern "C" FIXTURE_NOINLINE uint64_t spin_read##width(uint32_t ea)                    \
+extern "C" FIXTURE_NOINLINE FIXTURE_OPTNONE uint64_t spin_read##width(uint32_t ea)                    \
 {                                                                                      \
     uint64_t last = 0;                                                                 \
     for (int i = 0; i < 200000; i++) last = ppu_fm_read##width(ea);                   \
     return last;                                                                       \
-}                                                                                      \
-extern "C" FIXTURE_NOINLINE uint32_t spin_read##width##_end(uint32_t ea) { return ea + 1u; }
+}
 #if defined(_MSC_VER) && !defined(__clang__)
 #define FIXTURE_NOINLINE __declspec(noinline)
 #else
 #define FIXTURE_NOINLINE __attribute__((noinline))
+#endif
+/* optnone keeps each reader function in one block: the compiler moves no
+ * part of it to a cold section. The range of the function then covers
+ * each call site in it. */
+#if defined(__clang__)
+#define FIXTURE_OPTNONE __attribute__((optnone))
+#else
+#define FIXTURE_OPTNONE
 #endif
 SPIN(8) SPIN(16) SPIN(32) SPIN(64)
 
@@ -487,8 +498,6 @@ static int spin_at(int acc, uint32_t ea, uint32_t fire_ea_want)
     char what[64];
     uint64_t (*fn[4])(uint32_t) = { spin_read8, spin_read16, spin_read32, spin_read64 };
     void* start[4] = { (void*)spin_read8, (void*)spin_read16, (void*)spin_read32, (void*)spin_read64 };
-    void* end[4] = { (void*)spin_read8_end, (void*)spin_read16_end, (void*)spin_read32_end,
-                     (void*)spin_read64_end };
     uint64_t raw[4] = { 0, 0, vm_base[fire_ea_want] | vm_base[fire_ea_want + 1] << 8
                         | vm_base[fire_ea_want + 2] << 16 | (uint64_t)vm_base[fire_ea_want + 3] << 24,
                         (uint64_t)vm_base[fire_ea_want] | (uint64_t)vm_base[fire_ea_want + 1] << 8
@@ -496,12 +505,27 @@ static int spin_at(int acc, uint32_t ea, uint32_t fire_ea_want)
                         | (uint64_t)vm_base[fire_ea_want + 4] << 32 | (uint64_t)vm_base[fire_ea_want + 5] << 40
                         | (uint64_t)vm_base[fire_ea_want + 6] << 48 | (uint64_t)vm_base[fire_ea_want + 7] << 56 };
     snprintf(what, sizeof what, "spin_%s", names[acc]);
+    /* The first read of an address only records it. Reads after it count
+     * (PPU_FM_SPIN_DET): one read comes first. */
+    (void)read_value(acc, ea);
     fires = 0; fire_ra = 0;
     (void)fn[acc](ea);
     if (fires != 1) return fail(what, fires, 1);
     if (fire_ea != fire_ea_want) return fail(what, fire_ea, fire_ea_want);
     if (fire_v != raw[acc]) return fail(what, fire_v, raw[acc]);
-    if (!(fire_ra >= start[acc] && fire_ra < end[acc])) return fail(what, (unsigned long long)(uintptr_t)fire_ra, (unsigned long long)(uintptr_t)start[acc]);
+    /* The caller address is in the function that reads, not in the
+     * out-of-line copy of the accessor. The reader is one block (optnone)
+     * and is smaller than 4096 bytes. */
+    int inside = (uintptr_t)fire_ra - (uintptr_t)start[acc] < 0x1000;
+#if !PPU_FM_INLINE_FAST
+    /* One copy per unit: the copy of the accessor is a function of this
+     * image. Its size is below 1024 bytes. The fire address must not be in
+     * it. */
+    void* copies[4] = { (void*)ppu_fm_read8, (void*)ppu_fm_read16, (void*)ppu_fm_read32,
+                       (void*)ppu_fm_read64 };
+    if ((uintptr_t)fire_ra - (uintptr_t)copies[acc] < 0x400) inside = 0;
+#endif
+    if (!inside) return fail(what, (unsigned long long)(uintptr_t)fire_ra, (unsigned long long)(uintptr_t)start[acc]);
     (void)fn[acc](ea);
     if (fires != 2) return fail(what, fires, 2);
     return 0;
@@ -530,9 +554,10 @@ static int spin_off(void)
     return 0;
 }
 
-/* With the count bit set, each access of a window page leaves the fast path
- * and is counted: the counter reads the clock once per 16384 hits. A plain
- * page stays inline and is not counted. */
+/* With the count bit set, each access leaves the fast path and takes the
+ * out-of-line function, on a page of the window and on a plain page (the
+ * comment of ppu_fm_arm in the loader). The counter reads the clock once
+ * per 16384 hits. */
 static int counter(void)
 {
     uint32_t base = 0x46000100u;
@@ -560,7 +585,7 @@ static int counter(void)
         ppu_fm_write32(base + 0x24u, (uint32_t)i);
         ppu_fm_write64(base + 0x28u, (uint64_t)i);
     }
-    if (now_calls != 8) return fail("count_plain", now_calls, 8);
+    if (now_calls != 16) return fail("count_plain", now_calls, 16);
     return 0;
 }
 
@@ -612,7 +637,9 @@ int main(int argc, char** argv)
         return probes() || counter();
     }
     if (!strcmp(mode, "diag") || !strcmp(mode, "kill")) {
-        environment[!strcmp(mode, "kill") ? "PPU_FM" : "PPU_RWATCH"] = "1";
+        /* PPU_FM=0 is the kill switch: each access takes the family. */
+        if (!strcmp(mode, "kill")) environment["PPU_FM"] = "0";
+        else environment["PPU_RWATCH"] = "1";
         ppu_fm_arm();
         if (!(ppu_fm_slow & PPU_FM_S_DIAG)) return fail("diag_flag", ppu_fm_slow, PPU_FM_S_DIAG);
         return probes();
