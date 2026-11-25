@@ -37,7 +37,7 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 #endif
 
 /* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
- * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
+ * SPU ISA v1.2 Â§13 (+ the per-instruction pages): order all earlier LS and
  * channel accesses before later ones; LS must be consistent "if it were\n * observed by another entity" (Table 13-6 is exactly this runtime's
  * host-thread producer -> SPU consumer handoff). A no-op is neither a
  * compiler nor a CPU barrier -- MSVC at /O2 may reorder plain LS accesses
@@ -221,7 +221,7 @@ static inline u128 spu_sfi(u128 a, int32_t imm) { return spu_sfi_ref(a, imm); }
 #endif
 static inline u128 spu_sfhi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
 
-/* ---- multiply (low halfword of each word × ... -> 32-bit, per SPU mpy) ----
+/* ---- multiply (low halfword of each word Ã— ... -> 32-bit, per SPU mpy) ----
  * Sub-lane indexing assumes a little-endian host (matches the recompiler's
  * target). The "low halfword of word i" in SPU BE semantics is _s16[2i] on
  * an LE host (NOT _s16[2i+1], which would be correct on a BE host). */
@@ -1159,7 +1159,7 @@ static inline u128 spu_fsmbi(int32_t imm) {
 }
 
 /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
-/* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
+/* Generate-controls (cbd/chd/cwd/cdd) â€” insertion selectors for the (now
  * SPU-byte-correct) shufb. Each builds a control in TRUE SPU byte order: the
  * base selects b's SPU byte t at result SPU byte t (selector 0x10+t), and the
  * insert positions select a's preferred scalar bytes -- SPU byte 3 for a byte
