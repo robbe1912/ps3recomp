@@ -972,13 +972,25 @@ GROUPS = (("header", HEADER_MUTANTS, "header"), ("alias", ALIAS_MUTANTS, "alias"
           ("coherency", COHERENCY_MUTANTS, "coh"))
 
 # The externals of the coherency file that the fixture does not use. The
-# file links whole: its reserve function is a writer of the page byte.
-COHERENCY_STUB = r'''
-#include <stdint.h>
-void spu_ch_wake(void);
-void spu_ch_wake(void) {}
-uint64_t g_spu_lane_trace, g_spu_ls_gate;
-'''
+# file links whole: its reserve function is a writer of the page byte. The
+# coherency file of the fork declares g_spu_lane_trace and g_spu_ls_gate and
+# does not define them. The copy in the game defines them in spu_context.h.
+# So the stub holds a name only when no file of the tree that the coherency
+# file includes defines it.
+COHERENCY_STUB_NAMES = ("g_spu_lane_trace", "g_spu_ls_gate")
+COHERENCY_SOURCES = (COHERENCY, Path("runtime/spu/spu_coherency.h"), Path("runtime/spu/spu_context.h"))
+
+
+def coherency_stub(vendor):
+    lines = []
+    for path in COHERENCY_SOURCES:
+        if (vendor / path).is_file():
+            lines.extend((vendor / path).read_text().splitlines())
+    undefined = [name for name in COHERENCY_STUB_NAMES
+                 if not any(re.search(r"\b%s\s*(=[^;]*)?;" % name, line) and "extern" not in line
+                            for line in lines)]
+    body = "".join("uint64_t %s;\n" % name for name in undefined)
+    return "#include <stdint.h>\nvoid spu_ch_wake(void);\nvoid spu_ch_wake(void) {}\n" + body
 
 
 def arm_text(loader):
@@ -1015,7 +1027,7 @@ def build(environment, work, cc, msvc_style, texts, path_defines, vendor, inline
     (work / "alias.c").write_text(texts["alias"])
     (work / "sync.c").write_text(texts["sync"])
     (work / "coh.c").write_text(texts["coh"])
-    (work / "cohstub.c").write_text(COHERENCY_STUB)
+    (work / "cohstub.c").write_text(coherency_stub(vendor))
     defines = ["PPU_FM_INLINE_FAST=%d" % inline_fast] + list(path_defines)
     directories = [work / "mut" / "include", vendor / "include", vendor / "runtime" / "spu"]
     if msvc_style:
