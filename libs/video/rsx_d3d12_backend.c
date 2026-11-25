@@ -5628,6 +5628,26 @@ skip_dump_consider: ;
 
 /* The queued records own constant/SRV slots and uploaded geometry until the
  * submission below. Drain before writing any part of the next record. */
+/* Submit smaller batches through the existing nonpresenting drain path.
+ * The cap is opt-in. Invalid values leave it off. */
+static u32 submit_draws_cap(void)
+{
+    static int parsed;
+    static u32 cap;
+    if (parsed) return cap;
+    parsed = 1;
+    const char* value = getenv("RSX_SUBMIT_DRAWS");
+    if (!value) return 0;
+    u32 n = 0; const char* p = value;
+    while (*p >= '0' && *p <= '9' && n <= MAX_DRAWS) n = n * 10 + (u32)(*p++ - '0');
+    if (p == value || *p || n < 16 || n > MAX_DRAWS) {
+        fprintf(stderr, "[D3D12] RSX_SUBMIT_DRAWS must be a decimal 16..%u, got '%s'; the cap is off\n", (unsigned)MAX_DRAWS, value);
+        return 0;
+    }
+    fprintf(stderr, "[D3D12] RSX_SUBMIT_DRAWS=%u: submit at the first draw boundary with %u or more draws\n", n, n);
+    cap = n;
+    return cap;
+}
 static void submit_record_capacity(void* context, int present)
 {
     (void)context;
@@ -5657,6 +5677,11 @@ static void cpu_surface_flush_recorded(int at_pump)
 static void ensure_draw_record_capacity(void)
 {
     cpu_surface_flush_recorded(0);
+    {
+        u32 cap = submit_draws_cap();
+        if (cap && s_d3d.initialized && s_d3d.draw_count >= cap)
+            submit_record_capacity(NULL, 0);
+    }
     if (!rsx_record_batch_room(&s_d3d.draw_count, MAX_DRAWS, NULL, submit_record_capacity)) {
         fprintf(stderr, "[D3D12] Record capacity drain failed (count=%u)\n", s_d3d.draw_count);
         abort();
