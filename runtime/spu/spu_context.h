@@ -495,8 +495,10 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 
 /* SPU_LANE_TRACE: the diagnostic lines of the SPU lane hot paths. Default
  * off. One cached read of the environment for the process. A value that is
- * not empty and not 0 is on. Error lines, halts and [pm-end] lines do not
- * use it. */
+ * not empty and not 0 is on. Lines behind it: [spurs-pm] poll, [spurs-pm]
+ * DMA, [taskset] built, the [spu_workload] dispatch HIT and async RETURNED
+ * lines, and [WAIT] semaphore_wait. Error lines, halts and [pm-end] lines do
+ * not use it. */
 
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),

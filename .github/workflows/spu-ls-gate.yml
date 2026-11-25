@@ -2,9 +2,9 @@ name: SPU LS probe gate
 on:
   push:
     branches: [master, main, combined, 'codex/**']
-    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'runtime/syscalls/**', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
   pull_request:
-    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
+    paths: ['runtime/spu/**', 'runtime/platform/**', 'runtime/memory/**', 'runtime/diag/**', 'runtime/ppu/**', 'libs/spurs/**', 'runtime/ps3_log.h', 'runtime/syscalls/**', 'include/**', 'tools/spu_lifter.py', 'tools/spu_disasm.py', 'tools/test_spu_ls_gate.py', '.github/workflows/spu-ls-gate.yml']
   workflow_dispatch:
 jobs:
   gate:

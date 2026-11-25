@@ -1419,10 +1419,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* Policy-module observation trace: every SPURS PM run's first transfers,
-     * always on (policy runs are rare and their DMA pattern is the primary
-     * bring-up signal: joblist fetch, job-module loads, output stores). */
-    if (spu->policy_mode) {
+    /* Policy-module observation trace: every SPURS PM run's first transfers.
+     * Prints only with SPU_LANE_TRACE=1 (policy runs are rare and their DMA
+     * pattern is the primary bring-up signal: joblist fetch, job-module loads,
+     * output stores). */
+    if (spu->policy_mode && spu_lane_trace()) {
         static int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA

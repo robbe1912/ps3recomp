@@ -3,17 +3,26 @@
 
 One process per environment: the gate reads the environment once. The lifted
 bodies come from the lifter. Each build compiles a private copy of the runtime,
-so a mutant changes only that copy. --mutants adds the four planted defects."""
+so a mutant changes only that copy. --mutants adds the fourteen planted defects.
+
+Lines behind SPU_LANE_TRACE: [spurs-pm] poll, [spurs-pm] DMA, [taskset] built,
+the [spu_workload] dispatch HIT and async RETURNED lines, and [WAIT] semaphore_wait."""
 import argparse, hashlib, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
-ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path);ap.add_argument('--mutants',action='store_true');args=ap.parse_args()
+ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path);ap.add_argument('--mutants',action='store_true')
+ap.add_argument('--only',nargs='*',help='build these variants only (names)');args=ap.parse_args()
 out=(args.output or root/'temp/checks'/('spu-ls-gate-'+str(time.time_ns()))).resolve();out.mkdir(parents=True,exist_ok=True)
 fixture=root/'runtime/spu/tests/test_spu_ls_gate.c'
-TREES=('runtime/spu','runtime/platform','runtime/memory','runtime/diag','runtime/ppu','libs/spurs','runtime/ps3_log.h','include')
+TREES=('runtime/spu','runtime/platform','runtime/memory','runtime/diag','runtime/ppu','libs/spurs','runtime/ps3_log.h','include',
+       'runtime/syscalls/sys_semaphore.c','runtime/syscalls/sys_semaphore.h','runtime/syscalls/sys_timer.h','runtime/syscalls/lv2_syscall_table.h')
 names=['spu_channels.c','spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c','spu_float_simd.c','spu_task_lifecycle.c']
-EXTRA=['runtime/platform/win32_compat.c','runtime/memory/guest_read_sync.c','runtime/diag/spu_execution_observer.c']
-SILENT=['[spurs-pm] poll','[wws-res]','[wws-code]','[spu-lowread]','[spu-SMC]','[spu-watch']
+EXTRA=['runtime/platform/win32_compat.c','runtime/memory/guest_read_sync.c','runtime/diag/spu_execution_observer.c','runtime/syscalls/sys_semaphore.c']
+# Line kinds behind SPU_LANE_TRACE. A default run must not print one of them.
+GATED=['[spurs-pm] poll','[spurs-pm] DMA','[taskset] built','[spu_workload] dispatch HIT','[spu_workload] async image=','[WAIT] semaphore']
+# The three probe lines: each prints only when its own switch is on.
+PROBES=['[spu-lowread]','[spu-SMC]','[spu-watch']
+QUIET=['[wws-res]','[wws-code]']
 # (name, file, before, after): one planted defect each. Every pair must hit once.
 MUTANTS=[
  ('gate-inverted','runtime/spu/spu_context.h',
@@ -25,9 +34,39 @@ MUTANTS=[
  ('probe-lost-when-armed','runtime/spu/spu_context.h',
   '    if (g_spu_ls_gate & SPU_LS_GATE_SMC)\n        spu_ls_write_probe_smc(ctx, lsa, p);',
   '    if (0)\n        spu_ls_write_probe_smc(ctx, lsa, p);'),
+ ('probe-fired-when-not-armed','runtime/spu/spu_context.h',
+  '    if (g_spu_ls_gate & SPU_LS_GATE_LOWREAD) {',
+  '    if (g_spu_ls_gate) {'),
+ ('load-byte-order-turned','runtime/spu/spu_context.h',
+  '    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);',
+  '    v._u32[0] = w0; v._u32[1] = SPU_BSWAP32(w1);'),
+ ('store-byte-order-turned','runtime/spu/spu_context.h',
+  '    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);',
+  '    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = val._u32[3];'),
+ ('trace-always-on','runtime/spu/spu_context.h',
+  '    g_spu_lane_trace = (e && *e && strcmp(e, "0")) ? 1 : 0;',
+  '    g_spu_lane_trace = 1;'),
  ('poll-line-unconditional','runtime/spu/spu_channels.c',
   '            if (spu_lane_trace() && (n <= 4 || (n % 4096) == 0))',
   '            if (n <= 4 || (n % 4096) == 0)'),
+ ('sync-dispatch-line-unconditional','runtime/spu/spu_workload.c',
+  '    if (spu_lane_trace())\n        fprintf(stderr,\n            "[spu_workload] dispatch HIT fp=',
+  '    if (1)\n        fprintf(stderr,\n            "[spu_workload] dispatch HIT fp='),
+ ('taskset-line-unconditional','runtime/spu/spu_workload.c',
+  '                    if (spu_lane_trace()) {\n                        fprintf(stderr, "[taskset] built',
+  '                    if (1) {\n                        fprintf(stderr, "[taskset] built'),
+ ('async-returned-line-unconditional','runtime/spu/spu_workload.c',
+  '            if (spu_lane_trace())\n                fprintf(stderr, "[spu_workload] async image=%d RETURNED',
+  '            if (1)\n                fprintf(stderr, "[spu_workload] async image=%d RETURNED'),
+ ('async-dispatch-line-unconditional','runtime/spu/spu_workload.c',
+  '    if (spu_lane_trace())\n        fprintf(stderr,\n            "[spu_workload] dispatch HIT (async)',
+  '    if (1)\n        fprintf(stderr,\n            "[spu_workload] dispatch HIT (async)'),
+ ('dma-line-unconditional','runtime/spu/spu_dma.h',
+  '    if (spu->policy_mode && spu_lane_trace()) {',
+  '    if (spu->policy_mode) {'),
+ ('wait-line-unconditional','runtime/syscalls/sys_semaphore.c',
+  '      else if (!getenv("SEMTID") && spu_lane_trace())',
+  '      else if (!getenv("SEMTID"))'),
 ]
 def lifted():
     sys.path.insert(0,str(root/'tools'))
@@ -35,6 +74,7 @@ def lifted():
     from spu_disasm import spu_decode
     def i10(op,rt,ra,imm10):return (op<<24)|((imm10&0x3FF)<<14)|(ra<<7)|rt
     def ri16(op9,rt,imm16):return (op9<<23)|((imm16&0xFFFF)<<7)|rt
+    def wrch(rt,ch):return (0x10D<<21)|(ch<<7)|rt
     IL,ILHU,IOHL,AI,LQD,STQD=0b010000001,0b010000010,0b011000001,0x1C,0x34,0x24
     # ILHU clears the low halfword, IOHL sets it: ilhu+iohl builds a 32-bit value.
     edge=[ri16(IL,3,0),ri16(ILHU,4,4),i10(AI,5,4,-16),ri16(IL,6,0),ri16(IOHL,6,0x1235),
@@ -44,6 +84,13 @@ def lifted():
           ri16(IL,0,0x240),0x35000000]
     poll=[ri16(IL,2,0x9D0),0x35200100,ri16(IL,5,0x1320),ri16(IL,6,0xDF0),ri16(IL,10,0x5A5A),
           i10(STQD,10,5,0),i10(LQD,9,6,0),ri16(IL,0,0x240),0x35000000]
+    # One MFC GET through the channels: LSA 16, EAH 17, EAL 18, size 19, tag 20, command 21.
+    def get(lsa,ea,size):
+        return [ri16(IL,4,lsa),wrch(4,16),ri16(IL,4,0),wrch(4,17),ri16(ILHU,5,ea>>16),ri16(IOHL,5,ea&0xFFFF),wrch(5,18),
+                ri16(IL,4,size),wrch(4,19),ri16(IL,4,8),wrch(4,20),ri16(IL,4,0x40),wrch(4,21)]
+    dma=[*get(0x4000,0x20000,0x80),*get(0x1000,0x20100,0x80),*get(0x2000,0x20200,0),ri16(IL,0,0x240),0x35000000]
+    lane=[ri16(IL,5,0x30),i10(LQD,12,5,0),ri16(IL,10,0x1234),ri16(ILHU,13,0xABCD),ri16(IOHL,13,0xEF01),
+          i10(STQD,13,5,0),i10(LQD,13,5,0),ri16(IL,0,0x240),0x35000000]
     def body(words,pc):
         lines=[]
         for word in words:
@@ -52,9 +99,12 @@ def lifted():
         return '\n'.join(lines)
     return ('/* Lifted by tools/test_spu_ls_gate.py. Do not edit. */\n'
             'static void lifted_edge_job(spu_context* c) { spu_context* ctx = c;\n'+body(edge,0x4000)+'\n}\n'
-            'static void lifted_poll_job(spu_context* c) { spu_context* ctx = c;\n'+body(poll,0x5000)+'\n}\n')
+            'static void lifted_poll_job(spu_context* c) { spu_context* ctx = c;\n'+body(poll,0x5000)+'\n}\n'
+            'static void lifted_dma_job(spu_context* c) { spu_context* ctx = c;\n'+body(dma,0x6000)+'\n}\n'
+            'static void lifted_lane_job(spu_context* c) { spu_context* ctx = c;\n'+body(lane,0x7000)+'\n}\n')
 def stage(label,changes=()):
     src=out/label/'src'
+    shutil.rmtree(out/label,ignore_errors=True)   # a second run into the same output directory starts from a clean copy
     for rel in TREES:
         if (root/rel).is_dir():shutil.copytree(root/rel,src/rel,ignore=shutil.ignore_patterns('out_*','rpcs3_oracle','gcc_*.txt','__pycache__'))
         else:(src/rel).parent.mkdir(parents=True,exist_ok=True);shutil.copy2(root/rel,src/rel)
@@ -62,7 +112,7 @@ def stage(label,changes=()):
         path=src/rel;text=path.read_text()
         assert text.count(before)==1,f'{label}: {rel}: {text.count(before)} hits for {before[:40]!r}'
         path.write_text(text.replace(before,after))
-    (src/'runtime/spu/tests/spu_ls_gate_call.h').write_text(lifted())
+    (src/'runtime/spu/tests/spu_lane_trace_call.h').write_text(lifted())
     return src
 def build(src,label,changes):
     target=out/label;spu=src/'runtime/spu'
@@ -73,7 +123,7 @@ def build(src,label,changes):
     clang='clang' in identity.stdout.lower()
     sources=[spu/'tests/test_spu_ls_gate.c',*[spu/n for n in names],*[src/n for n in EXTRA]]
     if clang:sources.append(spu/'spu_dispatch_mt.c')
-    includes=[spu/'tests',src/'include',spu,src/'runtime/platform']
+    includes=[spu/'tests',src/'include',spu,src/'runtime/platform',src/'runtime/syscalls']
     (target/'obj').mkdir()
     binary=target/('test.exe' if os.name=='nt' else 'test')
     if os.name=='nt':
@@ -96,24 +146,34 @@ def run(binary,entry,mode,env_extra,expect,absent):
     env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
     env.update(env_extra)
     result=subprocess.run([str(binary),mode],cwd=binary.parent,env=env,capture_output=True,text=True,timeout=60)
-    ok=result.returncode==0 and 'PASS' in result.stdout and all(k in result.stderr for k in expect) \
-       and not any(k in result.stderr for k in absent)
+    ok=result.returncode==0 and 'PASS' in result.stdout \
+       and all(result.stderr.count(k)==n for k,n in expect) and not any(k in result.stderr for k in absent)
     entry.setdefault('runs',[]).append({'mode':mode,'env':env_extra,'returncode':result.returncode,
         'ok':ok,'stdout':result.stdout,'stderr':result.stderr})
     return ok,result
-# mode, environment additions, line kinds that must print, line kinds that must not print
-CASES=[('edge',{},[],SILENT),
-       ('edge',{'SPU_LANE_TRACE':'0'},[],SILENT),
-       ('policy',{},[],SILENT),
-       ('policy',{'SPU_LANE_TRACE':'1'},['[spurs-pm] poll #1','[wws-res]','[wws-code]'],[]),
-       ('edge',{'SPU_LS_LOWREAD':'1'},['[spu-lowread] img=77 read LS 0x000'],[]),
-       ('edge',{'SPU_SMC_WATCH':'77'},['[spu-SMC] img=77 WROTE CODE @0x01230'],[]),
-       ('edge',{'SPU_LS_WATCH':'0x1230'},['[spu-watch'],[])]
+LANE={'LBP_SPU_SERIAL':'1'}   # the async thread holds the serial lock until after its RETURNED line
+# The lane mode, trace on: every gated line kind, with its count.
+LANE_LINES=[('[spurs-pm] poll #1',1),('[spurs-pm] DMA cmd=0x40 lsa=0x04000',1),('[spurs-pm] DMA cmd=0x40 lsa=0x01000',1),
+            ('[spurs-pm] DMA cmd=0x40 lsa=0x02000',1),('[spu_workload] dispatch HIT fp=',1),('[spu_workload] dispatch HIT (async)',2),
+            ('[spu_workload] async image=77 RETURNED',2),('[taskset] built SpursTasksetContext image=77 taskset=0x00030000 task=0',1),
+            ('[WAIT] semaphore_wait(sem=1 timeout=0)',1)]
+# mode, environment additions, (line, count) that must print, line kinds that must not print
+CASES=[('edge',{},[],GATED+PROBES+QUIET),
+       ('edge',{'SPU_LANE_TRACE':'0'},[],GATED+PROBES+QUIET),
+       ('poll',{},[],GATED+PROBES+QUIET),
+       ('poll',{'SPU_LANE_TRACE':'1'},[('[spurs-pm] poll #1',1),('[wws-res]',1),('[wws-code]',1)],GATED[1:]+PROBES),
+       ('edge',{'SPU_LS_LOWREAD':'1'},[('[spu-lowread] img=77 read LS 0x000',1)],GATED+PROBES[1:]+QUIET),
+       ('edge',{'SPU_SMC_WATCH':'77'},[('[spu-SMC] img=77 WROTE CODE @0x01230',1)],GATED+PROBES[:1]+PROBES[2:]+QUIET),
+       ('edge',{'SPU_LS_WATCH':'0x1230'},[('[spu-watch rd 0x01230',1),('[spu-watch WR 0x01230',1)],GATED+PROBES[:2]+QUIET),
+       ('lane',LANE,[],GATED+PROBES+QUIET),
+       ('lane',dict(LANE,SPU_LANE_TRACE='0'),[],GATED+PROBES+QUIET),
+       ('lane',dict(LANE,SPU_LANE_TRACE='1'),LANE_LINES,PROBES)]
 report={'fixture_sha256':hashlib.sha256(fixture.read_bytes()).hexdigest(),
         'checker_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'lifter_sha256':hashlib.sha256((root/'tools/spu_lifter.py').read_bytes()).hexdigest(),'variants':[]}
 variants=[('production',())]
 if args.mutants:variants+=[(name,[(rel,before,after)]) for name,rel,before,after in MUTANTS]
+if args.only:variants=[v for v in variants if v[0] in args.only]   # short jobs while a timing run holds the host
 for name,changes in variants:
     src=stage(name,changes)
     binary,entry=build(src,name,changes)
@@ -123,10 +183,10 @@ for name,changes in variants:
         if not changes:assert ok,(name,mode,env_extra,result.stdout,result.stderr)
         elif not ok:entry.setdefault('killed_by',[]).append(mode)
         print(('PASS ' if ok else 'FAIL ')+name+' '+mode+' '+str(env_extra),flush=True)
+        (out/'result.json').write_text(json.dumps(report,indent=2))
     if changes:
         entry['killed']=bool(entry.get('killed_by'))
         print(('KILLED ' if entry['killed'] else 'SURVIVED ')+name+' '+str(entry.get('killed_by')),flush=True)
-    (out/'result.json').write_text(json.dumps(report,indent=2))
 mutants=[v for v in report['variants'] if v['mutated_sha256']]
 assert all(v['killed'] for v in mutants),'a mutant survived'
 print('PASS: '+str(len(CASES))+' environment cases; '+str(len(mutants))+' mutants rejected')
