@@ -425,13 +425,13 @@ static void vp_record_fp_b1(u32 slot, D3D12DrawRecord* dr)
 {
     ID3D12PipelineState* p = record_pso(dr);
     if (g_b1_mode[record_index(dr)] == 2 || !p) return;
-    b1_fill(g_b1 + (size_t)slot * VP_FPCB_STRIDE, p->n, g_b1_tag[record_index(dr)]);
+    b1_fill(g_b1 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE, p->n, g_b1_tag[record_index(dr)]);
     dr->fp_const_n = p->n;
 }
 static void vp_serve_pso_consts(u32 slot, D3D12DrawRecord* dr, u32 pso_n)
 {
     ID3D12PipelineState* p = record_pso(dr);
-    b1_fill(g_b1 + (size_t)slot * VP_FPCB_STRIDE, pso_n, p ? p->key : 0);
+    b1_fill(g_b1 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE, pso_n, p ? p->key : 0);
 }
 /* ---- SRV windows and sampler tables ---- */
 #define KEY_MAX 32768
@@ -602,7 +602,7 @@ static u64 model_key(const D3D12DrawRecord* r)
     mix(&h, r->depth_slot); mix(&h, r->rt_fmt);
     mix(&h, r->vp_x); mix(&h, r->vp_y); mix(&h, r->vp_w); mix(&h, r->vp_h);
     mix(&h, r->stencil_ref); mix(&h, r->fp_addr);
-    mix(&h, fnv(g_b0 + (size_t)r->cb_slot * VP_CB_STRIDE, PHASE_DRAW_B0_BYTES));
+    mix(&h, fnv(g_b0 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE, PHASE_DRAW_B0_BYTES));
     mix(&h, p ? p->key : 0);
     count = b1_final(r, tmp);
     mix(&h, fnv(tmp, (size_t)b1_bytes(count)));
@@ -744,11 +744,11 @@ static void add_record(void)
     r->vertex_count = vc; r->vb_byte_offset = g_cursor * VERTEX_STRIDE; r->cb_slot = i;
     fill_vertices(g_cursor, vc, i);
     g_cursor += vc;
-    slot = g_b0 + (size_t)i * VP_CB_STRIDE;            /* b0: the vertex constants of the state */
+    slot = g_b0 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + i) * VP_CB_STRIDE;   /* b0: the slot of the parity */
     memset(slot, 0, PHASE_DRAW_B0_BYTES);
     memcpy(slot, &g.b0, 4);
     memcpy(slot + 8, &g.b1, 4);
-    slot = g_b1 + (size_t)i * VP_FPCB_STRIDE;          /* b1: as recorded, before the refresh */
+    slot = g_b1 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + i) * VP_FPCB_STRIDE; /* b1: as recorded, before the refresh */
     memset(slot, 0, VP_FPCB_STRIDE);
     g_b1_tag[i] = g.b1; g_b1_mode[i] = (u32)g.b1mode;
     if (g.b1mode == 2) { b1_fill(slot, n, g.b1 + 555u); r->fp_const_n = 0xFFFFu; }
