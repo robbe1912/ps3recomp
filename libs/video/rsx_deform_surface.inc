@@ -1628,9 +1628,11 @@ static void deform_shadow_compare(RsxDeformSurface* s)
  * address + offsets[k]. The function writes the bytes that the CPU buffer
  * holds: level 0 and row 0 of level 1. It returns how many it wrote. The
  * count is 0 when no record holds the surface, the buffer is off, or the
- * record is changing: the caller then reads the guest memory. In the mode on
- * level 0 is in guest memory, so the read paths of rsx_cpu_surface.inc serve
- * the other reads of the game.
+ * record changes for more than 50 ms. The caller then reads the guest
+ * memory. A record that the renderer changes now (a paint) ends first: the
+ * read waits (deform_sequence_even). In the mode on level 0 is in guest
+ * memory, so the read paths of rsx_cpu_surface.inc serve the other reads of
+ * the game.
  *
  * rsx_deform_wheel_log() writes the line of the shadow mode for one read:
  *   [DEFORM_WHEEL] frame= x= y= level= cpu= gpu= t_ms=
@@ -1641,14 +1643,74 @@ static void deform_shadow_compare(RsxDeformSurface* s)
  * The first line is the first read after a compare that found painted texels.
  * The lines stop after RSX_DEFORM_LOG frames.
  */
+/* ---- the wait of a read for the end of a paint ---- */
+
+/* Game thread. The record of a listed target that holds the guest address
+ * while the renderer changes it now, or 0. deform_surface_of() does not
+ * give that record. */
+static RsxDeformSurface* deform_surface_changing(u32 address)
+{
+    for (int i = 0; i < s_deform.n_offsets; i++) {
+        RsxDeformSurface* s = &s_deform_surface[i];
+        if ((atomic_load_explicit(&s->sequence, memory_order_relaxed) & 1) && s->guest_address == address)
+            return s;
+    }
+    return NULL;
+}
+
+static _Atomic u64 s_deform_sample_waits, s_deform_sample_timeouts, s_deform_sample_wait_us_max;
+
+/* Game thread. The sequence number of s when the renderer changes the
+ * record no more, or 0 after RSX_DEFORM_SAMPLE_WAIT_S. The renderer paints
+ * the record on its own thread (deform_paint) and waits for nothing there.
+ * The read waits for the end of the paint. Before, the read returned 0 at
+ * once and the game read the GPU surface: that read waits for the next FIFO
+ * boundary of the renderer, 80 ms in a race with RSX_DRAIN_OVERLAP=1 (run
+ * D25). After the bound the caller reads the GPU surface, which is always
+ * correct. */
+#define RSX_DEFORM_SAMPLE_WAIT_S 0.050
+static u64 deform_sequence_even(RsxDeformSurface* s)
+{
+    u64 sequence = atomic_load_explicit(&s->sequence, memory_order_acquire);
+    if (!(sequence & 1)) return sequence;
+    double start = perf_now();
+    while ((sequence = atomic_load_explicit(&s->sequence, memory_order_acquire)) & 1) {
+        if (perf_now() - start >= RSX_DEFORM_SAMPLE_WAIT_S) {
+            (void)atomic_fetch_add_explicit(&s_deform_sample_timeouts, 1, memory_order_relaxed);
+            return 0;
+        }
+        rsx_deform_yield();
+    }
+    u64 us = (u64)((perf_now() - start) * 1000000.0);
+    u64 seen = atomic_load_explicit(&s_deform_sample_wait_us_max, memory_order_relaxed);
+    while (us > seen
+           && !atomic_compare_exchange_weak_explicit(&s_deform_sample_wait_us_max, &seen, us,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
+    }
+    u64 waits = atomic_fetch_add_explicit(&s_deform_sample_waits, 1, memory_order_relaxed) + 1;
+    if ((waits & 255) == 1)   /* the first wait, then each 256th */
+        fprintf(stderr, "[DEFORM_SAMPLE] waits=%llu timeouts=%llu wait_us_max=%llu\n",
+                (unsigned long long)waits,
+                (unsigned long long)atomic_load_explicit(&s_deform_sample_timeouts, memory_order_relaxed),
+                (unsigned long long)us);
+    return sequence;
+}
+
 int rsx_deform_sample(uint32_t address, const uint32_t offsets[4], unsigned char out[4])
 {
-    if (rsx_deform_mode() == 0) return 0;
+    int mode = rsx_deform_mode();
+    if (mode == 0) return 0;
     RsxDeformSurface* s = deform_surface_of(address, 0);
+    if (!s && mode == 1) s = deform_surface_changing(address);
     if (!s || s->guest_address != address) return 0;
     for (int tries = 0; tries < 4096; tries++) {
         u64 sequence = atomic_load_explicit(&s->sequence, memory_order_acquire);
-        if (sequence & 1) continue;
+        if (sequence & 1) {
+            /* The renderer changes the record now. */
+            if (mode != 1) continue;
+            sequence = deform_sequence_even(s);
+            if (!sequence) return 0;
+        }
         const u8* image = deform_image(s), *mip = deform_mip_bytes(s);
         u64 begin = s->guest_address, end = begin + (u64)s->pitch * s->height;
         u64 mip_begin = s->mip_address, mip_end = mip_begin + s->mip_width;
@@ -1689,6 +1751,21 @@ void rsx_deform_wheel_log(uint32_t address, uint32_t offset, const char* level,
             (unsigned long long)frame, offset % pitch, offset / pitch,
             level, cpu[0], cpu[1], cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3],
             deform_time_ms());
+}
+
+#ifndef _WIN32
+#include <sched.h>
+#endif
+
+/* Lets the renderer thread run while the game thread waits for the end of a
+ * paint (deform_sequence_even). */
+void rsx_deform_yield(void)
+{
+#ifdef _WIN32
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
 }
 
 /* Backend init, after cpu_surface_init: the hooks of the read paths. */

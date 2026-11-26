@@ -24,10 +24,15 @@ int rsx_deform_mode(void);
  * byte k is at guest address address + offsets[k]. The function writes the
  * bytes that the CPU buffer holds (level 0 and row 0 of level 1) to `out`.
  * It returns how many it wrote: 0 to 4. The count is 0 when no record holds
- * the surface, the buffer is off, or the record is changing. The caller then
- * reads the guest memory. */
+ * the surface, the buffer is off, or the record changes for more than 50 ms.
+ * The caller then reads the guest memory. A record that the renderer changes
+ * now (a paint) ends first: the read waits for that end. */
 int rsx_deform_sample(uint32_t address, const uint32_t offsets[4],
                       unsigned char out[4]);
+
+/* Called by rsx_deform_sample() while it waits for the end of a paint: it
+ * lets the renderer thread run. */
+void rsx_deform_yield(void);
 
 /* Shadow mode only; does nothing in the other modes. Writes one
  * [DEFORM_WHEEL] line for one read of the game: frame, x, y, the sample mode
