@@ -3092,6 +3092,14 @@ static const VPFP_snap* vp_fp_snap_entry(u32 snap, u32 off)
     return NULL;
 }
 
+/* Bytes of snapshot `snap` (idx+1) at resolved offset `off`; NULL when it does
+ * not verify. Used by rsx_d3d12_native_depth.inc. */
+static const u8* vp_fp_snap_bytes(u32 snap, u32 off)
+{
+    const VPFP_snap* s = vp_fp_snap_entry(snap, off);
+    return s ? s->bytes : NULL;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 fp_ctrl, u32 alpha_key,
                                           u32 unnorm_mask, const u32 (*unnorm_dim)[2],
