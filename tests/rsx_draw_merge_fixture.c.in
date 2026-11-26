@@ -1,0 +1,826 @@
+/* Production VP pass, draw merge include, record layout, PSO key helpers and
+ * the sub-viewport note of rsx_d3d12_backend.c; authored D3D12 command list,
+ * PSO store, record generator and model. The command list prints one line per
+ * command. Python (check_rsx_draw_merge.py) compares the lines of each batch
+ * with the merge and without it, and the draw count with the model.
+ * Usage: rsx_draw_merge_fixture <first seed> <batch count> */
+#include "rsx_commands.h"
+#include "rsx_primitives.h"
+#include "rsx_depth_sample.h"
+#include "rsx_surface_samples.h"
+#include "rsx_env_once.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef MAX_DRAWS
+#define MAX_DRAWS 48
+#endif
+@DEFINES@
+
+#define VERTEX_STRIDE VP_VERT_STRIDE
+#define VB_VERTS 32768                /* two parities of 16384 vertices */
+#define VB_BASE 0x200000000ull
+#define CB0_BASE 0x300000000ull
+#define CB1_BASE 0x400000000ull
+#define SRV_BASE 0x500000000ull
+#define OFF_RTS 6
+#define MISSING_RT 0x7F000000u
+#define SUBVP_SLOTS 4
+#define U64(x) ((unsigned long long)(x))
+#define FNV0 1469598103934665603ull
+
+/* ---- D3D12 mock: types ---- */
+typedef int BOOL;
+typedef unsigned int UINT;
+typedef long LONG;
+typedef unsigned int D3D12_CLEAR_FLAGS;
+typedef int DXGI_FORMAT;
+enum { FALSE = 0, TRUE = 1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST = 4,
+       DXGI_FORMAT_R8G8B8A8_UNORM = 28, DXGI_FORMAT_B8G8R8A8_UNORM = 87 };
+#define D3D12_CLEAR_FLAG_DEPTH   1u
+#define D3D12_CLEAR_FLAG_STENCIL 2u
+#define D3D12_RESOURCE_STATE_RENDER_TARGET 4
+#define D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE 0x80
+
+typedef struct { size_t ptr; } D3D12_CPU_DESCRIPTOR_HANDLE;
+typedef struct { uint64_t ptr; } D3D12_GPU_DESCRIPTOR_HANDLE;
+typedef struct { uint64_t BufferLocation; UINT SizeInBytes; UINT StrideInBytes; } D3D12_VERTEX_BUFFER_VIEW;
+typedef struct { float TopLeftX, TopLeftY, Width, Height, MinDepth, MaxDepth; } D3D12_VIEWPORT;
+typedef struct { LONG left, top, right, bottom; } D3D12_RECT;
+typedef struct { uint32_t address, filter, control0, border; } rsx_guest_sampler_regs;
+
+typedef struct MockPso ID3D12PipelineState;
+typedef struct MockResource ID3D12Resource;
+typedef struct MockHeap ID3D12DescriptorHeap;
+typedef struct MockList ID3D12GraphicsCommandList;
+typedef struct { int unused; } ID3D12RootSignature;
+typedef struct { u32 (*AddRef)(ID3D12PipelineState*); u32 (*Release)(ID3D12PipelineState*); } MockPsoVT;
+struct MockPso { const MockPsoVT* lpVtbl; u64 key; u32 n, mask; int guest; };
+typedef struct { u64 (*GetGPUVirtualAddress)(ID3D12Resource*); } MockResourceVT;
+struct MockResource { const MockResourceVT* lpVtbl; u64 address; };
+typedef struct { void (*GetGPUDescriptorHandleForHeapStart)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*); } MockHeapVT;
+struct MockHeap { const MockHeapVT* lpVtbl; u64 address; };
+typedef struct MockListVT {
+    void (*SetGraphicsRootSignature)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
+    void (*SetPipelineState)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+    void (*IASetPrimitiveTopology)(ID3D12GraphicsCommandList*, UINT);
+    void (*SetGraphicsRootConstantBufferView)(ID3D12GraphicsCommandList*, UINT, u64);
+    void (*SetDescriptorHeaps)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+    void (*SetGraphicsRootDescriptorTable)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+    void (*IASetVertexBuffers)(ID3D12GraphicsCommandList*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*);
+    void (*ClearDepthStencilView)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS,
+                                  float, u8, UINT, const void*);
+    void (*OMSetRenderTargets)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+                               const D3D12_CPU_DESCRIPTOR_HANDLE*);
+    void (*RSSetViewports)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+    void (*RSSetScissorRects)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+    void (*ClearRenderTargetView)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, const float*, UINT,
+                                  const void*);
+    void (*OMSetStencilRef)(ID3D12GraphicsCommandList*, UINT);
+    void (*DrawInstanced)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+} MockListVT;
+struct MockList { const MockListVT* lpVtbl; };
+
+/* ---- hashes and the random sequence ---- */
+static u64 fnv_more(u64 h, const void* data, size_t n)
+{
+    const u8* p = (const u8*)data;
+    size_t i;
+    for (i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+static u64 fnv(const void* data, size_t n) { return fnv_more(FNV0, data, n); }
+static void mix(u64* h, u64 v) { *h = fnv_more(*h, &v, 8); }
+static u64 g_rnd;
+static u32 rnd(u32 n)
+{
+    g_rnd ^= g_rnd << 13; g_rnd ^= g_rnd >> 7; g_rnd ^= g_rnd << 17;
+    return n ? (u32)(g_rnd % n) : 0;
+}
+static u64 ul(const void* p) { return (u64)(uintptr_t)p; }
+
+@RECORD@
+
+/* ---- backend state ---- */
+typedef struct { int initialized; } rsx_d3d12_depth_surface;
+typedef struct { int backing_initialized, display_written; } RecordBatch;
+static struct {
+    ID3D12GraphicsCommandList* cmd_list;
+    ID3D12RootSignature* vp_root_sig;
+    ID3D12PipelineState *pipeline_state_vp, *pipeline_state_vp_color, *pipeline_state_vp_no_depth,
+                        *pipeline_state_vp_color_no_depth;
+    int vp_ready, tex_ready;
+    u32 draw_count, width, height, vp_parity, vp_capacity, dsv_step, srv_inc;
+    D3D12DrawRecord draws[MAX_DRAWS];
+    ID3D12Resource *vp_cb, *vp_fpcb, *vp_vb;
+    u8 *vp_cb_mapped, *vp_fpcb_mapped, *vp_vb_mapped;
+    ID3D12DescriptorHeap *srv_heap, *dsv_heap;
+    struct { u32 off, w, h, dxgi; int st; } off_rt[OFF_RTS];
+    struct { rsx_d3d12_depth_surface surfaces[4]; } depth_cache;
+} s_d3d;
+/* ---- D3D12 mock: bound state, constant slots, vertex buffer, command list ---- */
+static struct {
+    u64 rootsig, pso, vb_loc, heap0, heap1, table1, table3, rt[4], dsv, cb0, cb1;
+    float vp[6];
+    LONG sc[4];
+    UINT nrt, stencil, topo, vb_size, vb_stride;
+    int vb_bound, pso_guest;
+    u32 pso_n;
+} g_st;
+static u64 g_vb_words[VB_VERTS * VERTEX_STRIDE / 8];
+static u64 g_b0_words[2 * MAX_DRAWS * VP_CB_STRIDE / 8];
+static u64 g_b1_words[2 * MAX_DRAWS * VP_FPCB_STRIDE / 8];
+static u8* const g_vb = (u8*)g_vb_words;
+static u8* const g_b0 = (u8*)g_b0_words;
+static u8* const g_b1 = (u8*)g_b1_words;
+
+static u64 state_hash(void)
+{
+    u64 h = FNV0;
+    int i;
+    mix(&h, g_st.rootsig); mix(&h, g_st.pso); mix(&h, g_st.vb_loc); mix(&h, g_st.vb_size);
+    mix(&h, g_st.vb_stride); mix(&h, g_st.heap0); mix(&h, g_st.heap1); mix(&h, g_st.table1);
+    mix(&h, g_st.table3); mix(&h, g_st.nrt);
+    for (i = 0; i < 4; i++) mix(&h, g_st.rt[i]);
+    mix(&h, g_st.dsv);
+    for (i = 0; i < 6; i++) mix(&h, fnv(&g_st.vp[i], 4));
+    for (i = 0; i < 4; i++) mix(&h, (u64)(long long)g_st.sc[i]);
+    mix(&h, g_st.stencil); mix(&h, g_st.topo); mix(&h, g_st.cb0); mix(&h, g_st.cb1);
+    mix(&h, (u64)g_st.vb_bound);
+    return h;
+}
+/* Bytes of b1 that a program with n constants reads (the rule of the record). */
+static u32 b1_bytes(u32 n) { return n >= VP_FPCB_MAX_CONSTS ? VP_FPCB_STRIDE : (n ? n + 1u : 2u) * 16u; }
+
+static void ml_root(ID3D12GraphicsCommandList* self, ID3D12RootSignature* rs)
+{ (void)self; g_st.rootsig = ul(rs); printf("rootsig %llx\n", U64(g_st.rootsig)); }
+static void ml_pso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
+{
+    (void)self;
+    g_st.pso = ul(pso); g_st.pso_guest = pso ? pso->guest : 0; g_st.pso_n = pso ? pso->n : 0;
+    printf("pso %llx\n", U64(g_st.pso));
+}
+static void ml_topo(ID3D12GraphicsCommandList* self, UINT t) { (void)self; g_st.topo = t; printf("topo %u\n", t); }
+static void ml_cbv(ID3D12GraphicsCommandList* self, UINT index, u64 address)
+{
+    (void)self;
+    if (index == 0) {
+        if (address < CB0_BASE || (address - CB0_BASE) % VP_CB_STRIDE ||
+            (address - CB0_BASE) / VP_CB_STRIDE >= 2 * MAX_DRAWS) { printf("cbvbad 0\n"); return; }
+        g_st.cb0 = fnv(g_b0 + (size_t)((address - CB0_BASE) / VP_CB_STRIDE) * VP_CB_STRIDE, PHASE_DRAW_B0_BYTES);
+        printf("cbv0 %016llx\n", U64(g_st.cb0));
+    } else if (index == 2) {
+        if (address < CB1_BASE || (address - CB1_BASE) % VP_FPCB_STRIDE ||
+            (address - CB1_BASE) / VP_FPCB_STRIDE >= 2 * MAX_DRAWS) { printf("cbvbad 2\n"); return; }
+        g_st.cb1 = g_st.pso_guest ? fnv(g_b1 + (size_t)((address - CB1_BASE) / VP_FPCB_STRIDE) * VP_FPCB_STRIDE,
+                                        (size_t)b1_bytes(g_st.pso_n)) : 0;
+        printf("cbv2 %016llx\n", U64(g_st.cb1));
+    } else printf("cbvbad %u\n", index);
+}
+static void ml_heaps(ID3D12GraphicsCommandList* self, UINT n, ID3D12DescriptorHeap* const* heaps)
+{
+    (void)self;
+    g_st.heap0 = n > 0 ? ul(heaps[0]) : 0; g_st.heap1 = n > 1 ? ul(heaps[1]) : 0;
+    printf("heaps %llx %llx\n", U64(g_st.heap0), U64(g_st.heap1));
+}
+static void ml_table(ID3D12GraphicsCommandList* self, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE h)
+{
+    (void)self;
+    if (index == 1) g_st.table1 = h.ptr; else if (index == 3) g_st.table3 = h.ptr;
+    printf("table %u %llx\n", index, U64(h.ptr));
+}
+static void ml_vb(ID3D12GraphicsCommandList* self, UINT slot, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v)
+{
+    (void)self; (void)slot;
+    if (n != 1 || v[0].StrideInBytes != VERTEX_STRIDE || v[0].BufferLocation < VB_BASE ||
+        v[0].BufferLocation + v[0].SizeInBytes > VB_BASE + sizeof g_vb_words) { printf("vbbad\n"); return; }
+    g_st.vb_loc = v[0].BufferLocation; g_st.vb_size = v[0].SizeInBytes; g_st.vb_stride = v[0].StrideInBytes;
+    g_st.vb_bound = 1;
+    printf("vb %llx %u %u\n", U64(g_st.vb_loc), g_st.vb_size, g_st.vb_stride);
+}
+static void ml_clear_ds(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f,
+                        float z, u8 s, UINT n, const void* r)
+{
+    (void)self; (void)n; (void)r;
+    printf("clearz %llx %u %.9g %u\n", U64(h.ptr), f, (double)z, (unsigned)s);
+}
+static void ml_rt(ID3D12GraphicsCommandList* self, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rt, BOOL single,
+                  const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
+{
+    (void)self; (void)single;
+    UINT i;
+    if (n > 4) { printf("rtbad\n"); return; }
+    g_st.nrt = n;
+    for (i = 0; i < 4; i++) g_st.rt[i] = i < n ? rt[i].ptr : 0;
+    g_st.dsv = dsv ? dsv->ptr : 0;
+    printf("rt %u", n);
+    for (i = 0; i < n; i++) printf(" %llx", U64(rt[i].ptr));
+    printf(" %llx\n", U64(g_st.dsv));
+}
+static void ml_vp(ID3D12GraphicsCommandList* self, UINT n, const D3D12_VIEWPORT* v)
+{
+    (void)self;
+    if (n != 1) { printf("vpbad\n"); return; }
+    g_st.vp[0] = v[0].TopLeftX; g_st.vp[1] = v[0].TopLeftY; g_st.vp[2] = v[0].Width;
+    g_st.vp[3] = v[0].Height; g_st.vp[4] = v[0].MinDepth; g_st.vp[5] = v[0].MaxDepth;
+    printf("vp %.9g %.9g %.9g %.9g %.9g %.9g\n", (double)v[0].TopLeftX, (double)v[0].TopLeftY,
+           (double)v[0].Width, (double)v[0].Height, (double)v[0].MinDepth, (double)v[0].MaxDepth);
+}
+static void ml_sc(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RECT* r)
+{
+    (void)self;
+    if (n != 1) { printf("scbad\n"); return; }
+    g_st.sc[0] = r[0].left; g_st.sc[1] = r[0].top; g_st.sc[2] = r[0].right; g_st.sc[3] = r[0].bottom;
+    printf("sc %ld %ld %ld %ld\n", r[0].left, r[0].top, r[0].right, r[0].bottom);
+}
+static void ml_clear_rt(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE h, const float* c, UINT n,
+                        const void* r)
+{
+    (void)self; (void)n; (void)r;
+    printf("clear %llx %.9g %.9g %.9g %.9g\n", U64(h.ptr), (double)c[0], (double)c[1], (double)c[2], (double)c[3]);
+}
+static void ml_stencil(ID3D12GraphicsCommandList* self, UINT ref)
+{ (void)self; g_st.stencil = ref; printf("stencil %u\n", ref); }
+/* One DrawInstanced: the state at the draw; then per record of the range the
+ * bytes of its part and its place in the triangle grid of the draw (g, r). */
+static void ml_draw(ID3D12GraphicsCommandList* self, UINT count, UINT instances, UINT first, UINT start)
+{
+    (void)self;
+    u64 sh = state_hash();
+    printf("draw %u %u %u %u\n", count, instances, first, start);
+    if (!g_st.vb_bound || instances != 1 || start != 0 || count == 0) { printf("drawbad\n"); return; }
+    u64 begin = g_st.vb_loc + (u64)first * VERTEX_STRIDE, end = begin + (u64)count * VERTEX_STRIDE;
+    if (begin < VB_BASE || end > VB_BASE + sizeof g_vb_words) { printf("drawbad range\n"); return; }
+    size_t region = (size_t)(g_st.vb_loc - VB_BASE);
+    u32 a = first, b = first + count, covered = 0, i;
+    for (i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++) {
+        const D3D12DrawRecord* r = &s_d3d.draws[i];
+        if (!r->is_vp || r->is_clear) continue;
+        u32 ra = r->vb_byte_offset / VERTEX_STRIDE, rb = ra + r->vertex_count;
+        if (rb <= a || ra >= b) continue;
+        u32 lo = ra > a ? ra : a, hi = rb < b ? rb : b;
+        u64 vh = fnv(g_vb + region + (size_t)lo * VERTEX_STRIDE, (size_t)(hi - lo) * VERTEX_STRIDE);
+        printf("drawpart %u %u %u %016llx %016llx %u %u%s\n", i, lo, hi - lo, U64(sh), U64(vh),
+               (lo - first) % 3u, (hi - first) % 3u, (lo == ra && hi == rb) ? "" : " partial");
+        covered += hi - lo;
+    }
+    if (covered != count) printf("drawgap %u\n", count - covered);
+}
+static u32 mock_ref(ID3D12PipelineState* p) { (void)p; return 1; }
+static u64 mock_gpu_address(ID3D12Resource* r) { return r->address; }
+static void mock_heap_start(ID3D12DescriptorHeap* h, D3D12_GPU_DESCRIPTOR_HANDLE* out) { out->ptr = h->address; }
+static const MockPsoVT g_pso_vt = { mock_ref, mock_ref };
+static const MockResourceVT g_res_vt = { mock_gpu_address };
+static const MockHeapVT g_heap_vt = { mock_heap_start };
+static const MockListVT g_list_vt = {
+    ml_root, ml_pso, ml_topo, ml_cbv, ml_heaps, ml_table, ml_vb, ml_clear_ds, ml_rt, ml_vp, ml_sc,
+    ml_clear_rt, ml_stencil, ml_draw };
+
+static ID3D12GraphicsCommandList g_list;
+static ID3D12RootSignature g_root_sig;
+static ID3D12Resource g_res_cb, g_res_cb1, g_res_vb;
+static ID3D12DescriptorHeap g_srv_heap, g_dsv_heap, g_heap_base, g_heap_over;
+static u32 s_draw_srv_base[MAX_DRAWS], s_rt_barriers, s_draw_cmds, s_pso_binds, s_srv_binds;
+static u32 s_pso_sampler_mask, s_last_drawn_slot, s_last_drawn_off, s_composite_env_off, s_frame_drew_composite;
+static int s_comp_env_init, g_bind_reuse = 1, s_subvp_n;
+static struct { ID3D12Resource* res; u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
+static ID3D12DescriptorHeap* s_sampler_bound;
+static const int* s_sampler_table;
+static double s_perf_gpu;
+static struct { u64 draws, small_draws; double pso; } s_phase;
+static RecordBatch s_record_batch;
+static const u32 g_rt_offs[OFF_RTS] = { 0x100000u, 0x200000u, 0x400000u, 0x800000u, 0x1000000u, 0x2000000u };
+
+/* ---- targets and depth surfaces ---- */
+static int off_rt_find(u32 off)
+{
+    int i;
+    for (i = 0; i < OFF_RTS; i++) if (g_rt_offs[i] == off) return i;
+    return -1;
+}
+static void off_rt_transition(int slot, int to)
+{
+    if (slot < 0 || slot >= OFF_RTS) { printf("barrierbad\n"); return; }
+    if (s_d3d.off_rt[slot].st == to) return;
+    s_d3d.off_rt[slot].st = to;
+    s_rt_barriers++;
+    printf("barrier %d %d\n", slot, to);
+}
+static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    h.ptr = 0xA000 + (size_t)slot * 64;
+    return h;
+}
+static D3D12_CPU_DESCRIPTOR_HANDLE rsx_d3d12_depth_handle(ID3D12DescriptorHeap* heap, u32 step, u32 slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    (void)heap;
+    h.ptr = 0xD000 + (size_t)slot * step;
+    return h;
+}
+static ID3D12PipelineState* rsx_d3d12_fallback_select(ID3D12PipelineState* compiled, int tex_ready, int depth,
+                                                      ID3D12PipelineState* with_tex,
+                                                      ID3D12PipelineState* with_tex_depth,
+                                                      ID3D12PipelineState* plain,
+                                                      ID3D12PipelineState* plain_depth)
+{
+    if (compiled) return compiled;
+    return tex_ready ? (depth ? with_tex_depth : with_tex) : (depth ? plain_depth : plain);
+}
+
+@HELPERS@
+
+/* ---- PSO store: one pipeline per key ---- */
+#define PSO_MAX 32768
+static ID3D12PipelineState g_psos[PSO_MAX], g_fallback[4];
+static u32 g_pso_n;
+static const u32 g_vs_hash[8] = { 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                                  0x11111111u, 0x33333333u, 0x55555555u, 0x22222222u };
+/* Every input of the lookup of the production store: the arguments, the
+ * texture alias key and the native depth key of the record. */
+static u64 pso_key(int vs_idx, u32 fp_addr, u32 blend, int nrt, int rtfmt, u32 fp_ctrl, u32 alpha_key,
+                   u32 unnorm_mask, const u32 dim[16][2], u32 cmask, u32 cull, u64 bias_key, u32 cube_mask,
+                   u64 ds_key, u32 snap_idx, const D3D12DrawRecord* dr)
+{
+    u64 h = FNV0;
+    u32 u;
+    mix(&h, (vs_idx >= 0 && vs_idx < 8) ? g_vs_hash[vs_idx] : 0u);
+    mix(&h, fp_addr); mix(&h, blend); mix(&h, (u64)nrt); mix(&h, (u64)rtfmt);
+    mix(&h, (u64)((fp_ctrl >> 6) & 1u)); mix(&h, alpha_key); mix(&h, unnorm_mask);
+    for (u = 0; u < 16; u++) if (unnorm_mask & (1u << u)) { mix(&h, dim[u][0]); mix(&h, dim[u][1]); }
+    mix(&h, cmask); mix(&h, cull); mix(&h, bias_key); mix(&h, cube_mask); mix(&h, ds_key); mix(&h, snap_idx);
+    for (u = 0; u < 16; u++) {
+        mix(&h, (u64)dr->tex[u].set); mix(&h, dr->tex[u].fmt); mix(&h, dr->tex[u].ctrl1);
+        mix(&h, (u64)(dr->tex_rt[u] + 1));
+        if (dr->tex_rt[u] >= 0 && dr->tex_rt[u] < OFF_RTS) mix(&h, s_d3d.off_rt[dr->tex_rt[u]].dxgi);
+    }
+    for (u = 0; u < 16; u++)
+        if (dr->depth_sample_mask & (1u << u)) {
+            mix(&h, dr->depth_view[u].enabled); mix(&h, dr->depth_view[u].compare);
+            mix(&h, dr->depth_view[u].func);
+        }
+    return h;
+}
+static ID3D12PipelineState* pso_intern(u64 key)
+{
+    u32 i;
+    for (i = 0; i < g_pso_n; i++) if (g_psos[i].guest && g_psos[i].key == key) return &g_psos[i];
+    if (g_pso_n >= PSO_MAX) { printf("psofull\n"); return NULL; }
+    memset(&g_psos[g_pso_n], 0, sizeof g_psos[g_pso_n]);
+    g_psos[g_pso_n].lpVtbl = &g_pso_vt;
+    g_psos[g_pso_n].guest = 1;
+    g_psos[g_pso_n].key = key;
+    g_psos[g_pso_n].n = 1 + (u32)(key % 6);             /* constants of the program */
+    g_psos[g_pso_n].mask = (u32)(key >> 17) & 0xFFFFu;  /* units the program samples */
+    return &g_psos[g_pso_n++];
+}
+static u64 record_key(const D3D12DrawRecord* dr)
+{
+    u32 udim[16][2];
+    memset(udim, 0, sizeof udim);
+    return pso_key(dr->vs_idx, dr->fp_addr, dr->blend_key, dr_num_rts(dr), dr_rt_dxgi(dr), dr->fp_ctrl,
+                   dr_alpha_key(dr), dr_unnorm(dr, udim), udim, dr->cmask, dr->cull, dr->bias_key,
+                   dr_cube_mask(dr), dr->ds_key, dr->fp_snap, dr);
+}
+/* A program at an address with bit 31 is a failed compile: a negative entry. */
+static ID3D12PipelineState* record_pso(const D3D12DrawRecord* dr)
+{
+    if (!dr->fp_addr || (dr->fp_addr & 0x80000000u)) return NULL;
+    return pso_intern(record_key(dr));
+}
+static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt, DXGI_FORMAT rtfmt,
+                                          u32 fp_ctrl, u32 alpha_key, u32 unnorm_mask, const u32 (*unnorm_dim)[2],
+                                          u32 cmask, u32 cull, u64 bias_key, u32 cube_mask, u64 ds_key,
+                                          u32 snap_idx, u16* out_fpc_n, const D3D12DrawRecord* dr)
+{
+    ID3D12PipelineState* p;
+    s_pso_sampler_mask = 0;
+    if (out_fpc_n) *out_fpc_n = 0;
+    if (!fp_addr || (fp_addr & 0x80000000u)) return NULL;
+    p = pso_intern(pso_key(vs_idx, fp_addr, blend, nrt, rtfmt, fp_ctrl, alpha_key, unnorm_mask, unnorm_dim,
+                           cmask, cull, bias_key, cube_mask, ds_key, snap_idx, dr));
+    if (!p) return NULL;
+    s_pso_sampler_mask = p->mask;
+    if (out_fpc_n) *out_fpc_n = (u16)p->n;
+    return p;
+}
+/* ---- b1 slots: n constants and the alpha slot, from a source value ---- */
+static u32 g_b1_tag[MAX_DRAWS], g_b1_mode[MAX_DRAWS];   /* mode: 0 final, 1 stale count, 2 refused */
+static u32 record_index(const D3D12DrawRecord* dr) { return (u32)(dr - s_d3d.draws); }
+static void b1_fill(u8* dst, u32 n, u64 source)
+{
+    u32 k;
+    int j;
+    for (k = 0; k <= n && k < VP_FPCB_MAX_CONSTS; k++)
+        for (j = 0; j < 4; j++) {
+            u32 w = (u32)((source * (u64)(k * 4u + (u32)j + 1u) * 0x9E3779B97F4A7C15ull) >> 24) ^
+                    (u32)(source >> (k + (u32)j));
+            memcpy(dst + ((size_t)k * 4u + (size_t)j) * 4u, &w, 4);
+        }
+}
+static void vp_record_fp_b1(u32 slot, D3D12DrawRecord* dr)
+{
+    ID3D12PipelineState* p = record_pso(dr);
+    if (g_b1_mode[record_index(dr)] == 2 || !p) return;
+    b1_fill(g_b1 + (size_t)slot * VP_FPCB_STRIDE, p->n, g_b1_tag[record_index(dr)]);
+    dr->fp_const_n = p->n;
+}
+static void vp_serve_pso_consts(u32 slot, D3D12DrawRecord* dr, u32 pso_n)
+{
+    ID3D12PipelineState* p = record_pso(dr);
+    b1_fill(g_b1 + (size_t)slot * VP_FPCB_STRIDE, pso_n, p ? p->key : 0);
+}
+/* ---- SRV windows and sampler tables ---- */
+#define KEY_MAX 32768
+static u64 g_srv_keys[KEY_MAX], g_samp_keys[KEY_MAX];
+static u32 g_srv_n, g_samp_n;
+static int g_samp_tables[KEY_MAX];
+static u64 srv_key(const D3D12DrawRecord* dr)
+{
+    u64 h = FNV0;
+    u32 u;
+    for (u = 0; u < 16; u++) {
+        if (!dr->tex[u].set) { mix(&h, 0); continue; }
+        mix(&h, dr->tex[u].off); mix(&h, dr->tex[u].w); mix(&h, dr->tex[u].h); mix(&h, dr->tex[u].fmt);
+        mix(&h, (u64)dr->tex[u].cube); mix(&h, dr->tex[u].depth); mix(&h, dr->tex[u].mips);
+        mix(&h, (u64)(dr->tex_rt[u] + 1));
+    }
+    return h;
+}
+static u32 key_intern(u64* keys, u32* n, u64 key)
+{
+    u32 i;
+    for (i = 0; i < *n; i++) if (keys[i] == key) return i;
+    if (*n >= KEY_MAX) { printf("keyfull\n"); return 0; }
+    keys[(*n)++] = key;
+    return *n - 1;
+}
+static u64 sampler_key(const D3D12DrawRecord* dr, u32 mask)
+{
+    u64 h = FNV0;
+    u32 u;
+    mix(&h, mask);
+    for (u = 0; u < 16; u++) {
+        mix(&h, (u64)dr->tex[u].set);
+        if ((mask >> u) & 1u) {
+            if (dr->tex[u].set && !dr->depth_view[u].enabled)
+                mix(&h, fnv(&dr->sampler[u], sizeof dr->sampler[u]));
+            if (dr->depth_view[u].enabled) mix(&h, fnv(&dr->depth_view[u], sizeof dr->depth_view[u]));
+        }
+    }
+    return h;
+}
+/* The inputs of rsx_guest_sampler_table: the mask, the set flags, the
+ * registers of the sampled units that are set, and the depth views. Tables
+ * 0..7 live in the base heap, the others in an overflow heap. */
+static int guest_sampler_bind(const D3D12DrawRecord* dr, unsigned mask)
+{
+    u32 k = key_intern(g_samp_keys, &g_samp_n, sampler_key(dr, mask));
+    ID3D12DescriptorHeap* heap = k < 8 ? &g_heap_base : &g_heap_over;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    int changed;
+    gpu.ptr = heap->address + (u64)k * 256;
+    s_sampler_table = &g_samp_tables[k];
+    changed = s_sampler_bound != heap;
+    if (changed) {
+        ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, heap };
+        s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 2, heaps);
+        s_sampler_bound = heap;
+    }
+    s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 3, gpu);
+    return changed;
+}
+
+static int phase_on(void);
+@MERGE@
+
+/* ---- the other adapters of the VP pass ---- */
+static int bind_reuse_on(void) { return g_bind_reuse; }
+static int phase_on(void) { return 1; }
+static int perf_on(void) { return 0; }
+static double perf_now(void) { return 0.0; }
+static void phase_draw_batch_begin(void) {}
+static void phase_draw_row(const D3D12DrawRecord* dr, u32 d, u32 flags, u32 barriers)
+{ (void)dr; (void)d; (void)flags; (void)barriers; }
+static void phase_draw_sign(const D3D12DrawRecord* dr) { (void)dr; }
+static void phase_gpu_draw(int small, int end) { (void)small; (void)end; }
+static void phase_draw_stencil(u32 ref) { (void)ref; }
+static void phase_draw_samplers(const int* table) { (void)table; }
+static int phase_draw_viewport(float x, float y, float w, float h, LONG l, LONG t, LONG r, LONG b)
+{ (void)x; (void)y; (void)w; (void)h; (void)l; (void)t; (void)r; (void)b; return 0; }
+static void subvp_capture(u32 fi)
+{
+    (void)fi;
+    u32 i;
+    printf("copy subvp %u", s_subvp_n);
+    for (i = 0; i < s_subvp_n; i++) printf(" %u,%u,%u,%u", s_subvp[i].x, s_subvp[i].y, s_subvp[i].w, s_subvp[i].h);
+    printf("\n");
+}
+static void screen_copy_capture(u32 fi) { (void)fi; printf("copy screen\n"); }
+static void cpu_surface_written(int primary, const int secondary[3]) { (void)primary; (void)secondary; }
+static void native_depth_begin(const D3D12DrawRecord* dr, ID3D12PipelineState* graphics)
+{ (void)graphics; if (dr->depth_sample_mask || dr->depth_alias_mask) printf("depthread %u\n", record_index(dr)); }
+static void native_depth_end(const D3D12DrawRecord* dr) { (void)dr; }
+static void gpu_pso_draw(ID3D12PipelineState* pso, u32 count, u32 first)
+{
+    if (ul(pso) != g_st.pso) printf("drawpso %llx\n", U64(ul(pso)));
+    s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, count, 1, first, 0);
+}
+static void rsx_record_batch_display_write(RecordBatch* batch) { (void)batch; }
+
+static void vp_pass(void)
+{
+    u32 fi = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle, dsv_handle;
+    rtv_handle.ptr = 0xBEEF;
+    dsv_handle.ptr = 0;
+@LOOP@}
+
+/* ---- record generator: state, events, model ---- */
+typedef struct {
+    u32 rt_off, mrt[3], depth_slot, rt_fmt, vx, vy, vw, vh, sref, fp, snap, blend, blend_key, ds, cull, cmask,
+        bias, fpctrl, alpha, topo;
+    int vs;
+    u32 texset, texid[16], texrt[16], samp[16], b0, b1;
+    int b1mode;
+} Gen;
+static Gen g;
+static u32 g_cursor;
+static const char* g_kind[MAX_DRAWS];
+static u64 g_model[MAX_DRAWS];
+
+static void fill_fields(D3D12DrawRecord* r)
+{
+    int u;
+    memset(r, 0, sizeof *r);
+    r->is_vp = 1;
+    r->topology = g.topo; r->rt_off = g.rt_off; memcpy(r->rt_mrt, g.mrt, sizeof r->rt_mrt);
+    r->depth_slot = g.depth_slot; r->rt_fmt = g.rt_fmt;
+    r->vp_x = g.vx; r->vp_y = g.vy; r->vp_w = g.vw; r->vp_h = g.vh; r->stencil_ref = g.sref;
+    r->fp_addr = g.fp; r->fp_snap = g.snap; r->fp_ctrl = g.fpctrl; r->alpha_ctl = g.alpha; r->vs_idx = g.vs;
+    r->blend = (int)g.blend; r->blend_key = g.blend_key; r->ds_key = g.ds; r->cull = g.cull; r->cmask = g.cmask;
+    r->bias_key = g.bias;
+    r->begin_epoch = 5;
+    for (u = 0; u < 16; u++) {
+        r->tex[u].set = (int)((g.texset >> u) & 1u);
+        r->tex[u].off = g.texid[u] * 0x1000u; r->tex[u].raw = g.texid[u] * 0x1000u;
+        r->tex[u].w = 8u << (g.texid[u] % 5u); r->tex[u].h = 8u << (g.texid[u] % 4u);
+        r->tex[u].fmt = (g.texid[u] & 1u) ? 0x40u : 0u; r->tex[u].ctrl1 = g.texid[u]; r->tex[u].mips = 1;
+        r->tex[u].cube = (int)((g.texid[u] % 7u) == 0u); r->tex[u].depth = 1;
+        r->sampler[u].address = g.samp[u]; r->sampler[u].filter = g.samp[u] * 3u;
+        r->sampler[u].control0 = g.samp[u] * 5u; r->sampler[u].border = g.samp[u] * 7u;
+        r->tex_rt[u] = g.texrt[u] == 0xFFFFFFFFu ? -1 : (int)g.texrt[u];
+    }
+}
+/* The b1 slot of a record after the refresh of the VP pass. Returns the
+ * constant count of the record then. */
+static u32 b1_final(const D3D12DrawRecord* r, u8* out)
+{
+    u32 i = record_index(r), n = 0, count = r->fp_const_n;
+    ID3D12PipelineState* p = record_pso(r);
+    memset(out, 0, VP_FPCB_STRIDE);
+    if (p) n = p->n;
+    if (p) {
+        b1_fill(out, n, g_b1_mode[i] == 2 ? p->key : g_b1_tag[i]);
+        if (g_b1_mode[i] != 2) count = n;
+    } else b1_fill(out, 0, g_b1_tag[i] + (g_b1_mode[i] == 1 ? 777u : g_b1_mode[i] == 2 ? 555u : 0u));
+    return count;
+}
+/* State key of the model: every field the adapters read, the constant bytes
+ * and the keys of the pipeline, the SRV window and the sampler table. */
+static u64 model_key(const D3D12DrawRecord* r)
+{
+    u8 tmp[VP_FPCB_STRIDE];
+    u64 h = FNV0;
+    u32 u, count;
+    ID3D12PipelineState* p = record_pso(r);
+    for (u = 0; u < 16; u++) mix(&h, (u64)r->tex[u].set);
+    mix(&h, r->rt_off); mix(&h, r->rt_mrt[0]); mix(&h, r->rt_mrt[1]); mix(&h, r->rt_mrt[2]);
+    mix(&h, r->depth_slot); mix(&h, r->rt_fmt);
+    mix(&h, r->vp_x); mix(&h, r->vp_y); mix(&h, r->vp_w); mix(&h, r->vp_h);
+    mix(&h, r->stencil_ref); mix(&h, r->fp_addr);
+    mix(&h, fnv(g_b0 + (size_t)r->cb_slot * VP_CB_STRIDE, PHASE_DRAW_B0_BYTES));
+    mix(&h, p ? p->key : 0);
+    count = b1_final(r, tmp);
+    mix(&h, fnv(tmp, (size_t)b1_bytes(count)));
+    mix(&h, count);
+    mix(&h, srv_key(r));
+    mix(&h, sampler_key(r, p ? p->mask : 0u));
+    return h;
+}
+static void fill_vertices(u32 first, u32 count, u32 seed)
+{
+    u32 v, j;
+    u64 s = (u64)seed * 0x9E3779B97F4A7C15ull + 12345u;
+    size_t region = (size_t)s_d3d.vp_parity * (VB_VERTS / 2) * VERTEX_STRIDE;
+    for (v = 0; v < count; v++) {
+        u64* dst = (u64*)(g_vb + region + (size_t)(first + v) * VERTEX_STRIDE);
+        for (j = 0; j < VERTEX_STRIDE / 8; j++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            dst[j] = s;
+        }
+    }
+}
+static void mutate(u32 k)
+{
+    static const u32 rect[5][4] = { {0, 0, 1280, 720}, {0, 208, 512, 512}, {0, 208, 1024, 512},
+                                    {16, 16, 320, 180}, {0, 0, 720, 1280} };
+    u32 u = rnd(16), tries;
+    switch (k) {
+    case 0: g.rt_off = rnd(4) ? g_rt_offs[rnd(OFF_RTS)] : 0; break;
+    case 1: g.mrt[rnd(3)] = rnd(2) ? g_rt_offs[rnd(OFF_RTS)] : 0; break;
+    case 2: g.depth_slot = rnd(3); break;
+    case 3: {
+        const u32* q = rect[rnd(5)];
+        g.vx = q[0]; g.vy = q[1]; g.vw = q[2]; g.vh = q[3];
+        break;
+    }
+    case 4: g.sref = rnd(256); break;
+    case 5:
+        g.fp = 0x7000001u + rnd(40); g.snap = 1 + rnd(8);
+        if (!rnd(12)) g.fp |= 0x80000000u;
+        if (!rnd(10)) { g.fp = 0; g.snap = 0; }
+        break;
+    case 6: g.blend_key ^= 1u << rnd(32); g.blend ^= 1u; break;
+    case 7: g.ds ^= rnd(2) ? RSX_DSK_STENCIL_EN : (1ull << rnd(18)); break;
+    case 8:
+        switch (rnd(5)) {
+        case 0: g.cull = rnd(8); break;
+        case 1: g.cmask ^= 1u << rnd(8); break;
+        case 2: g.bias ^= 1ull << rnd(40); break;
+        case 3: g.fpctrl ^= 0x40u; break;
+        default: g.alpha ^= 1u << rnd(17); break;
+        }
+        break;
+    case 9:
+        if (rnd(2)) g.texset ^= 1u << u;
+        else if (g.texset & (1u << u)) g.texid[u] += 1 + rnd(3);
+        else g.texset |= 1u << u;
+        break;
+    case 10: g.samp[u] ^= 1u + rnd(1000); break;
+    case 11: g.texrt[rnd(16)] = rnd(2) ? rnd(OFF_RTS) : 0xFFFFFFFFu; break;
+    case 12: g.b0 += 1 + rnd(1000); break;
+    case 13: g.b1 += 1 + rnd(1000); break;
+    case 14: g.b1mode = (int)rnd(3); break;
+    case 15: g.vs = (int)rnd(8); break;      /* slot of the vertex program */
+    case 16:                                /* register of a unit the program does not sample */
+        for (tries = 0; tries < 16; tries++) {
+            D3D12DrawRecord probe;
+            ID3D12PipelineState* p;
+            u32 v = rnd(16), mask;
+            fill_fields(&probe);
+            p = record_pso(&probe);
+            mask = p ? p->mask : 0u;
+            if (!((mask >> v) & 1u)) { g.samp[v] ^= 1u + rnd(1000); break; }
+        }
+        break;
+    }
+}
+static void gen_full(void)
+{
+    u32 u;
+    memset(&g, 0, sizeof g);
+    g.rt_fmt = 8; g.vw = 1280; g.vh = 720; g.sref = 0x10; g.fp = 0x7000001u; g.snap = 1; g.blend = 1;
+    g.blend_key = 0x1234u; g.ds = 1; g.cmask = 0xFu; g.fpctrl = 0x40u; g.alpha = 0x10000u;
+    g.topo = RSX_TOPOLOGY_TRIANGLES; g.texset = 0x3u; g.b0 = 11; g.b1 = 22;
+    for (u = 0; u < 16; u++) {
+        g.texid[u] = u * 3u + 1u;
+        g.texrt[u] = u == 0 ? 0u : 0xFFFFFFFFu;
+        g.samp[u] = u * 5u + 1u;
+    }
+}
+static void add_record(void)
+{
+    u32 i = s_d3d.draw_count, vc, n, save_topo = g.topo, u;
+    int kind = 0;                 /* 0 = draw, 1 = draws alone, 2 = no target */
+    u64 x = rnd(100);
+    D3D12DrawRecord* r = &s_d3d.draws[i];
+    ID3D12PipelineState* p;
+    u8* slot;
+    memset(r, 0, sizeof *r);
+    if (x < 38) {                                      /* same state as the record before */
+    } else if (x < 58) mutate(rnd(15));
+    else if (x < 63) g.vs = (int)rnd(8);               /* another slot, the same program or not */
+    else if (x < 68) mutate(16);
+    else if (x < 75) {                                 /* a clear between two records of one state */
+        r->is_vp = 1; r->is_clear = 1; r->topology = RSX_TOPOLOGY_TRIANGLES; r->rt_off = g.rt_off;
+        memcpy(r->rt_mrt, g.mrt, sizeof r->rt_mrt); r->cb_slot = i; r->depth_slot = g.depth_slot;
+        r->rt_fmt = g.rt_fmt;
+        for (u = 0; u < 4; u++) r->cc[u] = (float)rnd(256) / 255.0f;
+        r->clear_flags = rnd(4); r->clear_z = (float)rnd(256) / 255.0f; r->clear_s = (u8)rnd(256);
+        g_kind[i] = "clear"; g_model[i] = 0;
+        s_d3d.draw_count = i + 1;
+        return;
+    } else if (x < 79) {                              /* a record of the legacy pass: another topology, an adjacent range */
+        r->topology = rnd(2) ? RSX_TOPOLOGY_TRIANGLE_STRIP : RSX_TOPOLOGY_POINTS;
+        r->vb_byte_offset = g_cursor * VERTEX_STRIDE; r->vertex_count = 3; r->cb_slot = i;
+        g_cursor += 3;
+        g_kind[i] = "legacy"; g_model[i] = 0;
+        s_d3d.draw_count = i + 1;
+        return;
+    } else if (x < 83) kind = 2;
+    else if (x < 88) kind = 1;                         /* reads a depth surface */
+    else if (x < 92) {                                 /* another topology: not whole triangles */
+        g.topo = rnd(2) ? RSX_TOPOLOGY_TRIANGLE_STRIP : RSX_TOPOLOGY_POINTS;
+        kind = 1;
+    } else if (x < 95) g_cursor += 3;                  /* vertices that belong to no record */
+    else mutate(rnd(15));
+    fill_fields(r);
+    g.topo = save_topo;
+    if (kind == 2) r->rt_off = MISSING_RT;
+    if (kind == 1 && r->topology == RSX_TOPOLOGY_TRIANGLES) {
+        u32 unit = rnd(16);
+        if (rnd(2)) r->depth_sample_mask = 1u << unit;   /* a sampled unit: a part of the PSO key */
+        else r->depth_alias_mask = 1u << unit;           /* an aliased unit: not in the PSO key */
+        r->depth_view[unit].enabled = 1; r->depth_view[unit].compare = 1;
+    }
+    p = record_pso(r);
+    n = p ? p->n : 0;
+    vc = 3u * (1u + rnd(30));
+    if (r->topology != RSX_TOPOLOGY_TRIANGLES) vc += 1u + rnd(2u);
+    r->vertex_count = vc; r->vb_byte_offset = g_cursor * VERTEX_STRIDE; r->cb_slot = i;
+    fill_vertices(g_cursor, vc, i);
+    g_cursor += vc;
+    slot = g_b0 + (size_t)i * VP_CB_STRIDE;            /* b0: the vertex constants of the state */
+    memset(slot, 0, PHASE_DRAW_B0_BYTES);
+    memcpy(slot, &g.b0, 4);
+    memcpy(slot + 8, &g.b1, 4);
+    slot = g_b1 + (size_t)i * VP_FPCB_STRIDE;          /* b1: as recorded, before the refresh */
+    memset(slot, 0, VP_FPCB_STRIDE);
+    g_b1_tag[i] = g.b1; g_b1_mode[i] = (u32)g.b1mode;
+    if (g.b1mode == 2) { b1_fill(slot, n, g.b1 + 555u); r->fp_const_n = 0xFFFFu; }
+    else if (g.b1mode == 1) { b1_fill(slot, n, g.b1 + 777u); r->fp_const_n = p ? (n + 1u) % 7u : 1u; }
+    else { b1_fill(slot, n, g.b1); r->fp_const_n = p ? n : 0; }
+    s_d3d.draw_count = i + 1;
+    g_kind[i] = kind == 0 ? "draw" : kind == 1 ? "single" : "missing";
+    g_model[i] = model_key(r);
+}
+static void setup(void)
+{
+    u32 i;
+    g_list.lpVtbl = &g_list_vt;
+    s_d3d.cmd_list = &g_list;
+    s_d3d.vp_root_sig = &g_root_sig;
+    g_res_cb.address = CB0_BASE; g_res_cb1.address = CB1_BASE; g_res_vb.address = VB_BASE;
+    g_res_cb.lpVtbl = g_res_cb1.lpVtbl = g_res_vb.lpVtbl = &g_res_vt;
+    s_d3d.vp_cb = &g_res_cb; s_d3d.vp_fpcb = &g_res_cb1; s_d3d.vp_vb = &g_res_vb;
+    s_d3d.vp_cb_mapped = g_b0; s_d3d.vp_fpcb_mapped = g_b1; s_d3d.vp_vb_mapped = g_vb;
+    g_srv_heap.address = SRV_BASE; g_heap_base.address = 0x600000000ull; g_heap_over.address = 0x700000000ull;
+    g_srv_heap.lpVtbl = g_dsv_heap.lpVtbl = g_heap_base.lpVtbl = g_heap_over.lpVtbl = &g_heap_vt;
+    s_d3d.srv_heap = &g_srv_heap; s_d3d.dsv_heap = &g_dsv_heap;
+    s_d3d.width = 1280; s_d3d.height = 720; s_d3d.vp_ready = 1; s_d3d.tex_ready = 1;
+    s_d3d.vp_capacity = VB_VERTS / 2; s_d3d.dsv_step = 32; s_d3d.srv_inc = 64;
+    for (i = 0; i < OFF_RTS; i++) {
+        s_d3d.off_rt[i].off = g_rt_offs[i];
+        s_d3d.off_rt[i].w = (i & 1u) ? 1024u : 1280u; s_d3d.off_rt[i].h = (i & 1u) ? 1024u : 720u;
+        s_d3d.off_rt[i].dxgi = (i & 1u) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    for (i = 0; i < 4; i++) { g_fallback[i].lpVtbl = &g_pso_vt; g_fallback[i].key = 0x100 + i; }
+    s_d3d.pipeline_state_vp = &g_fallback[0]; s_d3d.pipeline_state_vp_color = &g_fallback[1];
+    s_d3d.pipeline_state_vp_no_depth = &g_fallback[2]; s_d3d.pipeline_state_vp_color_no_depth = &g_fallback[3];
+}
+static void run_batch(u32 seed)
+{
+    u32 n, i;
+    g_rnd = (u64)seed * 6364136223846793005ull + 1442695040888963407ull;
+    for (i = 0; i < 8; i++) rnd(1000);
+    memset(s_d3d.draws, 0, sizeof s_d3d.draws);
+    s_d3d.draw_count = 0;
+    s_d3d.vp_parity = seed & 1u;
+    g_bind_reuse = (seed & 2u) != 0;
+    g_cursor = 0; g_srv_n = 0; g_samp_n = 0; s_subvp_n = 0;
+    s_rt_barriers = s_draw_cmds = s_pso_binds = s_srv_binds = 0;
+    memset(&g_st, 0, sizeof g_st);
+    for (i = 0; i < OFF_RTS; i++) s_d3d.off_rt[i].st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    for (i = 0; i < 4; i++) s_d3d.depth_cache.surfaces[i].initialized = 0;
+    memset(&s_phase, 0, sizeof s_phase);
+    gen_full();
+    printf("batch %u\n", seed);
+    n = 1 + rnd(MAX_DRAWS - 2);
+    for (i = 0; i < n; i++) add_record();
+    for (i = 0; i < s_d3d.draw_count; i++) {
+        const D3D12DrawRecord* r = &s_d3d.draws[i];
+        printf("rec %u %s %u %u %016llx\n", i, g_kind[i], r->vb_byte_offset / VERTEX_STRIDE, r->vertex_count,
+               U64(g_model[i]));
+        s_draw_srv_base[i] = key_intern(g_srv_keys, &g_srv_n, srv_key(r));
+    }
+    vp_pass();
+    draw_merge_report(4242, 1, s_phase.draws);
+    printf("subvp %u", s_subvp_n);
+    for (i = 0; i < s_subvp_n; i++) printf(" %u,%u,%u,%u", s_subvp[i].x, s_subvp[i].y, s_subvp[i].w, s_subvp[i].h);
+    printf("\nbatchend %u\n", seed);
+}
+int main(int argc, char** argv)
+{
+    u32 first = argc > 1 ? (u32)strtoul(argv[1], NULL, 10) : 0;
+    u32 count = argc > 2 ? (u32)strtoul(argv[2], NULL, 10) : 300;
+    u32 s;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setup();
+    for (s = 0; s < count; s++) run_batch(first + s);
+    printf("done %u\n", count);
+    return 0;
+}
