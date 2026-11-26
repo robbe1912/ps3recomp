@@ -20,7 +20,7 @@ STOP = "static void cpu_surface_snapshot_trace("
 TAIL = ("cpu_surface_bind", "cpu_surface_written", "cpu_surface_retire")
 RECHECK = "if(cpu_surface_view_load(&v->sequence)!=sequence)return CPU_SURFACE_VIEW_CHANGING;"
 CALL = "if(cpu_surface_fast_request(address,bytes,client_thread))return;"
-SWITCH = "const char *fast=getenv(\"RSX_CPU_SURFACE_FAST\");s_cpu_surface_fast=!(fast&&fast[0]=='0'&&!fast[1]);"
+SWITCH = "const char *fast=getenv(\"RSX_CPU_SURFACE_FAST\");s_cpu_surface_fast=fast&&fast[0]=='1'&&!fast[1];"
 NOTE = "            if(!cpu_surface_view_load(&v->noted))cpu_surface_view_store(&v->noted,1);\n"
 REFRESH_NOTE = "if(view && cpu_surface_view_exchange(&view->noted,0))e->wanted=1;"
 REFRESH_VIEW = "        CpuSurfaceView *view=r?cpu_surface_view_entry(cpu_surface_view_index(r)):NULL;\n"
@@ -47,7 +47,7 @@ def wiring(source, region, request, init, backend):
         < request.index(CALL)
         < request.index("request.done=CreateEventA(")
     ), "the renderer thread keeps its direct path; a client thread tries the fast path before it queues"
-    assert init.count(SWITCH) == 1, "RSX_CPU_SURFACE_FAST=0 keeps every read queued"
+    assert init.count(SWITCH) == 1, "only RSX_CPU_SURFACE_FAST=1 enables caller-side reads"
     assert init.count("vm_read_sync_set_handler(cpu_surface_request,NULL);") == 1, "one coherent read handler"
     assert region.count(RECHECK) == 1, "a client uses a view only when its sequence number did not change"
     for name in ("cpu_surface_copy", "cpu_surface_prefetch_take"):

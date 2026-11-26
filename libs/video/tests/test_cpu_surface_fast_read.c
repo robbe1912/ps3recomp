@@ -257,6 +257,11 @@ int main(void) {
   s_cpu_surface_profile = 1;
   s_cpu_surface_profile_frequency = 1000;
   client_served(inside, 4, "a surface without a recorded write");
+  s_cpu_surface_profile = 0;
+  cpu_surface_view_recorded(1);
+  client_queued(inside, 4, "a pending batch can write the ready surface");
+  cpu_surface_view_recorded(0);
+  s_cpu_surface_profile = 1;
   client_served(0x1000, 64, "the whole range of a surface");
   s_cpu_surface_profile = 0;
 

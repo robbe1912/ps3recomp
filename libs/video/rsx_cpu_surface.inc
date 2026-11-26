@@ -95,13 +95,27 @@ typedef struct CpuSurfaceView {
 #define CPU_SURFACE_VIEW_COUNT 48                    /* entry count: bits 48 to 63 */
 enum { CPU_SURFACE_VIEW_CHANGING, CPU_SURFACE_VIEW_CLEAR, CPU_SURFACE_VIEW_PENDING, CPU_SURFACE_VIEW_READY };
 static _Atomic u64 s_cpu_surface_views;
-static int s_cpu_surface_fast;      /* RSX_CPU_SURFACE_FAST=0 keeps every read queued */
+/* One renderer publishes this state. Clients require an unchanged revision
+ * across the whole scan, not just a consistent view of each slot. */
+#define CPU_SURFACE_VIEW_UPDATING 1ull
+#define CPU_SURFACE_VIEW_RECORDED 2ull
+#define CPU_SURFACE_VIEW_INCOMPLETE 4ull
+#define CPU_SURFACE_VIEW_REVISION 8ull
+static _Atomic u64 s_cpu_surface_view_state;
+static int s_cpu_surface_fast;      /* RSX_CPU_SURFACE_FAST=1 enables caller-side reads */
 static _Atomic u64 s_cpu_surface_fast_served;
 static u64 cpu_surface_view_load(const _Atomic u64 *value) {
     return __c11_atomic_load(value,__ATOMIC_ACQUIRE);
 }
 static void cpu_surface_view_store(_Atomic u64 *value,u64 next) {
     __c11_atomic_store(value,next,__ATOMIC_RELEASE);
+}
+static void cpu_surface_view_recorded(int pending) {
+    if(!s_cpu_surface_fast)return;
+    u64 state=cpu_surface_view_load(&s_cpu_surface_view_state);
+    u64 bit=pending?CPU_SURFACE_VIEW_RECORDED:0;
+    if((state&CPU_SURFACE_VIEW_RECORDED)!=bit)
+        cpu_surface_view_store(&s_cpu_surface_view_state,((state&~CPU_SURFACE_VIEW_RECORDED)|bit)+CPU_SURFACE_VIEW_REVISION);
 }
 static u64 cpu_surface_view_exchange(_Atomic u64 *value,u64 next) {
     return __c11_atomic_exchange(value,next,__ATOMIC_ACQ_REL);
@@ -123,6 +137,8 @@ static int cpu_surface_view_probe(const CpuSurfaceView *v,u32 address,u32 bytes)
  * path. A read that touches no surface takes the queued path too. */
 static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
     if(!s_cpu_surface_fast)return 0;
+    u64 revision=cpu_surface_view_load(&s_cpu_surface_view_state);
+    if(revision&(CPU_SURFACE_VIEW_UPDATING|CPU_SURFACE_VIEW_RECORDED|CPU_SURFACE_VIEW_INCOMPLETE))return 0;
     u64 views=cpu_surface_view_load(&s_cpu_surface_views);
     CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
     u64 hits=0;
@@ -135,6 +151,7 @@ static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
         }
     }
     if(!hits)return 0;
+    if(cpu_surface_view_load(&s_cpu_surface_view_state)!=revision)return 0;
     CpuSurfaceRequest fast={0};fast.address=address;fast.bytes=bytes;fast.client_thread=client_thread;
     fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
     fast.profile.matched=fast.profile.hits=hits;cpu_surface_profile_emit(&fast);
@@ -221,8 +238,16 @@ static CpuSurfaceView *cpu_surface_view_slot(int index) {
  * it now: the guest bytes r owns and whether a copy of r would be a hit. The
  * new view is visible only after all four fields are stored. */
 static void cpu_surface_view_update(OffRT *r) {
+    if(!s_cpu_surface_fast)return;
+    u64 state=cpu_surface_view_load(&s_cpu_surface_view_state);
+    if(state&CPU_SURFACE_VIEW_INCOMPLETE)return;
+    cpu_surface_view_store(&s_cpu_surface_view_state,state|CPU_SURFACE_VIEW_UPDATING);
     CpuSurfaceView *v=cpu_surface_view_slot(cpu_surface_view_index(r));
-    if(!v)return;
+    if(!v){
+        /* An untracked slot can overlap a tracked slot. Do not serve either. */
+        cpu_surface_view_store(&s_cpu_surface_view_state,state|CPU_SURFACE_VIEW_INCOMPLETE);
+        return;
+    }
     int live=r->res && r->cpu_address;
     u64 begin=live?(u64)r->cpu_address:0,end=live?begin+(u64)r->cpu_pitch*r->h:0;
     u64 ready=!r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation;
@@ -230,6 +255,7 @@ static void cpu_surface_view_update(OffRT *r) {
     cpu_surface_view_store(&v->sequence,sequence+1);
     cpu_surface_view_store(&v->begin,begin);cpu_surface_view_store(&v->end,end);cpu_surface_view_store(&v->ready,ready);
     cpu_surface_view_store(&v->sequence,sequence+2);
+    cpu_surface_view_store(&s_cpu_surface_view_state,state+CPU_SURFACE_VIEW_REVISION);
 }
 /* Renderer thread. r left its slot. No client may serve the old range, and a
  * noted read must not reach the next surface of the slot. */
@@ -840,6 +866,7 @@ static int s_cpu_surface_pending_overflow;
 static int s_cpu_surface_prompt;
 static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
     if(!address || address==0xffffffffu || !pitch)return;
+    cpu_surface_view_recorded(1);
     if(!height){s_cpu_surface_pending_overflow=1;return;}   /* unknown extent: serve nothing early */
     u64 begin=address,end=begin+(u64)pitch*height;
     for(unsigned i=0;i<s_cpu_surface_pending_count;i++)
@@ -857,6 +884,7 @@ static int cpu_surface_pending_overlaps(u32 address,u32 bytes) {
 /* render_frame consumed and submitted every recorded draw. */
 static void cpu_surface_batch_submitted(void) {
     s_cpu_surface_pending_count=0;s_cpu_surface_pending_overflow=0;
+    cpu_surface_view_recorded(0);
 }
 static void cpu_surface_service_ready(void) {
     if(!s_cpu_surface_prompt)return;
@@ -921,7 +949,7 @@ static void cpu_surface_init(void) {
     s_cpu_surface_prompt=!(prompt&&prompt[0]=='0'&&!prompt[1]);
     const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
     s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
-    const char *fast=getenv("RSX_CPU_SURFACE_FAST");s_cpu_surface_fast=!(fast&&fast[0]=='0'&&!fast[1]);
+    const char *fast=getenv("RSX_CPU_SURFACE_FAST");s_cpu_surface_fast=fast&&fast[0]=='1'&&!fast[1];
     cpu_surface_batch_submitted();
     cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
     if(s_cpu_surface_profile) {
