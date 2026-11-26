@@ -602,6 +602,10 @@ static u64 model_key(const D3D12DrawRecord* r)
     mix(&h, r->depth_slot); mix(&h, r->rt_fmt);
     mix(&h, r->vp_x); mix(&h, r->vp_y); mix(&h, r->vp_w); mix(&h, r->vp_h);
     mix(&h, r->stencil_ref); mix(&h, r->fp_addr);
+    /* The texture transitions of the pass read the offscreen target of each unit,
+     * also of a unit that is not set and of a record without a program. The SRV
+     * window holds the set units only. */
+    for (u = 0; u < 16; u++) mix(&h, (u64)(r->tex_rt[u] + 1));
     mix(&h, fnv(g_b0 + ((size_t)s_d3d.vp_parity * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE, PHASE_DRAW_B0_BYTES));
     mix(&h, p ? p->key : 0);
     count = b1_final(r, tmp);
