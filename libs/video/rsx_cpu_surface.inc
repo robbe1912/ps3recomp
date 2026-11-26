@@ -85,16 +85,19 @@ static void cpu_surface_profile_emit(CpuSurfaceRequest *request) {
  * uses the C11 atomic builtins.
  * The renderer packs bytes only while its view is not ready. The load that
  * follows a served read is as current as the load that follows a queued hit:
- * both loads run after the handler returns. */
+ * both loads run after the handler returns. With RSX_CPU_SURFACE_STALE a view
+ * that is not ready can serve one read from the bytes in guest memory, so
+ * that load can overlap the pack of the next copy. */
 typedef struct CpuSurfaceView {
     _Atomic u64 sequence;   /* odd while the renderer changes this view */
     _Atomic u64 begin, end; /* guest byte range [begin, end), both 0: no surface */
     _Atomic u64 ready;      /* 1: a renderer copy of this surface would be a hit */
     _Atomic u64 noted;      /* 1 after a client read served this surface; the prefetch refresh takes it */
+    _Atomic u64 stale;      /* 1: one read that waits for a copy may return the bytes in guest memory */
 } CpuSurfaceView;
 #define CPU_SURFACE_VIEW_ADDRESS 0x7FFFFFFFFFFFull   /* table address: bits 0 to 46 */
 #define CPU_SURFACE_VIEW_COUNT 48                    /* entry count: bits 48 to 63 */
-enum { CPU_SURFACE_VIEW_CHANGING, CPU_SURFACE_VIEW_CLEAR, CPU_SURFACE_VIEW_PENDING, CPU_SURFACE_VIEW_READY };
+enum { CPU_SURFACE_VIEW_CHANGING, CPU_SURFACE_VIEW_CLEAR, CPU_SURFACE_VIEW_PENDING, CPU_SURFACE_VIEW_READY, CPU_SURFACE_VIEW_STALE };
 static _Atomic u64 s_cpu_surface_views;
 static int s_cpu_surface_fast;      /* RSX_CPU_SURFACE_FAST=0 keeps every read queued */
 static _Atomic u64 s_cpu_surface_fast_served;
@@ -110,18 +113,50 @@ static u64 cpu_surface_view_exchange(_Atomic u64 *value,u64 next) {
 static u64 cpu_surface_view_increase(_Atomic u64 *value) {
     return __c11_atomic_fetch_add(value,1,__ATOMIC_RELAXED)+1;
 }
+/* Stale reads of one surface. RSX_CPU_SURFACE_STALE names one RSX surface
+ * offset, one that RSX_CPU_SURFACE_PREFETCH lists; none by default, and
+ * then every read is as without that switch.
+ * A read of that surface that needs its current gpu_generation returns at
+ * once with the bytes in guest memory: those of the copy that landed last
+ * in the layout the surface has now. The read is one generation behind, as
+ * the same read one frame earlier is. r->cpu_generation does not change,
+ * and the read sync view changes only when fresh bytes land in guest
+ * memory: the next read after the prefetched copy lands serves them.
+ * On the client thread one read returns that way for each landing of a
+ * copy and for each write the renderer records. Then a read takes the
+ * queued path again, and the renderer serves it when its copy completes,
+ * so a guest that polls the value makes progress.
+ * The first read of a surface, a read after a layout change and every
+ * other surface take the path they take without the switch.
+ * Use this only for a surface that holds a slowly changing value and that
+ * the game does not synchronise on: the load of a stale read can overlap
+ * the pack of the next copy. In MotorStorm races the main thread reads the
+ * 64x64 HDR exposure target (02A30480) once per frame.
+ * RSX_CPU_SURFACE_STALE_LOG=1 prints the counters each 1000 stale reads. */
+typedef struct CpuSurfaceStale {
+    u32 off;                    /* the RSX surface offset the switch names */
+    int configured;             /* 1: the switch names an offset */
+    int landed;                 /* 1: a copy of the surface is in guest memory, in the layout below */
+    u32 address, pitch, w, height, format;   /* layout of the surface when that copy landed */
+    _Atomic u64 stale;          /* stale reads served, client thread and renderer thread */
+    unsigned long long fresh, copies;        /* renderer thread: reads served from a prefetched copy, coherent copies */
+} CpuSurfaceStale;
+static CpuSurfaceStale s_cpu_surface_stale;
+static int s_cpu_surface_stale_log;
+static void cpu_surface_stale_print(void) {
+    fprintf(stderr,"[CPUSURFACE_STALE] offset=%08X stale=%llu fresh=%llu copies=%llu\n",s_cpu_surface_stale.off,
+        (unsigned long long)cpu_surface_view_load(&s_cpu_surface_stale.stale),(unsigned long long)s_cpu_surface_stale.fresh,
+        (unsigned long long)s_cpu_surface_stale.copies);
+}
 /* One client read of guest bytes [address, address+bytes) against view v. */
 static int cpu_surface_view_probe(const CpuSurfaceView *v,u32 address,u32 bytes) {
     u64 sequence=cpu_surface_view_load(&v->sequence);
     if(sequence&1)return CPU_SURFACE_VIEW_CHANGING;
-    u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end),ready=cpu_surface_view_load(&v->ready);
+    u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end),ready=cpu_surface_view_load(&v->ready),stale=cpu_surface_view_load(&v->stale);
     if(cpu_surface_view_load(&v->sequence)!=sequence)return CPU_SURFACE_VIEW_CHANGING;
     if((u64)address>=end || (u64)address+bytes<=begin)return CPU_SURFACE_VIEW_CLEAR;
-    return ready?CPU_SURFACE_VIEW_READY:CPU_SURFACE_VIEW_PENDING;
+    return ready?CPU_SURFACE_VIEW_READY:stale?CPU_SURFACE_VIEW_STALE:CPU_SURFACE_VIEW_PENDING;
 }
-/* Client thread. Returns 1 when it served the read, so no request is queued.
- * A view that changes or waits for a copy makes the read take the queued
- * path. A read that touches no surface takes the queued path too. */
 /* Hooks of rsx_deform_surface.inc, the CPU buffer of a paint target. They
  * are NULL while that file is not in the build, or until its init runs:
  * then every path below is as it was. */
@@ -130,24 +165,39 @@ static struct {
     int (*owned)(u32 rsx_offset);          /* 1: level 0 of a listed surface, buffer mode on   */
     u64 (*sequence)(void);                 /* sum of the paint sequence numbers               */
 } s_cpu_surface_deform;
+/* Client thread. Returns 1 when it served the read, so no request is queued.
+ * A view that changes or waits for a copy makes the read take the queued
+ * path. A read that touches no surface takes the queued path too.
+ * RSX_CPU_SURFACE_STALE: a view that waits for a copy of a listed surface
+ * serves one read with the bytes in guest memory. The next read takes the
+ * queued path until the renderer lands a copy or records a new write. */
 static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
     if(!s_cpu_surface_fast)return 0;
     if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,bytes))return 1;
     u64 views=cpu_surface_view_load(&s_cpu_surface_views);
     CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
-    u64 hits=0;
+    u64 hits=0,stale=0;
     for(u64 i=views>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
         int state=cpu_surface_view_probe(v,address,bytes);
-        if(state!=CPU_SURFACE_VIEW_CLEAR && state!=CPU_SURFACE_VIEW_READY)return 0;
         if(state==CPU_SURFACE_VIEW_READY){
             if(!cpu_surface_view_load(&v->noted))cpu_surface_view_store(&v->noted,1);
             hits++;
-        }
+        } else if(state==CPU_SURFACE_VIEW_STALE) {
+            /* One read takes the permit before the other views are known. A read that
+             * queues after that loses it: its next read queues, as without the switch. */
+            if(cpu_surface_view_exchange(&v->stale,0)!=1)return 0;
+            if(!cpu_surface_view_load(&v->noted))cpu_surface_view_store(&v->noted,1);
+            stale++;
+        } else if(state!=CPU_SURFACE_VIEW_CLEAR)return 0;
     }
-    if(!hits)return 0;
+    if(!hits && !stale)return 0;
     CpuSurfaceRequest fast={0};fast.address=address;fast.bytes=bytes;fast.client_thread=client_thread;
     fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
-    fast.profile.matched=fast.profile.hits=hits;cpu_surface_profile_emit(&fast);
+    fast.profile.matched=hits+stale;fast.profile.hits=hits;cpu_surface_profile_emit(&fast);
+    if(stale) {
+        u64 count=cpu_surface_view_increase(&s_cpu_surface_stale.stale);
+        if(s_cpu_surface_stale_log && !(count%1000))cpu_surface_stale_print();
+    }
     u64 served=cpu_surface_view_increase(&s_cpu_surface_fast_served);
     if(s_cpu_surface_profile && !(served&1023))fprintf(stderr,"[CPUSURFACE_FAST] served=%llu\n",(unsigned long long)served);
     return 1;
@@ -190,6 +240,23 @@ static void cpu_surface_fence_block(ID3D12Fence *fence,HANDLE event,u64 value,co
     CPU_SURFACE_HR(fence->lpVtbl->SetEventOnCompletion(fence,value,event));
     if(WaitForSingleObject(event,30000)!=WAIT_OBJECT_0 || !cpu_surface_fence_reached(fence,value))cpu_surface_fail(operation,E_FAIL);
 }
+/* Renderer thread. 1 when RSX_CPU_SURFACE_STALE names the RSX offset of r. */
+static int cpu_surface_stale_listed(const OffRT *r) {
+    return s_cpu_surface_stale.configured && s_cpu_surface_stale.off==r->off;
+}
+/* Renderer thread. A copy of r is in guest memory. While r keeps this layout,
+ * a stale read of r serves those bytes. */
+static void cpu_surface_stale_landed(OffRT *r) {
+    CpuSurfaceStale *s=&s_cpu_surface_stale;
+    s->landed=1;s->address=r->cpu_address;s->pitch=r->cpu_pitch;s->w=r->w;s->height=r->h;s->format=r->cpu_format;
+}
+/* Renderer thread. 1 when a copy of r landed before and r has the layout of
+ * that copy now. */
+static int cpu_surface_stale_serves(const OffRT *r) {
+    const CpuSurfaceStale *s=&s_cpu_surface_stale;
+    return s->configured && s->landed && s->off==r->off && r->cpu_address && r->cpu_address==s->address &&
+        r->cpu_pitch==s->pitch && r->w==s->w && r->h==s->height && r->cpu_format==s->format;
+}
 /* Renderer thread only: one client-visible view for each slot of the surface
  * pool. CPU_SURFACE_CAPACITY is the slot count of the pool. */
 static int cpu_surface_view_index(OffRT *r) {
@@ -225,6 +292,7 @@ static CpuSurfaceView *cpu_surface_view_slot(int index) {
         cpu_surface_view_store(&table[i].end,cpu_surface_view_load(&old[i].end));
         cpu_surface_view_store(&table[i].ready,cpu_surface_view_load(&old[i].ready));
         cpu_surface_view_store(&table[i].noted,cpu_surface_view_load(&old[i].noted));
+        cpu_surface_view_store(&table[i].stale,cpu_surface_view_load(&old[i].stale));
     }
     cpu_surface_view_store(&s_cpu_surface_views,(uintptr_t)table|next<<CPU_SURFACE_VIEW_COUNT);
     for(u64 i=0;i<count;i++)cpu_surface_view_store(&old[i].sequence,cpu_surface_view_load(&old[i].sequence)+1);
@@ -232,16 +300,23 @@ static CpuSurfaceView *cpu_surface_view_slot(int index) {
 }
 /* Renderer thread. Publishes r as cpu_surface_read and cpu_surface_copy see
  * it now: the guest bytes r owns and whether a copy of r would be a hit. The
- * new view is visible only after all four fields are stored. */
+ * new view is visible only after all five fields are stored. */
 static void cpu_surface_view_update(OffRT *r) {
     CpuSurfaceView *v=cpu_surface_view_slot(cpu_surface_view_index(r));
     if(!v)return;
     int live=r->res && r->cpu_address && !(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off));
     u64 begin=live?(u64)r->cpu_address:0,end=live?begin+(u64)r->cpu_pitch*r->h:0;
     u64 ready=!r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation;
+    /* A listed surface serves one pending read from its last copy while it has
+     * the layout of that copy. A surface that left its slot takes no stale read
+     * when it comes back. */
+    u64 stale=0;
+    if(live && cpu_surface_stale_serves(r))stale=1;
+    else if(cpu_surface_stale_listed(r))s_cpu_surface_stale.landed=0;
     u64 sequence=cpu_surface_view_load(&v->sequence);
     cpu_surface_view_store(&v->sequence,sequence+1);
     cpu_surface_view_store(&v->begin,begin);cpu_surface_view_store(&v->end,end);cpu_surface_view_store(&v->ready,ready);
+    cpu_surface_view_store(&v->stale,stale);
     cpu_surface_view_store(&v->sequence,sequence+2);
 }
 /* Renderer thread. r left its slot. No client may serve the old range, and a
@@ -332,25 +407,75 @@ static void cpu_surface_prefetch_note(const OffRT *r) {
     CpuSurfacePrefetch *e=cpu_surface_prefetch_entry(r);
     if(e)e->wanted=1;
 }
-/* Serve a read of r from its prefetched copy if that copy holds r's current
- * generation in r's current layout. Returns 1 when vm_base now holds it. */
-static int cpu_surface_prefetch_take(OffRT *r) {
+static void cpu_surface_stale_reset(void) {
+    memset(&s_cpu_surface_stale,0,sizeof s_cpu_surface_stale);
+}
+/* RSX_CPU_SURFACE_STALE: one hex offset of 1 to 8 digits. */
+static void cpu_surface_stale_configure(const char *list) {
+    cpu_surface_stale_reset();
+    const char *log=getenv("RSX_CPU_SURFACE_STALE_LOG");
+    s_cpu_surface_stale_log=log&&log[0]=='1'&&!log[1];
+    if(!list || !*list)return;
+    u64 off=0;unsigned digits=0;int d;
+    while((d=cpu_surface_hex_digit(*list))>=0){off=off*16u+(u64)d;list++;digits++;
+        if(digits>8)cpu_surface_fail("RSX_CPU_SURFACE_STALE (offsets are 1-8 hex digits)",E_INVALIDARG);}
+    if(!digits || *list)cpu_surface_fail("RSX_CPU_SURFACE_STALE (one hex offset)",E_INVALIDARG);
+    s_cpu_surface_stale.off=(u32)off;s_cpu_surface_stale.configured=1;
+    fprintf(stderr,"[CPUSURFACE_STALE] enabled offset=%08X\n",(unsigned)off);
+}
+static void cpu_surface_stale_shutdown(void) {
+    if(s_cpu_surface_stale.configured)cpu_surface_stale_print();
+    cpu_surface_stale_reset();
+}
+/* Renderer thread, service path. The read returns the bytes of the copy that
+ * landed last and does not wait for the prefetched copy on the GPU. */
+static int cpu_surface_stale_serve(void) {
+    u64 stale=cpu_surface_view_increase(&s_cpu_surface_stale.stale);
+    if(s_cpu_surface_stale_log && !(stale%1000))cpu_surface_stale_print();
+    return 1;
+}
+/* Renderer thread. Packs the prefetched copy of e, width pixels per row, into
+ * the guest bytes of r. */
+static void cpu_surface_prefetch_pack(CpuSurfacePrefetch *e,OffRT *r,u32 width) {
     extern uint8_t *vm_base;
+    D3D12_RANGE range={0,(SIZE_T)e->readback_bytes};void *mapped=NULL;
+    CPU_SURFACE_HR(e->readback->lpVtbl->Map(e->readback,0,&range,&mapped));
+    if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)((u64)r->cpu_pitch*r->h),r->cpu_pitch,
+        mapped,(size_t)e->readback_bytes,e->readback_pitch,width,r->h,r->cpu_format))cpu_surface_fail("prefetched surface packing",E_INVALIDARG);
+    D3D12_RANGE empty={0,0};e->readback->lpVtbl->Unmap(e->readback,0,&empty);
+}
+/* Serve a read of r from its prefetched copy if that copy holds r's current
+ * generation in r's current layout. Returns 1 when the read is served: the
+ * copy is in guest memory, or RSX_CPU_SURFACE_STALE served the last copy. */
+static int cpu_surface_prefetch_take(OffRT *r) {
     CpuSurfacePrefetch *e=cpu_surface_prefetch_entry(r);
     if(!e)return 0;
     u32 width=cpu_surface_prefetch_width(r);
     if(!e->generation || e->generation!=r->gpu_generation || !width || width!=e->width || r->w!=e->w ||
        r->cpu_address!=e->address || r->cpu_pitch!=e->pitch || r->h!=e->height || r->cpu_format!=e->format){e->missed++;return 0;}
     if(!cpu_surface_fence_reached(s_cpu_surface_prefetch_fence,e->fence)) {
+        /* RSX_CPU_SURFACE_STALE: a listed surface serves its last copy and does not wait. */
+        if(cpu_surface_stale_serves(r))return cpu_surface_stale_serve();
         e->waited++;cpu_surface_fence_block(s_cpu_surface_prefetch_fence,s_cpu_surface_prefetch_event,e->fence,"prefetch GPU fence wait");
     }
-    D3D12_RANGE range={0,(SIZE_T)e->readback_bytes};void *mapped=NULL;
-    CPU_SURFACE_HR(e->readback->lpVtbl->Map(e->readback,0,&range,&mapped));
-    if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)((u64)r->cpu_pitch*r->h),r->cpu_pitch,
-        mapped,(size_t)e->readback_bytes,e->readback_pitch,width,r->h,r->cpu_format))cpu_surface_fail("prefetched surface packing",E_INVALIDARG);
-    D3D12_RANGE empty={0,0};e->readback->lpVtbl->Unmap(e->readback,0,&empty);
-    r->cpu_generation=r->gpu_generation;e->used++;cpu_surface_view_update(r);
+    cpu_surface_prefetch_pack(e,r,width);
+    r->cpu_generation=r->gpu_generation;e->used++;
+    if(cpu_surface_stale_listed(r)){s_cpu_surface_stale.fresh++;cpu_surface_stale_landed(r);}
+    cpu_surface_view_update(r);
     return 1;
+}
+/* Renderer thread, once per submitted batch. RSX_CPU_SURFACE_STALE names r: a
+ * prefetched copy that the GPU finished lands now, when it is newer than the
+ * bytes in guest memory and r kept the layout of that copy. A stale read does
+ * not land a copy, so the copies land here and at the next read. */
+static void cpu_surface_stale_land(CpuSurfacePrefetch *e,OffRT *r) {
+    if(!e->generation || e->generation<=r->cpu_generation)return;
+    u32 width=cpu_surface_prefetch_width(r);
+    if(!width)return;
+    if(!(width==e->width && r->w==e->w && r->cpu_address==e->address && r->cpu_pitch==e->pitch && r->h==e->height && r->cpu_format==e->format))return;
+    if(!cpu_surface_fence_reached(s_cpu_surface_prefetch_fence,e->fence))return;
+    cpu_surface_prefetch_pack(e,r,width);
+    r->cpu_generation=e->generation;cpu_surface_stale_landed(r);cpu_surface_view_update(r);
 }
 /* Follow the surface at e->off. Returns it, or NULL when it is not live. */
 static OffRT *cpu_surface_prefetch_track(CpuSurfacePrefetch *e) {
@@ -418,6 +543,7 @@ static void cpu_surface_prefetch_refresh(void) {
     CpuSurfacePrefetch *entries[CPU_SURFACE_PREFETCH_MAX];OffRT *surfaces[CPU_SURFACE_PREFETCH_MAX];unsigned count=0;
     for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
         CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];OffRT *r=cpu_surface_prefetch_track(e);
+        if(r && cpu_surface_stale_listed(r))cpu_surface_stale_land(e,r);
         /* A read a client thread served itself asks for the next copy as well. */
         CpuSurfaceView *view=r?cpu_surface_view_entry(cpu_surface_view_index(r)):NULL;
         if(view && cpu_surface_view_exchange(&view->noted,0))e->wanted=1;
@@ -447,6 +573,14 @@ static void cpu_surface_prefetch_init(void) {
     const char *log=getenv("RSX_CPU_SURFACE_PREFETCH_LOG");
     s_cpu_surface_prefetch_log=log&&log[0]=='1'&&!log[1];
     s_cpu_surface_prefetch_fence_value=0;
+    if(s_cpu_surface_stale.configured) {
+        unsigned listed=0;
+        for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++)listed|=s_cpu_surface_prefetch[i].off==s_cpu_surface_stale.off;
+        if(!listed) {
+            fprintf(stderr,"[CPUSURFACE_STALE] offset %08X is not in RSX_CPU_SURFACE_PREFETCH: stale reads are off\n",(unsigned)s_cpu_surface_stale.off);
+            cpu_surface_stale_reset();
+        }
+    }
     if(!s_cpu_surface_prefetch_count)return;
     CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateCommandAllocator(s_d3d.device,D3D12_COMMAND_LIST_TYPE_DIRECT,
         &IID_ID3D12CommandAllocator,(void **)&s_cpu_surface_prefetch_alloc));
@@ -531,6 +665,7 @@ static void cpu_surface_copy(OffRT *r) {
     if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)guest_bytes,r->cpu_pitch,
         mapped,(size_t)bytes,pitch,width,r->h,r->cpu_format))cpu_surface_fail("guest surface packing",E_INVALIDARG);
     D3D12_RANGE empty={0,0};r->cpu_readback->lpVtbl->Unmap(r->cpu_readback,0,&empty);
+    if(cpu_surface_stale_listed(r)){s_cpu_surface_stale.copies++;cpu_surface_stale_landed(r);}
     r->cpu_generation=r->gpu_generation;cpu_surface_view_update(r);
     if(s_cpu_surface_profile_active) {
         s_cpu_surface_profile_active->packing+=cpu_surface_tick()-profile_begin;
@@ -1048,6 +1183,7 @@ static void cpu_surface_init(void) {
     const char *snapshot_fast=getenv("RSX_CPU_SURFACE_SNAPSHOT_FAST");s_cpu_surface_snapshot_fast=snapshot_fast&&snapshot_fast[0]=='1'&&!snapshot_fast[1];
     cpu_surface_batch_submitted();
     cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
+    cpu_surface_stale_configure(getenv("RSX_CPU_SURFACE_STALE"));
     if(s_cpu_surface_profile) {
         LARGE_INTEGER f;if(!QueryPerformanceFrequency(&f)||f.QuadPart<=0)cpu_surface_fail("profile frequency",E_FAIL);
         s_cpu_surface_profile_frequency=(u64)f.QuadPart;
@@ -1071,6 +1207,7 @@ static void cpu_surface_retire(OffRT *r) {
 static void cpu_surface_shutdown(void) {
     vm_read_sync_set_handler(NULL,NULL);
     vm_read_snapshot_set_handler(NULL,NULL);
+    cpu_surface_stale_shutdown();
     cpu_surface_prefetch_shutdown();
     AcquireSRWLockExclusive(&s_cpu_surface_lock);
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++)cpu_surface_retire(&s_d3d.off_rt[i]);
