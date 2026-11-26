@@ -1,5 +1,6 @@
 /* Render-thread service for CPU loads from host-rendered guest surfaces. */
 #include "ps3emu/guest_read_sync.h"
+#include "rsx_read_sync_memo.h"
 #include "rsx_surface_readback.h"
 #include "rsx_cpu_surface_profile.h"
 #include "rsx_cpu_surface_snapshot.h"
@@ -1102,6 +1103,9 @@ static void cpu_surface_capture(D3D12DrawRecord *draw) {
     for(unsigned i=0;i<4;i++)cpu_surface_pending_add(draw->cpu_address[i],draw->cpu_pitch[i],draw->rt_h);
     cpu_surface_service_ready();
 }
+/* Ranges of the read sync marks: a bind of a surface that an earlier bind marked
+ * makes no second mark (rsx_read_sync_memo.h). The render thread owns it. */
+static rsx_read_sync_memo s_cpu_surface_mark_memo;
 static void cpu_surface_bind(int index,const D3D12DrawRecord *draw,unsigned target) {
     if(index<0)return;OffRT *r=&s_d3d.off_rt[index];
     u32 address=draw->cpu_address[target],pitch=draw->cpu_pitch[target];
@@ -1109,7 +1113,7 @@ static void cpu_surface_bind(int index,const D3D12DrawRecord *draw,unsigned targ
     if(r->cpu_address && address!=r->cpu_address)cpu_surface_fail("surface memory identity changed at one offset",E_INVALIDARG);
     if(r->cpu_pitch!=pitch)r->cpu_generation=0;
     r->cpu_address=address;r->cpu_pitch=pitch;r->cpu_format=draw->rt_fmt;
-    if(address && vm_read_sync_mark_range(address,(u64)pitch*r->h))cpu_surface_fail("guest surface registration",E_INVALIDARG);
+    if(address && rsx_read_sync_memo_mark(&s_cpu_surface_mark_memo,address,(u64)pitch*r->h))cpu_surface_fail("guest surface registration",E_INVALIDARG);
     cpu_surface_view_update(r);
 }
 static void cpu_surface_written(int primary,const int secondary[3]) {
