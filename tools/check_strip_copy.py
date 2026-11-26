@@ -135,13 +135,15 @@ def main():
 
     code, output = execute(build('production', function))
     print(output.strip())
-    results['production'] = dict(exit=code, passed=code == 0 and 'PASS ' in output)
+    def passed(code, output):
+        return code == 0 and 'PASS:' in output and 'FAIL' not in output
+    results['production'] = dict(exit=code, passed=passed(code, output))
     if not results['production']['passed']:
         raise SystemExit('FAIL the uploader with the inline copy did not pass')
     if args.mutants:
         for name, new, what in MUTANTS:
             code, output = execute(build('mutant-' + name, function.replace(COPY, new)))
-            results['mutant ' + name] = dict(exit=code, rejected=code != 0 or 'PASS ' not in output)
+            results['mutant ' + name] = dict(exit=code, rejected=not passed(code, output))
             print(('REJECTED ' if results['mutant ' + name]['rejected'] else 'FAIL ') + 'mutant %s: %s' % (name, what))
             if not results['mutant ' + name]['rejected']:
                 raise SystemExit('FAIL mutant %s passed' % name)

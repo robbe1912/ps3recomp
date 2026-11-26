@@ -3,7 +3,7 @@
 #include "rsx_vertex_fetch.h"
 #include "rsx_index_strip.h"
 #include "rsx_upload_buffer.h"
-#include "rsx_diet_capture.h"
+#include "rsx_vertex_diet_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +68,8 @@ static u32 segment[4096],segment_n;
 static u64 g_digest=14695981039346656037ull,g_chunks,g_vertices;
 static void absorb(const u8* p,size_t n)
 { for(size_t i=0;i<n;++i){g_digest^=p[i];g_digest*=1099511628211ull;} }
+/* Chunks in which one uploader fetched fewer vertices than the index count (cache hits). */
+static u64 g_hit_chunks;
 static int check_chunk(u32 first,u32 count,int fan)
 {
     u32 expected_count=0;VPSlot* expected=malloc((size_t)count*3*VP_VERT_STRIDE);
@@ -83,14 +85,18 @@ static int check_chunk(u32 first,u32 count,int fan)
         for(int v=0;v<3;++v)reference_vertex(&state,tri[v],expected+16*expected_count++);
     }
     /* The uploader before the change writes the chunk first: its bytes are the second reference. */
-    u32 old=s_d3d.vp_vb_offset;u32 n_ref=upload_strip_vp_indexed_reference(&state,first,count,fan);
+    u32 old=s_d3d.vp_vb_offset,f0=fetches;u32 n_ref=upload_strip_vp_indexed_reference(&state,first,count,fan);
     CHECK(n_ref==expected_count);
     u8* output=(u8*)s_d3d.vp_vb_mapped+(u64)s_d3d.vp_parity*s_d3d.vp_capacity*VP_VERT_STRIDE+old;
     CHECK(!memcmp(output,expected,(size_t)n_ref*VP_VERT_STRIDE));
     absorb(output,(size_t)n_ref*VP_VERT_STRIDE);++g_chunks;g_vertices+=n_ref;
     s_d3d.vp_vb_offset=old;
-    u32 n=upload_strip_vp_indexed(&state,first,count,fan);
+    /* Both uploaders have their own per-callback cache: the new one fetches
+     * the same guest vertices (the same count of position probes) as the old one. */
+    u32 f1=fetches;u32 n=upload_strip_vp_indexed(&state,first,count,fan);
     CHECK(n==expected_count);
+    CHECK(fetches-f1==f1-f0);
+    if(f1-f0<(u32)count)++g_hit_chunks;
     CHECK(!memcmp(output,expected,(size_t)n*VP_VERT_STRIDE));free(expected);return 0;
 }
 static void reset(void){++state.begin_epoch;segment_n=0;s_d3d.vp_vb_offset=0;fetches=0;}
@@ -150,30 +156,30 @@ int main(int argc,char** argv)
     for(int fan=0;fan<2;++fan){
         reset();state.restart_index_enable=0;state.index_array_dma=0;
         for(u32 i=0;i<8;++i)indices[i]=i;
-        CHECK(!check_chunk(0,2,fan));CHECK(fetches==0);
-        CHECK(!check_chunk(2,1,fan));CHECK(fetches==3);
+        CHECK(!check_chunk(0,2,fan));
+        CHECK(!check_chunk(2,1,fan));
         state.vertex_data4f[15][0]=41.25f;
-        CHECK(!check_chunk(3,1,fan));CHECK(fetches==6);
+        CHECK(!check_chunk(3,1,fan));
         CHECK(!check_chunk(4,4,fan));
-        reset();indices[0]=1;indices[1]=17;indices[2]=511;CHECK(!check_chunk(0,3,fan));CHECK(fetches==3);
-        reset();for(u32 i=0;i<8;++i)indices[i]=i*17+2;CHECK(!check_chunk(0,8,fan));CHECK(fetches==8);
-        reset();for(u32 i=0;i<512;++i)indices[i]=i;CHECK(!check_chunk(0,512,fan));CHECK(fetches==512);
+        reset();indices[0]=1;indices[1]=17;indices[2]=511;CHECK(!check_chunk(0,3,fan));
+        reset();for(u32 i=0;i<8;++i)indices[i]=i*17+2;CHECK(!check_chunk(0,8,fan));
+        reset();for(u32 i=0;i<512;++i)indices[i]=i;CHECK(!check_chunk(0,512,fan));
         /* Two grid rows sharing their middle row (8..15): the per-callback
          * cache keeps it, so each of the 24 distinct vertices is fetched once
          * (a 3-entry cache refetched the shared row: 32). */
         reset();for(u32 i=0;i<8;++i){indices[2*i]=i;indices[2*i+1]=i+8;indices[16+2*i]=i+8;indices[17+2*i]=i+16;}
-        CHECK(!check_chunk(0,32,fan));CHECK(fetches==24);
+        CHECK(!check_chunk(0,32,fan));CHECK(fetches==48); /* 24 vertices, each fetched once by each uploader */
         for(int bits=0;bits<2;++bits){
             state.index_array_dma=bits?16:0;state.restart_index_enable=1;state.restart_index=bits?65535:0xffffffffu;
             const u32 values[]={0,1,2,2,1,7,0xffffffffu,8,9,10,12,0xffffffffu,30,31,32};
             memcpy(indices,values,sizeof values);reset();CHECK(!check_chunk(0,15,fan));
-            reset();CHECK(!check_chunk(0,2,fan));CHECK(fetches==0);
+            reset();CHECK(!check_chunk(0,2,fan));
             state.frequency_divider_op^=1u<<2;state.vertex_data4f[15][0]=123.5f;
             CHECK(!check_chunk(2,5,fan));state.vertex_data4f[15][0]=-37.25f;CHECK(!check_chunk(7,8,fan));
         }
         state.restart_index_enable=0;state.index_array_dma=16;state.restart_index=0x1ffff;
         reset();for(u32 i=0;i<8;++i)indices[i]=511-i*47;CHECK(!check_chunk(0,8,fan));
-        reset();state.vertex_data4f[15][0]=-0.0f;CHECK(!check_chunk(0,8,fan));CHECK(fetches==8);
+        reset();state.vertex_data4f[15][0]=-0.0f;CHECK(!check_chunk(0,8,fan));CHECK(fetches==16);
     }
     state.index_array_dma=16;state.restart_index_enable=1;state.restart_index=0x1ffff;
     { const u32 values[]={0,1,65535,2,3,4};memcpy(indices,values,sizeof values);reset();CHECK(!check_chunk(0,6,0)); }
@@ -213,5 +219,6 @@ int main(int argc,char** argv)
         }
     }
     CHECK(!captured_draws());
-    free(s_d3d.vp_vb_mapped);printf("PASS: exact indexed strip/fan bytes of the new and the old uploader; chunks=%llu vertices=%llu digest=%016llx\n",(unsigned long long)g_chunks,(unsigned long long)g_vertices,(unsigned long long)g_digest);return 0;
+    CHECK(g_hit_chunks>0); /* the byte compare covers cache hits, where the inline copy runs */
+    free(s_d3d.vp_vb_mapped);printf("PASS: exact indexed strip/fan bytes of the new and the old uploader; chunks=%llu hit_chunks=%llu vertices=%llu digest=%016llx\n",(unsigned long long)g_chunks,(unsigned long long)g_hit_chunks,(unsigned long long)g_vertices,(unsigned long long)g_digest);return 0;
 }
