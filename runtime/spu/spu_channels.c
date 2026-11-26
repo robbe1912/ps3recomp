@@ -2939,8 +2939,9 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (g_spu_pm_svc_on && spu_native_owned_policy(ctx) && pm_svc_branch(ctx)) return;
-    if (spu_native_owned_policy(ctx) && !spu_native_owned_can_run(ctx,ctx->pc)) {
-        spu_native_owned_interpret(ctx); return;
+    if (spu_native_owned_policy(ctx)) {
+        const int miss = spu_native_owned_miss(ctx);
+        if (miss) { spu_miss_hit(ctx, miss); spu_native_owned_interpret(ctx); return; }
     }
     if (fn) {
         spu_check_stack_reset(ctx, fn);

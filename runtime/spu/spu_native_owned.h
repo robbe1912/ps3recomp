@@ -97,6 +97,192 @@ static inline int spu_native_owned_run_ok(const spu_context* ctx, uint32_t pc) {
 static inline int spu_native_owned_can_run(const spu_context* ctx, uint32_t pc) {
     return spu_native_owned_policy(ctx) && spu_native_owned_run_ok(ctx, pc);
 }
+
+/* The stop list of spu_native_owned_run_ok, as one number. 0: the lifted code
+ * may run. The two functions hold the same test in the same order. */
+enum {
+    SPU_STOP_NO_IMAGE = 1, SPU_STOP_NO_LS, SPU_STOP_PC_RANGE, SPU_STOP_PC_ALIGN,
+    SPU_STOP_IRQ_FRAME, SPU_STOP_IRQ_SAVED, SPU_STOP_INT_PENDING,
+    SPU_STOP_LS_WATCH, SPU_STOP_LS_LOWREAD, SPU_STOP_SMC_WATCH, SPU_STOP_OBSERVED,
+    SPU_STOP_NO_OWNER, SPU_STOP_OWNER_IMAGE, SPU_STOP_OWNER_RANGE,
+    SPU_STOP_SVC_REFUSED, SPU_STOP_COUNT
+};
+static inline int spu_native_owned_stop_reason(const spu_context* ctx, uint32_t pc) {
+    if (ctx->image_id < 0) return SPU_STOP_NO_IMAGE;
+    if (!ctx->ls) return SPU_STOP_NO_LS;
+    if (pc >= SPU_LS_SIZE) return SPU_STOP_PC_RANGE;
+    if (pc & 3) return SPU_STOP_PC_ALIGN;
+    if (ctx->irq_frame) return SPU_STOP_IRQ_FRAME;
+    if (ctx->irq_saved) return SPU_STOP_IRQ_SAVED;
+    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) return SPU_STOP_INT_PENDING;
+    if (g_spu_ls_watch_n > 0) return SPU_STOP_LS_WATCH;
+    if (g_spu_ls_probe > 0) return SPU_STOP_LS_LOWREAD;
+    if (g_spu_smc_watch > 0) return SPU_STOP_SMC_WATCH;
+    if (spu_owned_observed()) return SPU_STOP_OBSERVED;
+    const int image = spu_owned_image();
+    for (unsigned i=0;i<sizeof(ctx->resident_code)/sizeof(ctx->resident_code[0]);++i) {
+        if (!ctx->resident_code[i].image_id) continue;
+        uint32_t base=ctx->resident_code[i].lsa, size=ctx->resident_code[i].size;
+        if (pc < base || pc-base >= size) continue;
+        const unsigned owner = ctx->resident_code[i].image_id;
+        if (owner <= 0) return SPU_STOP_NO_OWNER;
+        if (image && image != owner) return SPU_STOP_OWNER_IMAGE;
+        if (base >= SPU_LS_SIZE || size > SPU_LS_SIZE-base) return SPU_STOP_OWNER_RANGE;
+        return 0;
+    }
+    if (image) return SPU_STOP_OWNER_IMAGE;
+    return g_spu_pm_svc_on && spu_pm_svc_can_run(ctx,pc) ? 0 : SPU_STOP_NO_OWNER;
+}
+
+/* SPU_NATIVE_OWNED_MISS_LOG=1: count the dispatches that send owned code to
+ * the interpreter, by image id and by cause. Default off: one predicted
+ * branch on the miss path and nothing on the lifted path. While the switch
+ * is on, each lane writes one line per second in which it had a miss:
+ *   [spu-miss] lane=<n> img=<id> gate stop <stop reason>=<n> ...
+ *            no lifted entry <pc>=<n> | img=<id> ...
+ * The numbers are the misses of the last second. The test vector of the
+ * counter is spu_miss_count_test.c. */
+#include "spu_interp.h"
+#include <stdio.h>
+#include <string.h>
+#ifdef _WIN32
+#include "../platform/win32_compat.h"
+#endif
+#define SPU_MISS_NO_ENTRY SPU_STOP_COUNT   /* target without a lifted entry */
+#define SPU_MISS_CAUSES (SPU_STOP_COUNT + 1)
+#define SPU_MISS_IMAGES 8
+#define SPU_MISS_PCS 16
+#define SPU_MISS_PERIOD_MS 1000
+typedef struct {
+    int image;
+    unsigned long long cause[SPU_MISS_CAUSES];   /* indexed by stop reason */
+    struct { uint32_t pc; unsigned long long n; } entry[SPU_MISS_PCS];
+    int nentry;
+} spu_miss_image;
+typedef struct {
+    spu_miss_image image[SPU_MISS_IMAGES];
+    int nimage;
+    unsigned long long last_ms;   /* time of the last line; the first miss prints at once */
+    int started;
+} spu_miss_state;
+SPU_GATE SPU_THREAD_LOCAL spu_miss_state g_spu_miss;
+SPU_GATE SPU_THREAD_LOCAL int g_spu_miss_log = -1;  /* SPU_NATIVE_OWNED_MISS_LOG, then 0/1 */
+SPU_GATE long g_spu_miss_lanes;
+
+static __attribute__((noinline, cold)) int spu_miss_log_init(void)
+{
+    const char* e = getenv("SPU_NATIVE_OWNED_MISS_LOG");
+    g_spu_miss_log = (e && *e && strcmp(e, "0")) ? 1 : 0;
+    return g_spu_miss_log;
+}
+static inline int spu_miss_log_on(void) {
+    return __builtin_expect(g_spu_miss_log >= 0, 1) ? g_spu_miss_log : spu_miss_log_init();
+}
+
+/* The lane index: 0, 1, 2 ... in the order in which the lanes count a miss. */
+static __attribute__((noinline, cold)) int spu_miss_lane(void)
+{
+#ifdef _WIN32
+    return InterlockedIncrement(&g_spu_miss_lanes) - 1;
+#else
+    return __atomic_add_fetch(&g_spu_miss_lanes, 1, __ATOMIC_RELAXED) - 1;
+#endif
+}
+static inline unsigned long long spu_miss_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+}
+static const char* const spu_miss_stop_names[SPU_STOP_COUNT] = {
+    "", "no image", "no ls", "pc range", "pc unaligned", "irq frame", "irq saved",
+    "interrupt pending", "ls watch", "ls lowread", "smc watch", "observed",
+    "no code owner", "owner image differs", "owner range", "policy svc refused"
+};
+/* The counters start at zero. The image ids and the pc table stay. */
+static inline void spu_miss_image_reset(spu_miss_image* im)
+{
+    memset(im->cause, 0, sizeof im->cause);
+    for (int e = 0; e < im->nentry; ++e) im->entry[e].n = 0;
+}
+static inline int spu_miss_slot(spu_miss_state* s, int image)
+{
+    for (int i = 0; i < s->nimage; ++i) if (s->image[i].image == image) return i;
+    if (s->nimage >= SPU_MISS_IMAGES) return SPU_MISS_IMAGES - 1;  /* the last slot overflows */
+    s->image[s->nimage].image = image;
+    return s->nimage++;
+}
+
+/* One miss: cause is a stop reason of the gate, or SPU_MISS_NO_ENTRY for a
+ * target that has no lifted entry. now_ms is a monotonic time in ms. When
+ * SPU_MISS_PERIOD_MS passed since the last line, the line is written and the
+ * counters start at zero. The line goes to line (SPU_MISS_LINE bytes).
+ * Returns 1 when a line was written. */
+#define SPU_MISS_LINE 12288
+static __attribute__((noinline)) int spu_miss_count(spu_miss_state* s, int lane, int image,
+                                                    int cause, uint32_t pc, unsigned long long now_ms,
+                                                    char* line)
+{
+    spu_miss_image* im = &s->image[spu_miss_slot(s, image)];
+    if (cause == SPU_MISS_NO_ENTRY) {
+        int e;
+        for (e = 0; e < im->nentry && im->entry[e].pc != pc; ++e) {}
+        if (e == im->nentry && e < SPU_MISS_PCS) { im->entry[e].pc = pc; im->nentry = e + 1; }
+        if (e >= SPU_MISS_PCS) { e = SPU_MISS_PCS - 1; im->entry[e].pc = 0xFFFFFFFFu; }
+        ++im->entry[e].n;
+    } else {
+        ++im->cause[cause < SPU_STOP_COUNT ? cause : 0];
+    }
+    if (!s->started) { s->started = 1; s->last_ms = now_ms - SPU_MISS_PERIOD_MS; }
+    if (now_ms - s->last_ms < SPU_MISS_PERIOD_MS) return 0;
+    s->last_ms = now_ms;
+    int n = 0, printed = 0;
+    n += snprintf(line + n, (size_t)SPU_MISS_LINE - n, "[spu-miss] lane=%d", lane);
+    for (int i = 0; i < s->nimage; ++i) {
+        const spu_miss_image* m = &s->image[i];
+        unsigned long long sum = 0;
+        for (int c = 0; c < SPU_MISS_CAUSES; ++c) sum += m->cause[c];
+        for (int e = 0; e < m->nentry; ++e) sum += m->entry[e].n;
+        if (!sum) continue;   /* an image without a miss in this second prints nothing */
+        const int first = !printed; printed = 1;
+        n += snprintf(line + n, (size_t)SPU_MISS_LINE - n, "%s img=%d", first ? "" : " |", m->image);
+        for (int c = 1; c < SPU_STOP_COUNT; ++c)
+            if (m->cause[c])
+                n += snprintf(line + n, (size_t)SPU_MISS_LINE - n, " gate stop %s=%llu",
+                              spu_miss_stop_names[c], m->cause[c]);
+        for (int e = 0; e < m->nentry; ++e)
+            if (m->entry[e].n)
+                n += snprintf(line + n, (size_t)SPU_MISS_LINE - n, " no lifted entry 0x%05X=%llu",
+                              m->entry[e].pc, m->entry[e].n);
+    }
+    if (n > 0 && (size_t)n >= SPU_MISS_LINE) n = sizeof line - 1;
+    line[n] = 0;
+    for (int i = 0; i < SPU_MISS_IMAGES; ++i) spu_miss_image_reset(&s->image[i]);
+    return 1;
+}
+
+static inline void spu_miss_reset(void) { g_spu_miss = (spu_miss_state){0}; }
+
+/* 0: the lifted code of an owned context may run. Else the dispatch goes to
+ * the interpreter, and the value says why. */
+static inline int spu_native_owned_miss(const spu_context* ctx)
+{
+    if (!spu_native_owned_can_run(ctx,ctx->pc)) return spu_native_owned_stop_reason(ctx,ctx->pc);
+    return spu_lifted_lookup(ctx,ctx->pc) ? 0 : SPU_MISS_NO_ENTRY;
+}
+/* The call of the dispatch site, on the miss path only. */
+static inline void spu_miss_hit(spu_context* ctx, int cause)
+{
+    if (__builtin_expect(spu_miss_log_on(), 0))
+    {
+        char line[SPU_MISS_LINE];
+        if (spu_miss_count(&g_spu_miss, spu_miss_lane(), ctx->image_id, cause, ctx->pc, spu_miss_ms(), line))
+            fprintf(stderr, "%s\n", line);
+    }
+}
 #ifdef __cplusplus
 }
 #endif
