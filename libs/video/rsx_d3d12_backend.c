@@ -8531,7 +8531,9 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
             }
             cached_state[set] = (u8)((bits & 3u) | ((way ^ 1u) << 2));
             const double started = s_vertex_profile_enabled ? perf_now() : 0.0;
-            memcpy(&out[o*16], cached_vertices[set][way], sizeof cached_vertices[set][way]);
+            /* Sixteen float4 as plain assignments: one 16-byte load and one 16-byte store
+             * each. The CRT call of the old copy is gone from this inner loop. */
+            for (u32 i = 0; i < 16; i++) out[o*16 + i] = cached_vertices[set][way][i];
             if (s_vertex_profile_enabled) {
                 s_vertex_profile.copy_bytes += sizeof cached_vertices[set][way];
                 s_vertex_profile.copy_seconds += perf_now() - started;
