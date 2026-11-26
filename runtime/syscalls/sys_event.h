@@ -119,6 +119,11 @@ typedef struct sys_event_flag_info {
     pthread_cond_t  cv;
 #endif
 
+    /* Set by sys_event_flag_cancel: waiters return CELL_ECANCELED instead of
+     * re-blocking on a flag that will never be satisfied the normal way.
+     * Cleared when the slot is re-created (create() memsets the struct). */
+    int          cancelled;
+
 } sys_event_flag_info;
 
 extern sys_event_flag_info g_sys_event_flags[SYS_EVENT_FLAG_MAX];
@@ -146,6 +151,8 @@ int64_t sys_event_flag_wait(ppu_context* ctx);
 int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);
 int64_t sys_event_flag_clear(ppu_context* ctx);
+/* r3 = flag_id. PS3 semantics: wake every waiter with CELL_ECANCELED. */
+int64_t sys_event_flag_cancel(ppu_context* ctx);
 int64_t sys_event_flag_get(ppu_context* ctx);
 
 /* Registration */

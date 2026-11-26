@@ -204,3 +204,22 @@ s32 cellKey2CharGetMode(CellKey2CharHandle handle, s32* mode)
     vm_write32((u32)(uintptr_t)mode, (u32)s_contexts[handle].mode);
     return CELL_OK;
 }
+
+/* cellKey2CharGetChar (NID 0x56776C0D): callback-style convert used by the
+ * OSK path. r3 is a guest pointer to the handle slot this library handed
+ * out, r5 a pointer to the char buffer, r6 to the char count, r7 to the
+ * "processed" byte. No composition engine runs here, so report "handled,
+ * no characters" -- a valid, empty conversion rather than an error. */
+s32 cellKey2CharGetChar(u32* handle, void* kdata, u16* charCode,
+                        u32* charNum, u8* processed)
+{
+    (void)kdata;
+    (void)charCode;
+    if (!handle)
+        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
+    if (!charNum || !processed)
+        return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
+    vm_write32((u32)(uintptr_t)charNum, 0);
+    vm_write8 ((u32)(uintptr_t)processed, 1);
+    return CELL_OK;
+}

@@ -38,6 +38,22 @@ int edat_is_npd(const char* host_path);
 /* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged). */
 int edat_decrypt_file(const char* in_path, const char* out_path);
 
+/* RPCS3 Crypto/unedat.cpp validate_dev_klic, exposed: for license type 3 the
+ * NPD dev_hash must equal AES-CMAC(klic ^ NP_OMAC_KEY_2) over the header's
+ * first 0x60 bytes. This is what PROVES a supplied klicensee is the file's
+ * real key before any data is trusted. Returns 1 PASS, 0 FAIL, -1 not NPD. */
+int edat_validate_dev_klic(const char* host_path, const uint8_t klic[16]);
+
+/* edat_decrypt_file with an explicit klicensee -- the one the guest handed
+ * cellFsSdataOpen through its arg/size pair (MotorStorm's pack EDATs are
+ * license type 3: the klicensee IS the file key). The klic is never taken on
+ * trust: it must PASS edat_validate_dev_klic (logged PASS/FAIL either way)
+ * before it keys the blocks; on FAIL the built-in chain (known klicensees,
+ * then the env/.rifkey RIF key) runs exactly as before. klic==NULL degrades
+ * to plain edat_decrypt_file. */
+int edat_decrypt_file_klic(const char* in_path, const char* out_path,
+                           const uint8_t klic[16], const char* klic_source);
+
 /* The path the FS layer should actually open for `host_path`.
  *
  * Returns host_path unchanged when it is not an EDAT, or when decryption fails (the
@@ -47,15 +63,23 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap);
 
-/* Hand the runtime a klicensee the guest supplied. On hardware a game that owns
- * free (license type 3) or disc-bound EDATs passes its own klicensee to
- * sceNpDrmIsAvailable / sceNpDrmIsAvailable2 before opening them; the kernel keeps
- * it and decrypts later opens with it. These keys are title-specific and live in
- * the game's code, so a runtime cannot carry them: it has to take them from the
- * guest call. Registered keys are tried before the built-in ones, and each one is
- * still checked against the file's dev_hash before use. Up to 16 are kept (a
- * duplicate is ignored). */
-void edat_add_klicensee(const uint8_t klic[16]);
+/* edat_resolve with the guest klicensee: same "<name>.dec" cache, but the
+ * decrypt is keyed by `klic` after validation. klic==NULL -> edat_resolve,
+ * i.e. the env-key-only path cellFsOpen keeps. */
+const char* edat_resolve_klic(const char* host_path, char* buf, size_t cap,
+                              const uint8_t klic[16], const char* klic_source);
+
+/* Hand the guest's klicensee to the resolver: sceNpDrmIsAvailable receives
+ * it (firmware ABI: r4 points at the 16 bytes) long before any file is
+ * opened, and the plain cellFsOpen door has no klic argument of its own.
+ * Once noted, edat_resolve picks it up and runs it through the SAME
+ * validated chain -- it must still PASS edat_validate_dev_klic for each
+ * file (PASS/FAIL logged) before it keys anything. */
+void edat_note_guest_klic(const uint8_t klic[16]);
+
+/* Copy the noted klicensee into out[16]. Returns 1 with the bytes, 0 if
+ * none was noted. */
+int edat_get_guest_klic(uint8_t out[16]);
 
 /* Self-check of the AES-128 and AES-CMAC primitives against the FIPS-197 and
  * RFC 4493 vectors. Returns 0 if both match. Run once on first use: silently

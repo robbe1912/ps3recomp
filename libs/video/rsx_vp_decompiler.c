@@ -64,6 +64,7 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes)
     return 0;
 }
 
+
 /* ---- output appender --------------------------------------------------- */
 typedef struct { char* p; u32 cap; u32 len; int overflow; } Out;
 static void emit(Out* o, const char* s)
@@ -150,6 +151,55 @@ static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
 {
     const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
     return t >= s_vp_branch_base ? t - s_vp_branch_base : t;
+}
+
+u32 rsx_vp_program_extent_instrs(const u8* ucode, u32 max_bytes, u32 start_slot)
+{
+    if (!ucode || max_bytes < 16u) return 0;
+    const u32 bound = max_bytes / 16u > RSX_VP_MAX_INSTR
+                    ? RSX_VP_MAX_INSTR : max_bytes / 16u;
+
+    /* Targets are absolute VP slots; decode them relative to the program
+     * entry exactly as the decompiler will, then restore the prior base. */
+    const u32 prev_base = s_vp_branch_base;
+    s_vp_branch_base = start_slot;
+
+    /* Depth-first reachability from instruction 0: a path walks linearly
+     * until D3.end; every BRA/BRI/CAL/CLI/BRB/CLB target starts another
+     * path. seen[] caps each target at one push pair, so the worklist is
+     * bounded by 2 * RSX_VP_MAX_INSTR entries. */
+    static u8 seen[RSX_VP_MAX_INSTR];
+    int wl[RSX_VP_MAX_INSTR * 2];
+    int sp = 0;
+    memset(seen, 0, bound);
+    wl[sp++] = 0;
+    u32 max_reach = 0;
+    while (sp > 0) {
+        int pc = wl[--sp];
+        while (pc >= 0 && (u32)pc < bound && !seen[pc]) {
+            seen[pc] = 1;
+            if ((u32)pc > max_reach) max_reach = (u32)pc;
+            const u32 d0 = rd_le(ucode + (u32)pc * 16u + 0);
+            const u32 d1 = rd_le(ucode + (u32)pc * 16u + 4);
+            const u32 d2 = rd_le(ucode + (u32)pc * 16u + 8);
+            const u32 d3 = rd_le(ucode + (u32)pc * 16u + 12);
+            if (vp_is_flow((d1 >> 27) & 0x1Fu)) {
+                const u32 t = vp_branch_target(d0, d2, d3);
+                if (t < bound && !seen[t] && sp < (int)(sizeof wl / sizeof wl[0]))
+                    wl[sp++] = (int)t;
+            }
+            if (d3 & 1u) break;   /* D3.end stops this path */
+            pc++;
+        }
+    }
+    s_vp_branch_base = prev_base;
+
+    /* Include the linear first-end slice: a reachable target must lie inside
+     * it in a well-formed program, but widening never under-covers. */
+    const u32 first_end = rsx_vp_program_size_instrs(ucode, max_bytes);
+    u32 extent = max_reach + 1u;
+    if (first_end > extent) extent = first_end;
+    return extent > bound ? bound : extent;
 }
 
 /* Condition-code state for one instruction (D0). The NV40 VP has two CC
@@ -659,6 +709,20 @@ static int rsx_vp_decompile_impl(
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
+        /* Preserve signed homogeneous W. Negating the clip vector keeps
+         * NDC coordinates but changes the clip half-space, admitting
+         * behind-camera geometry and breaking mixed-sign primitives.
+         * Keep the existing viewport-Z boundary mapping separately. */
+        "    float _w = _p.w;\n"
+        "    float _s = vp_posscale.z;\n"
+        "    float _o = vp_posoffset.z;\n"
+        "    float _zm = _p.z * _s + _w * _o;\n"
+        "    if (_s != 0.0) {\n"
+        "        if (_zm < 0.0 && _zm >= _w * (_o - _s))\n"
+        "            _p.z = -_w * _o / _s;\n"
+        "        else if (_zm > _w && _zm <= _w * (_o + _s))\n"
+        "            _p.z = _w * (1.0 - _o) / _s;\n"
+        "    }\n"
         "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"

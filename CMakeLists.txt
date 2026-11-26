@@ -23,6 +23,9 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 option(PS3RECOMP_ATOMIC_OBSERVATION "Compile opt-in atomic commit probes" OFF)
 option(PS3RECOMP_EXECUTION_OBSERVATION "Compile opt-in SPU execution observations" OFF)
 option(PS3RECOMP_SPURS_SCHEDULER_OBSERVATION "Compile opt-in SPURS admission/worker observations" OFF)
+if(PS3RECOMP_BUILD_TESTS)
+    message(FATAL_ERROR "Unreviewed guest instruction fixtures are excluded from this source snapshot. Use upstream synthetic tests or the private local archive; see docs/VENDOR.md.")
+endif()
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -46,26 +49,6 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
-
-# The Vulkan RSX backend is opt-in and uses the shared guest draw engine.
-# It loads libvulkan at run time, so building needs only the Vulkan headers --
-# no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Windows/Linux)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
-if(PS3RECOMP_RSX_VULKAN)
-    if(APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not enabled on macOS yet")
-    endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
-    if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
-        message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
-            "libvulkan-dev, Fedora: vulkan-headers -- or pass "
-            "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
-    endif()
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
-    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
-endif()
 
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
 # rather than globbed. It needs no platform #ifdef of its own as a result.
@@ -183,36 +166,68 @@ if(APPLE)
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
-if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32)
-        find_package(SDL2 CONFIG REQUIRED)
-        target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
-    endif()
-    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
-    # PUBLIC: ps3recomp_host selects its backend on this definition.
-    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
-    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
-    message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+# ---------------------------------------------------------------------------
+# FFmpeg: libavcodec + libavutil + libswscale for cellVdec
+# ---------------------------------------------------------------------------
+# cellVdec decodes real MPEG-2/AVC through libavcodec; there is no stub. The
+# dependency is therefore mandatory: a configure without it stops here with
+# the exact thing that is missing, not with a runtime that silently plays
+# black video.
+#
+# PS3RECOMP_FFMPEG_ROOT points at an FFmpeg shared "development" tree:
+#   include/libavcodec/avcodec.h, include/libavutil/..., include/libswscale/...
+#   lib/avcodec.lib lib/avutil.lib libswscale.lib     (MSVC-style imports)
+#   lib/libavcodec.dll.a libavutil.dll.a ...          (GCC-style imports)
+#   bin/avcodec-*.dll avutil-*.dll swscale-*.dll      (needed at run time)
+# On Windows the import libraries and the DLLs must come from the same
+# package. System FFmpeg (Debian, Homebrew) works without the variable.
+set(PS3RECOMP_FFMPEG_ROOT "" CACHE PATH
+    "FFmpeg development root: include/ + lib/ (+ bin/ for the DLLs at run time)")
+if(PS3RECOMP_FFMPEG_ROOT)
+    set(FFMPEG_ROOT_HINT "${PS3RECOMP_FFMPEG_ROOT}")
 endif()
-
-# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
-# is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
-# only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
-# PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a
-# separate, user-supplied LGPL library. See libs/codec/ffmpeg_runtime.h.
-option(PS3RECOMP_FFMPEG_RUNTIME "Decode media through FFmpeg loaded at run time (needs the FFmpeg headers)" OFF)
-if(PS3RECOMP_FFMPEG_RUNTIME)
-    find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
-    if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
-        message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
-            "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
-            "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
-    endif()
-    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
-    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
-    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
-    message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
+find_path(FFMPEG_INCLUDE_DIR
+    NAMES libavcodec/avcodec.h
+    HINTS "${FFMPEG_ROOT_HINT}" ENV FFMPEG_ROOT
+    PATH_SUFFIXES include
+    DOC "FFmpeg headers (libavcodec/avcodec.h)")
+set(PS3RECOMP_FFMPEG_MISSING "")
+if(NOT FFMPEG_INCLUDE_DIR)
+    string(APPEND PS3RECOMP_FFMPEG_MISSING
+        "  headers: no libavcodec/avcodec.h under include/\n")
 endif()
+set(FFMPEG_LIBRARIES "")
+foreach(FFMPEG_COMP avcodec avutil swscale)
+    find_library(FFMPEG_${FFMPEG_COMP}_LIB
+        NAMES ${FFMPEG_COMP} lib${FFMPEG_COMP}
+        HINTS "${FFMPEG_ROOT_HINT}" ENV FFMPEG_ROOT
+        PATH_SUFFIXES lib
+        DOC "FFmpeg ${FFMPEG_COMP} library")
+    if(NOT FFMPEG_${FFMPEG_COMP}_LIB)
+        string(APPEND PS3RECOMP_FFMPEG_MISSING
+            "  library: no ${FFMPEG_COMP} import/static library under lib/\n")
+    else()
+        list(APPEND FFMPEG_LIBRARIES "${FFMPEG_${FFMPEG_COMP}_LIB}")
+    endif()
+endforeach()
+if(PS3RECOMP_FFMPEG_MISSING)
+    message(FATAL_ERROR
+        "FFmpeg not found, and cellVdec needs it (libavcodec/libavutil/"
+        "libswscale; no stub decoder exists).\n"
+        "${PS3RECOMP_FFMPEG_MISSING}"
+        "Pass the FFmpeg development root, e.g.\n"
+        "  cmake ... -DPS3RECOMP_FFMPEG_ROOT=E:/.../ffmpeg-n9.0-win64-lgpl-shared-9.0\n"
+        "(that root holds include/, lib/ and bin/avcodec-*.dll; the DLLs must "
+        "be next to the game exe or on PATH at run time).\n"
+        "On Debian/Ubuntu: apt install libavcodec-dev libavutil-dev "
+        "libswscale-dev.\nOn macOS: brew install ffmpeg.")
+endif()
+target_include_directories(ps3recomp_runtime PRIVATE "${FFMPEG_INCLUDE_DIR}")
+# PRIVATE on a STATIC library still lands on consumers' link lines (CMake
+# wraps it in $<LINK_ONLY:>), so ports that link ps3recomp_runtime get the
+# three FFmpeg libraries without doing anything.
+target_link_libraries(ps3recomp_runtime PRIVATE ${FFMPEG_LIBRARIES})
+message(STATUS "  FFmpeg:       ${FFMPEG_LIBRARIES}")
 
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
@@ -232,11 +247,9 @@ endif()
 #           the standalone binary as an imported target and fails to load
 #           without it)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
-if(UNIX OR PS3RECOMP_RSX_VULKAN)
-    find_package(glslang CONFIG QUIET)
-endif()
-
 if(UNIX)
+    find_package(glslang CONFIG QUIET)
+
     # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
     # a static one, under different pkg-config names -- and pkg-config itself
     # is not a given on a Mac, so fall back to a plain header + library search.
@@ -299,27 +312,6 @@ if(UNIX)
     endif()
 endif()
 
-# Guest shaders on Vulkan: HLSL -> SPIR-V. glslang only -- Vulkan consumes
-# SPIR-V, so spirv-cross is not needed. Without glslang
-# libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
-# its fixed-function path.
-if(PS3RECOMP_RSX_VULKAN)
-    if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
-        set_source_files_properties(
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
-            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
-        target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
-        if(TARGET glslang::glslang-default-resource-limits)
-            target_link_libraries(ps3recomp_runtime PRIVATE
-                glslang::glslang-default-resource-limits)
-        endif()
-        message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
-                       "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
-    else()
-        message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
-    endif()
-endif()
-
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
@@ -338,8 +330,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
+        # hottest SPU op in lifted audio code.
+        -msse4.1
     )
-    # Optional shuffle ISA is confined to the capability-checked helper.
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
     #
@@ -381,30 +375,6 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
-    if(UNIX AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-        find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
-        set(SPU_OWNED_OPTIONS "${CMAKE_CURRENT_BINARY_DIR}/spu_owned_options.c")
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_owned_options.py"
-                --output "${SPU_OWNED_OPTIONS}"
-            RESULT_VARIABLE SPU_OWNED_OPTIONS_RESULT)
-        if(NOT SPU_OWNED_OPTIONS_RESULT EQUAL 0)
-            message(FATAL_ERROR "Cannot extract production native-owned option readers")
-        endif()
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-            runtime/spu/spu_channels.c tools/spu_owned_options.py)
-        add_executable(test_spu_dispatch_checks runtime/spu/tests/test_dispatch_checks.c
-            runtime/diag/spu_execution_observer.c "${SPU_OWNED_OPTIONS}")
-        target_compile_definitions(test_spu_dispatch_checks PRIVATE PS3_EXECUTION_OBSERVATION=1)
-        target_include_directories(test_spu_dispatch_checks PRIVATE include runtime runtime/spu)
-        target_compile_options(test_spu_dispatch_checks PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
-        if(APPLE)
-            target_link_options(test_spu_dispatch_checks PRIVATE -Wl,-dead_strip)
-        else()
-            target_link_options(test_spu_dispatch_checks PRIVATE -Wl,--gc-sections)
-        endif()
-        add_test(NAME spu_dispatch_checks COMMAND test_spu_dispatch_checks)
-    endif()
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so
@@ -416,45 +386,17 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
-    # cellVdec through its guest API: the callback-only decoder always, and
-    # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
-    add_subdirectory(libs/codec/tests)
-    # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
-    # each report DMA context. Links the runtime like the POSIX host below.
-    if(UNIX)
-        add_subdirectory(tests/gcm_reports)
-    endif()
-
-    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME spurs_task_exit_code_initialize
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
-        add_test(NAME spurs_taskset_size
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_taskset_size.py")
-        add_test(NAME spu_sdcrz
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
-    endif()
-    if(NOT WIN32)
-        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
-        if(Python3_Interpreter_FOUND)
-            add_test(NAME spu_fnms_zero_extended
-                COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
-        endif()
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------
-# Backend host harness
+# POSIX host harness
 # ---------------------------------------------------------------------------
 # Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
 # can be brought up and regression-tested without a game binary or a recompiler
-# run. Uses Metal on Apple, opt-in Vulkan on Windows/Linux, or the headless
-# null contract where no graphics backend is selected.
-if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
+# run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
+# headless software path everywhere else, so Linux -- which has no real backend
+# yet -- can still run the whole guest command stream end to end in CI.
+if(UNIX)
     add_executable(ps3recomp_host
         runtime/host/host_posix.c
         runtime/host/host_stubs.c
@@ -471,11 +413,6 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
     # The runtime carries C++ (and, with translation on, spirv-cross), so the
     # C++ driver must do the final link or the standard library goes missing.
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
-    if(WIN32 AND PS3RECOMP_RSX_VULKAN)
-        add_custom_command(TARGET ps3recomp_host POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "$<TARGET_FILE:SDL2::SDL2>" "$<TARGET_FILE_DIR:ps3recomp_host>")
-    endif()
 
     # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
     # regression net for the Metal backend's shader path on every platform.
@@ -543,7 +480,6 @@ if(UNIX)
             runtime/ppu/tests/boot_main.cpp
             runtime/ppu/tests/smoke/smoke_recomp.c
             runtime/ppu/ppu_loader.cpp
-            runtime/memory/guest_read_sync.c
             runtime/ppu/ppu_hle.cpp
             runtime/ppu/ppu_fs.cpp
             runtime/ppu/ppu_sysprx.cpp
@@ -616,259 +552,3 @@ message(STATUS "  C compiler:   ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSIO
 message(STATUS "  C++ compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Build type:   ${CMAKE_BUILD_TYPE}")
 message(STATUS "")
-
-# Authored device pixels exercise actual HLE accessors and row conversion.
-if(PS3RECOMP_BUILD_TESTS OR BUILD_TESTING)
-    enable_testing()
-    add_executable(test_gcm_draw_trace tests/test_gcm_draw_trace.c)
-    target_include_directories(test_gcm_draw_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-    if(MSVC)
-        target_compile_definitions(test_gcm_draw_trace PRIVATE _CRT_SECURE_NO_WARNINGS)
-    endif()
-    add_test(NAME gcm_draw_trace
-        COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:test_gcm_draw_trace>"
-                "-DWORK=${CMAKE_CURRENT_BINARY_DIR}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_gcm_draw_trace.cmake.in")
-    add_executable(test_rsx_record_batch tests/test_rsx_record_batch.c)
-    add_test(NAME rsx_record_batch COMMAND test_rsx_record_batch)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME rsx_triangle_capacity COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_triangle_capacity.py" --cc "${CMAKE_C_COMPILER}")
-    set_tests_properties(rsx_triangle_capacity PROPERTIES TIMEOUT 180)
-    add_executable(test_rsx_texture_remap tests/test_rsx_texture_remap.c
-        libs/video/rsx_texture_layout.c)
-    target_include_directories(test_rsx_texture_remap PRIVATE include libs/video)
-    add_test(NAME rsx_texture_remap COMMAND test_rsx_texture_remap)
-    add_executable(test_rsx_timeline_select tests/test_rsx_timeline_select.c)
-    target_include_directories(test_rsx_timeline_select PRIVATE libs/video)
-    add_test(NAME rsx_timeline_select COMMAND test_rsx_timeline_select)
-    add_executable(test_rsx_mrt_masks tests/test_rsx_mrt_masks.c libs/video/rsx_commands.c)
-    target_include_directories(test_rsx_mrt_masks PRIVATE include libs/video)
-    add_test(NAME rsx_mrt_masks COMMAND test_rsx_mrt_masks)
-    add_executable(test_rsx_mrt_observer tests/test_rsx_mrt_observer.c)
-    target_include_directories(test_rsx_mrt_observer PRIVATE libs/video)
-    add_test(NAME rsx_mrt_observer COMMAND test_rsx_mrt_observer)
-    if(WIN32)
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        if(PS3RECOMP_RSX_VULKAN AND NOT glslang_FOUND)
-            add_test(NAME rsx_vulkan_translation_required
-                COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_vulkan_host.py"
-                    "$<TARGET_FILE:ps3recomp_host>" --missing-translation
-                    --output "${CMAKE_CURRENT_BINARY_DIR}/vulkan-unavailable-check")
-            set_tests_properties(rsx_vulkan_translation_required PROPERTIES TIMEOUT 60)
-        endif()
-        add_executable(test_rsx_mrt_masks_gpu tests/rsx_mrt_masks_gpu.cpp)
-        target_include_directories(test_rsx_mrt_masks_gpu PRIVATE libs/video)
-        target_link_libraries(test_rsx_mrt_masks_gpu PRIVATE d3d12 dxgi d3dcompiler)
-        add_test(NAME rsx_mrt_masks_gpu COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_mrt_masks.py" "$<TARGET_FILE:test_rsx_mrt_masks_gpu>")
-        set_tests_properties(rsx_mrt_masks_gpu PROPERTIES TIMEOUT 90)
-
-        add_executable(test_rsx_fp_pack_gpu tests/rsx_fp_pack_gpu.cpp
-            libs/video/rsx_fp_decompiler.c)
-        target_include_directories(test_rsx_fp_pack_gpu PRIVATE include libs/video)
-        target_compile_features(test_rsx_fp_pack_gpu PRIVATE cxx_std_17)
-        target_link_libraries(test_rsx_fp_pack_gpu PRIVATE d3d11 d3dcompiler)
-        add_test(NAME rsx_fp_pack COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_fp_pack.py" "$<TARGET_FILE:test_rsx_fp_pack_gpu>")
-        set_tests_properties(rsx_fp_pack PROPERTIES TIMEOUT 180)
-
-        add_executable(test_rsx_fp_source_sign_gpu tests/rsx_fp_source_sign_gpu.cpp
-            libs/video/rsx_fp_decompiler.c)
-        target_include_directories(test_rsx_fp_source_sign_gpu PRIVATE include libs/video)
-        target_compile_features(test_rsx_fp_source_sign_gpu PRIVATE cxx_std_17)
-        target_link_libraries(test_rsx_fp_source_sign_gpu PRIVATE d3d11 d3dcompiler)
-        add_test(NAME rsx_fp_source_sign COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_fp_source_sign.py" "$<TARGET_FILE:test_rsx_fp_source_sign_gpu>")
-        set_tests_properties(rsx_fp_source_sign PROPERTIES TIMEOUT 180)
-
-        add_executable(test_rsx_depth_surfaces_gpu tests/rsx_depth_surfaces_gpu.c
-            libs/video/rsx_commands.c)
-        target_include_directories(test_rsx_depth_surfaces_gpu PRIVATE include libs/video)
-        target_link_libraries(test_rsx_depth_surfaces_gpu PRIVATE d3d12 dxgi dxguid d3dcompiler)
-        add_test(NAME rsx_depth_required COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_depth_required.py" "$<TARGET_FILE:test_rsx_depth_surfaces_gpu>")
-        set_tests_properties(rsx_depth_required PROPERTIES TIMEOUT 180)
-
-        add_executable(test_rsx_surface_readback_gpu tests/rsx_surface_readback_gpu.cpp)
-        target_include_directories(test_rsx_surface_readback_gpu PRIVATE libs/video)
-        target_link_libraries(test_rsx_surface_readback_gpu PRIVATE d3d12 dxgi dxguid)
-        add_test(NAME rsx_surface_readback_gpu COMMAND test_rsx_surface_readback_gpu)
-        set_tests_properties(rsx_surface_readback_gpu PROPERTIES TIMEOUT 45)
-
-        add_executable(test_rsx_depth_alias_gpu tests/rsx_depth_alias_gpu.c)
-        target_include_directories(test_rsx_depth_alias_gpu PRIVATE libs/video)
-        target_link_libraries(test_rsx_depth_alias_gpu PRIVATE d3d12 dxgi dxguid d3dcompiler)
-        add_test(NAME rsx_depth_alias COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_depth_alias.py" "$<TARGET_FILE:test_rsx_depth_alias_gpu>")
-        set_tests_properties(rsx_depth_alias PROPERTIES TIMEOUT 180)
-
-        add_executable(test_rsx_address_gpu tests/rsx_address_d3d12_gpu.cpp)
-        target_include_directories(test_rsx_address_gpu PRIVATE libs/video)
-        target_link_libraries(test_rsx_address_gpu PRIVATE d3d12 dxgi d3dcompiler)
-        add_executable(test_rsx_address_tables tests/rsx_address_tables_test.c)
-        target_include_directories(test_rsx_address_tables PRIVATE libs/video)
-        target_link_libraries(test_rsx_address_tables PRIVATE dxguid)
-        add_test(NAME rsx_address COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_address.py"
-            "$<TARGET_FILE:test_rsx_address_gpu>" "$<TARGET_FILE:test_rsx_address_tables>")
-        set_tests_properties(rsx_address PROPERTIES TIMEOUT 300)
-    endif()
-    if(WIN32)
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c")
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c" _pad_source)
-        string(REPLACE "if (pad_file_applied && data->len > 0) --held_n;" "if (pad_file_applied) --held_n;" _pad_legacy "${_pad_source}")
-        if(_pad_source STREQUAL _pad_legacy)
-            message(FATAL_ERROR "PAD_FILE control no longer mutates the report-count guard")
-        endif()
-        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pad_file_legacy.c" "${_pad_legacy}")
-        foreach(_variant normal legacy)
-            add_executable(test_pad_file_${_variant} tests/pad_file_reports.c)
-            target_include_directories(test_pad_file_${_variant} PRIVATE include libs/input)
-            target_compile_definitions(test_pad_file_${_variant} PRIVATE _CRT_SECURE_NO_WARNINGS)
-            if(MSVC)
-                target_compile_options(test_pad_file_${_variant} PRIVATE /Gy)
-                target_link_options(test_pad_file_${_variant} PRIVATE /OPT:REF)
-            endif()
-            target_link_libraries(test_pad_file_${_variant} PRIVATE user32 xinput)
-        endforeach()
-        target_compile_definitions(test_pad_file_legacy PRIVATE PAD_IMPLEMENTATION="${CMAKE_CURRENT_BINARY_DIR}/pad_file_legacy.c")
-        add_test(NAME pad_file_reports COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_pad_file_reports.py" "$<TARGET_FILE:test_pad_file_normal>" "$<TARGET_FILE:test_pad_file_legacy>")
-        set_tests_properties(pad_file_reports PROPERTIES TIMEOUT 40)
-    endif()
-    add_test(NAME ppu_inline_read_sync COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_inline_read_sync.py"
-        --compiler "${CMAKE_C_COMPILER}")
-    set_tests_properties(ppu_inline_read_sync PROPERTIES TIMEOUT 90)
-
-    foreach(_shuffle_variant IN ITEMS dispatch scalar)
-        add_executable(test_spu_shufb_${_shuffle_variant} runtime/spu/tests/test_spu_shufb_dispatch.c)
-        target_include_directories(test_spu_shufb_${_shuffle_variant} PRIVATE runtime/spu)
-        add_test(NAME spu_shufb_${_shuffle_variant} COMMAND test_spu_shufb_${_shuffle_variant})
-        set_tests_properties(spu_shufb_${_shuffle_variant} PROPERTIES TIMEOUT 40)
-    endforeach()
-    target_compile_definitions(test_spu_shufb_scalar PRIVATE SPU_SHUFB_FORCE_SCALAR)
-    add_executable(test_spu_float_simd runtime/spu/tests/test_spu_float_simd.c runtime/spu/spu_float_simd.c)
-    target_include_directories(test_spu_float_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu)
-    if(NOT WIN32)
-        target_link_libraries(test_spu_float_simd PRIVATE m)
-    endif()
-    add_test(NAME spu_float_simd COMMAND $<TARGET_FILE:test_spu_float_simd>)
-    set_tests_properties(spu_float_simd PROPERTIES TIMEOUT 40)
-
-    add_executable(test_spu_mfc_registry runtime/spu/tests/test_spu_mfc_registry.c
-        runtime/platform/win32_compat.c)
-    target_include_directories(test_spu_mfc_registry PRIVATE runtime/spu runtime/platform)
-    if(NOT WIN32)
-        target_link_libraries(test_spu_mfc_registry PRIVATE pthread)
-    endif()
-    add_test(NAME spu_mfc_registry COMMAND test_spu_mfc_registry)
-    set_tests_properties(spu_mfc_registry PROPERTIES TIMEOUT 30)
-
-    add_executable(test_rsx_pipeline_cache tests/rsx_pipeline_cache.c)
-    target_include_directories(test_rsx_pipeline_cache PRIVATE libs/video)
-    add_test(NAME rsx_pipeline_cache COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_pipeline_cache.py" "$<TARGET_FILE:test_rsx_pipeline_cache>")
-    set_tests_properties(rsx_pipeline_cache PROPERTIES TIMEOUT 40)
-    add_executable(test_rsx_slot_pool tests/rsx_slot_pool.c)
-    target_include_directories(test_rsx_slot_pool PRIVATE libs/video)
-    add_test(NAME rsx_slot_pool COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_slot_pool.py" "$<TARGET_FILE:test_rsx_slot_pool>")
-    set_tests_properties(rsx_slot_pool PROPERTIES TIMEOUT 45)
-    if(WIN32)
-        add_executable(test_rsx_slot_pool_gpu tests/rsx_slot_pool_gpu.cpp)
-        target_include_directories(test_rsx_slot_pool_gpu PRIVATE libs/video)
-        target_compile_features(test_rsx_slot_pool_gpu PRIVATE cxx_std_17)
-        target_link_libraries(test_rsx_slot_pool_gpu PRIVATE d3d11 d3dcompiler)
-        add_test(NAME rsx_slot_pool_gpu COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_slot_pool_gpu.py" "$<TARGET_FILE:test_rsx_slot_pool_gpu>")
-        set_tests_properties(rsx_slot_pool_gpu PROPERTIES TIMEOUT 180)
-    endif()
-    if(WIN32)
-        add_test(NAME rsx_shader_pipeline COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_shader_pipeline.py" --cc "${CMAKE_C_COMPILER}")
-        set_tests_properties(rsx_shader_pipeline PROPERTIES TIMEOUT 240)
-    endif()
-    add_executable(test_rsx_shader_cache tests/rsx_shader_cache.c)
-    target_include_directories(test_rsx_shader_cache PRIVATE libs/video)
-    add_test(NAME rsx_shader_cache COMMAND test_rsx_shader_cache)
-    set_tests_properties(rsx_shader_cache PROPERTIES TIMEOUT 15)
-    if(WIN32)
-        add_executable(test_rsx_shader_cache_gpu tests/rsx_shader_cache_gpu.cpp)
-        target_include_directories(test_rsx_shader_cache_gpu PRIVATE libs/video)
-        target_compile_features(test_rsx_shader_cache_gpu PRIVATE cxx_std_17)
-        target_link_libraries(test_rsx_shader_cache_gpu PRIVATE d3d11 d3dcompiler)
-        add_test(NAME rsx_shader_cache_gpu COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_shader_cache_gpu.py" "$<TARGET_FILE:test_rsx_shader_cache_gpu>")
-        set_tests_properties(rsx_shader_cache_gpu PROPERTIES TIMEOUT 180)
-    endif()
-    add_executable(test_rsx_gpu_references tests/rsx_gpu_references.c)
-    target_include_directories(test_rsx_gpu_references PRIVATE libs/video)
-    add_test(NAME rsx_gpu_references COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_gpu_references.py" "$<TARGET_FILE:test_rsx_gpu_references>")
-    set_tests_properties(rsx_gpu_references PROPERTIES TIMEOUT 45)
-    if(WIN32)
-        add_executable(test_rsx_gpu_pso_gpu tests/rsx_gpu_pso_gpu.cpp)
-        target_include_directories(test_rsx_gpu_pso_gpu PRIVATE libs/video)
-        target_compile_features(test_rsx_gpu_pso_gpu PRIVATE cxx_std_17)
-        target_link_libraries(test_rsx_gpu_pso_gpu PRIVATE d3d12 dxgi d3dcompiler)
-        add_test(NAME rsx_gpu_pso COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_gpu_pso.py" "$<TARGET_FILE:test_rsx_gpu_pso_gpu>")
-        set_tests_properties(rsx_gpu_pso PROPERTIES TIMEOUT 100)
-    endif()
-    add_executable(test_rsx_gpu_submission tests/rsx_gpu_submission.c)
-    target_include_directories(test_rsx_gpu_submission PRIVATE libs/video)
-    add_test(NAME rsx_gpu_submission COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_rsx_gpu_submission.py" "$<TARGET_FILE:test_rsx_gpu_submission>")
-    set_tests_properties(rsx_gpu_submission PROPERTIES TIMEOUT 45)
-
-    add_executable(test_rsx_fp_decompiler libs/video/tests/test_fp_decompiler.c
-        libs/video/rsx_fp_decompiler.c)
-    target_include_directories(test_rsx_fp_decompiler PRIVATE include libs/video)
-    add_test(NAME rsx_fp_decompiler COMMAND test_rsx_fp_decompiler)
-    add_executable(test_rsx_upload_buffer tests/test_rsx_upload_buffer.c)
-    add_test(NAME rsx_upload_buffer COMMAND test_rsx_upload_buffer)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_d3d12_backend.c" RSX_UPLOAD_SOURCE)
-    string(REPLACE "\r\n" "\n" RSX_UPLOAD_SOURCE "${RSX_UPLOAD_SOURCE}")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS libs/video/rsx_d3d12_backend.c)
-    string(FIND "${RSX_UPLOAD_SOURCE}" "static u32 upload_strip_vp(" RSX_UPLOAD_START)
-    string(FIND "${RSX_UPLOAD_SOURCE}" "/* Fetch index k" RSX_UPLOAD_END)
-    if(RSX_UPLOAD_START LESS 0 OR RSX_UPLOAD_END LESS RSX_UPLOAD_START)
-        message(FATAL_ERROR "Cannot extract production VP strip upload regression seam")
-    endif()
-    math(EXPR RSX_UPLOAD_LENGTH "${RSX_UPLOAD_END} - ${RSX_UPLOAD_START}")
-    string(SUBSTRING "${RSX_UPLOAD_SOURCE}" ${RSX_UPLOAD_START} ${RSX_UPLOAD_LENGTH} UPLOAD_STRIP_FUNCTION)
-    configure_file(tests/test_rsx_upload_strip.c.in test_rsx_upload_strip.c @ONLY)
-    add_executable(test_rsx_upload_strip "${CMAKE_CURRENT_BINARY_DIR}/test_rsx_upload_strip.c")
-    target_include_directories(test_rsx_upload_strip PRIVATE include libs/video)
-    add_test(NAME rsx_upload_strip COMMAND test_rsx_upload_strip)
-    string(FIND "${RSX_UPLOAD_SOURCE}" "static u32 upload_strip_vp_indexed(" RSX_INDEXED_START)
-    if(RSX_INDEXED_START LESS 0)
-        message(FATAL_ERROR "Cannot locate production indexed strip upload")
-    endif()
-    string(SUBSTRING "${RSX_UPLOAD_SOURCE}" ${RSX_INDEXED_START} -1 RSX_INDEXED_SOURCE)
-    string(FIND "${RSX_INDEXED_SOURCE}" "\n}\n" RSX_INDEXED_END)
-    if(RSX_INDEXED_END LESS 0)
-        message(FATAL_ERROR "Cannot locate end of production indexed strip upload")
-    endif()
-    math(EXPR RSX_INDEXED_LENGTH "${RSX_INDEXED_END} + 2")
-    string(SUBSTRING "${RSX_INDEXED_SOURCE}" 0 ${RSX_INDEXED_LENGTH} INDEXED_STRIP_FUNCTION)
-    configure_file(tests/test_rsx_indexed_strip.c.in test_rsx_indexed_strip.c @ONLY)
-    add_executable(test_rsx_indexed_strip "${CMAKE_CURRENT_BINARY_DIR}/test_rsx_indexed_strip.c" libs/video/rsx_vertex_fetch.c)
-    target_include_directories(test_rsx_indexed_strip PRIVATE include libs/video)
-    add_test(NAME rsx_indexed_strip COMMAND test_rsx_indexed_strip)
-    add_executable(test_memory_container tests/test_memory_container.c)
-    if(NOT WIN32)
-        find_package(Threads REQUIRED)
-        target_link_libraries(test_memory_container PRIVATE Threads::Threads)
-    endif()
-    add_test(NAME memory_container_allocation COMMAND test_memory_container)
-    add_executable(test_cpu_surface_hle tests/test_cpu_surface_hle.c runtime/memory/guest_read_sync.c)
-    target_include_directories(test_cpu_surface_hle PRIVATE include libs/video runtime/ppu)
-    add_test(NAME cpu_surface_hle COMMAND test_cpu_surface_hle)
-endif()
-
-add_executable(test_rsx_capture_schedule tests/rsx_capture_schedule.c)
-target_include_directories(test_rsx_capture_schedule PRIVATE libs/video)
-add_test(NAME rsx_capture_schedule COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_SOURCE_DIR}/tests/check_rsx_capture_schedule.py $<TARGET_FILE:test_rsx_capture_schedule>)
-set_tests_properties(rsx_capture_schedule PROPERTIES TIMEOUT 30)

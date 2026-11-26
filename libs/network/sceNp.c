@@ -10,9 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
-#include "np_psnr.h"
-#include "../system/cellSysutil.h"
-#include "../filesystem/edat.h"
+#include "../filesystem/edat.h"             /* klicensee note-through for EDAT resolution */
 
 
 /* ---------------------------------------------------------------------------
@@ -36,17 +34,11 @@ void sceNpSetFakeUsername(const char* username)
     }
 }
 
-const char* np_fake_username(void)
-{
-    return s_fake_username;
-}
-
-/* Build a fake NP ID from the current username (PS3_NP_ONLINE_ID wins, so
- * two instances on one machine can be two players). */
+/* Build a fake NP ID from the current username */
 static void np_build_fake_id(SceNpId* npId)
 {
     memset(npId, 0, sizeof(SceNpId));
-    strncpy(npId->handle.data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(npId->handle.data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
     npId->handle.term = '\0';
 }
 
@@ -60,7 +52,7 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     (void)poolPtr;
 
     printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
-           poolSize, np_psnr_online_id());
+           poolSize, s_fake_username);
 
     if (s_np_initialized)
         return SCE_NP_ERROR_ALREADY_INITIALIZED;
@@ -68,9 +60,6 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     s_np_initialized = 1;
     return CELL_OK;
 }
-
-/* Whether sceNpInit has run; sceNpBasic follows it (see sceNpBasic.c). */
-int np_is_initialized(void) { return s_np_initialized; }
 
 s32 sceNpTerm(void)
 {
@@ -93,12 +82,8 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
     if (!npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* A guest address, like every sibling getter's: writing through it
-     * untranslated hit a host address and crashed Simpsons Arcade the first
-     * time it asked for its NP ID online. */
-    npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
+    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -114,10 +99,10 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineId, 0, sizeof(SceNpOnlineId));
-    strncpy(onlineId->data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(onlineId->data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
     onlineId->term = '\0';
 
-    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
+    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -133,11 +118,11 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineName, 0, sizeof(SceNpOnlineName));
-    strncpy(onlineName->data, np_psnr_online_id(),
+    strncpy(onlineName->data, s_fake_username,
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
 
     printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
-           userId, np_psnr_online_id());
+           userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -154,12 +139,12 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
 
     memset(userInfo, 0, sizeof(SceNpUserInfo));
     np_build_fake_id(&userInfo->npId);
-    strncpy(userInfo->onlineName.data, np_psnr_online_id(),
+    strncpy(userInfo->onlineName.data, s_fake_username,
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
     /* Leave avatar URL empty */
 
     printf("[sceNp] GetUserProfile(user=%d) -> \"%s\"\n",
-           userId, np_psnr_online_id());
+           userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -235,12 +220,8 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
-    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
-    { static s32 last = -2;
-      if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
-      last = st; }
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
+    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
     return CELL_OK;
 }
 
@@ -248,16 +229,10 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
 {
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
+    /* Stored for bookkeeping; we never transition online so never fire it. */
     s_npmgr_cb     = callback;
     s_npmgr_cb_arg = arg;
     printf("[sceNp] ManagerRegisterCallback()\n");
-    /* Online: tell the title it is signed in, as the console does once the
-     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
-    if (np_psnr_enabled() && callback) {
-        const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
-                              (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
-        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
-    }
     return CELL_OK;
 }
 
@@ -273,23 +248,6 @@ s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, np
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }
-
-/* Parental controls: an unrestricted adult account. Unimplemented, these
- * returned OK without writing, and the title read whatever was in its stack. */
-s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
-{
-    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
-    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
-    if (age) vm_write32((u32)(uintptr_t)age, 25);
-    return CELL_OK;
-}
-
-s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
-{
-    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
-    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
-    return CELL_OK;
-}
 
 /* Score setup is local even while the NP manager is offline. Games may
  * initialize it before starting the worker that decides whether to use PSN. */
@@ -314,33 +272,172 @@ s32 sceNpScoreTerm(void)
 }
 
 /* ---------------------------------------------------------------------------
- * NPDRM
+ * NP Manager: tickets & parental controls
  *
- * On hardware sceNpDrmIsAvailable[2](klicensee, path) checks the licence for an
- * NPDRM file and leaves the klicensee with the kernel, so later cellFsOpen calls
- * on EDATs return plaintext. Free (license type 3) and disc-bound game data use a
- * title-specific klicensee that only the game knows; record it for the EDAT
- * reader (libs/filesystem/edat.c), which verifies it against each file's
- * dev_hash before using it. The two calls differ only in licence-check details
- * that do not apply here.
+ * The manager never leaves SCE_NP_MANAGER_STATUS_OFFLINE here, so ticket
+ * requests fail with the same error a signed-out console returns and the
+ * game takes its offline path. Content-rating / chat-restriction flags are
+ * local parental data and read back as "unrestricted" like a retail box
+ * with no parental controls set.
  * -----------------------------------------------------------------------*/
 
-static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
+s32 sceNpManagerGetTicket(void)
 {
-    const u8* k = GUEST_PTR(k_licensee, const u8*);
-    const char* path = GUEST_PTR(drm_path, const char*);
-    /* A NULL klicensee is legal for content that needs none; nothing to record. */
-    if (k) edat_add_klicensee(k);
-    fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
+    printf("[sceNp] ManagerGetTicket() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpManagerRequestTicket(void)
+{
+    printf("[sceNp] ManagerRequestTicket() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpManagerGetContentRatingFlag(s32 userId, u8* restriction, s32* age)
+{
+    (void)userId;
+    printf("[sceNp] ManagerGetContentRatingFlag(userId=%d)\n", userId);
+    if (!restriction || !age)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+    vm_write8((u32)(uintptr_t)restriction, 0);       /* not restricted */
+    vm_write32((u32)(uintptr_t)age, 25);             /* adult account  */
     return CELL_OK;
 }
 
-s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
+s32 sceNpManagerGetChatRestrictionFlag(s32 userId, u8* restriction)
 {
-    return np_drm_is_available(k_licensee, drm_path);
+    (void)userId;
+    printf("[sceNp] ManagerGetChatRestrictionFlag(userId=%d)\n", userId);
+    if (!restriction)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+    vm_write8((u32)(uintptr_t)restriction, 0);
+    return CELL_OK;
 }
 
-s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
+/* ---------------------------------------------------------------------------
+ * sceNpBasic: friend-list style entries. Without PSN there is no roster to
+ * mutate or poll, so everything answers with the signed-out error.
+ * -----------------------------------------------------------------------*/
+
+s32 sceNpBasicAddPlayersHistory(void)
 {
-    return np_drm_is_available(k_licensee, drm_path);
+    printf("[sceNp] BasicAddPlayersHistory() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpBasicAddFriend(void)
+{
+    printf("[sceNp] BasicAddFriend() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpBasicGetBlockListEntry(void)
+{
+    printf("[sceNp] BasicGetBlockListEntry() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+s32 sceNpBasicRecvMessageAttachment(void)
+{
+    printf("[sceNp] BasicRecvMessageAttachment() -> OFFLINE\n");
+    return SCE_NP_ERROR_OFFLINE;
+}
+
+/* NPDRM license check. Firmware ABI: r3 is the npDrm context the game built
+ * earlier, r4 points at the 16-byte klicensee. For a retail disc image the
+ * license is available by construction -- but the klicensee is worth keeping:
+ * the same title's HDD-installed EDAT content (MotorStorm's pack_toc.edat
+ * etc.) is license-type-3 and keyed by exactly these 16 bytes, and every
+ * cellFsOpen of it goes through edat_resolve. Note it there; it is validated
+ * per file against the NPD dev_hash before any use. */
+extern uint32_t ppu_vm_size;   /* ppu_loader.cpp, extern "C"; 0 = full space backed */
+
+s32 sceNpDrmIsAvailable(u32 npdrm_ea, u32 klic_ea)
+{
+    if (npdrm_ea && (!ppu_vm_size || (uint64_t)npdrm_ea + 16 <= ppu_vm_size)) {
+        uint8_t klic[16], path[16];
+        /* Ground truth from this title's calls: r3 carries the 16 raw
+         * klicensee bytes (high entropy), r4 an ASCII content path
+         * ("/dev_hdd0/game/B.."). Note the key from r3. */
+        memcpy(klic, GUEST_PTR(npdrm_ea, const uint8_t*), 16);   /* raw, no swap */
+        memcpy(path, GUEST_PTR(klic_ea, const uint8_t*), 16);    /* r4, diagnostic only */
+        edat_note_guest_klic(klic);
+        printf("[sceNp] DrmIsAvailable: noted klic ea=0x%08X "
+               "r3=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X "
+               "r4=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+               npdrm_ea, klic[0],klic[1],klic[2],klic[3],klic[4],klic[5],klic[6],klic[7],
+               klic[8],klic[9],klic[10],klic[11],klic[12],klic[13],klic[14],klic[15],
+               path[0],path[1],path[2],path[3],path[4],path[5],path[6],path[7],
+               path[8],path[9],path[10],path[11],path[12],path[13],path[14],path[15]);
+    } else {
+        printf("[sceNp] DrmIsAvailable() -> CELL_OK (retail disc image)\n");
+    }
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Score contexts. Creation succeeds while score is initialized (the ladder
+ * worker may build contexts before deciding to go online) and every network
+ * operation fails immediately with OFFLINE, surfaced through Poll/WaitAsync
+ * exactly like a request the server refused.
+ * -----------------------------------------------------------------------*/
+
+static u32 s_score_title_ctx = 0x11110001u;
+static u32 s_score_trans_ctx = 0x22220001u;
+
+s32 sceNpScoreCreateTitleCtx(void)
+{
+    if (!s_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+    printf("[sceNp] ScoreCreateTitleCtx() -> 0x%08X\n", s_score_title_ctx);
+    return (s32)s_score_title_ctx;
+}
+
+s32 sceNpScoreDestroyTitleCtx(u32 ctx)
+{
+    (void)ctx;
+    return CELL_OK;
+}
+
+s32 sceNpScoreCreateTransactionCtx(u32 titleCtx)
+{
+    if (!s_score_initialized)
+        return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+    (void)titleCtx;
+    printf("[sceNp] ScoreCreateTransactionCtx() -> 0x%08X\n", s_score_trans_ctx);
+    return (s32)s_score_trans_ctx;
+}
+
+s32 sceNpScoreDestroyTransactionCtx(u32 ctx, u32 transCtx)
+{
+    (void)ctx;
+    (void)transCtx;
+    return CELL_OK;
+}
+
+s32 sceNpScoreRecordScoreAsync(void)      { return SCE_NP_ERROR_OFFLINE; }
+s32 sceNpScoreRecordGameDataAsync(void)   { return SCE_NP_ERROR_OFFLINE; }
+s32 sceNpScoreGetRankingByRangeAsync(void){ return SCE_NP_ERROR_OFFLINE; }
+s32 sceNpScoreGetRankingByNpIdAsync(void) { return SCE_NP_ERROR_OFFLINE; }
+s32 sceNpScoreGetGameDataAsync(void)      { return SCE_NP_ERROR_OFFLINE; }
+
+s32 sceNpScorePollAsync(u32 ctx, u32 reqId, s32* result)
+{
+    (void)ctx;
+    (void)reqId;
+    printf("[sceNp] ScorePollAsync(reqId=%u) -> OFFLINE\n", reqId);
+    if (result)
+        vm_write32((u32)(uintptr_t)result, (u32)SCE_NP_ERROR_OFFLINE);
+    return CELL_OK;
+}
+
+s32 sceNpScoreWaitAsync(u32 ctx, u32 reqId, s32* result)
+{
+    return sceNpScorePollAsync(ctx, reqId, result);
+}
+
+s32 sceNpScoreAbortTransaction(u32 transCtx)
+{
+    (void)transCtx;
+    return CELL_OK;
 }

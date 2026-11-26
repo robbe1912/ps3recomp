@@ -1,7 +1,4 @@
 /* thread_name.c -- see thread_name.h. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "thread_name.h"
 
 #include <stdlib.h>   /* getenv */
@@ -26,15 +23,16 @@ void ps3_thread_setname(uintptr_t thread_handle, const char* name)
      * thread, printed by the creator right at the handle it just made.
      * GetThreadId (not GetCurrentThreadId): the CREATOR prints the NEW
      * thread's id. PS3_THRLOG=0 silences. */
-    { static SRWLOCK log_lock = SRWLOCK_INIT;
-      static int s_log = -1;
-      AcquireSRWLockExclusive(&log_lock);
+    { static int s_log = -1;
       if (s_log < 0) { const char* e = getenv("PS3_THRLOG"); s_log = (e && *e == '0') ? 0 : 1; }
       if (s_log) {
-        /* First print per tid only: short-lived workers can otherwise flood
-         * stderr while the CPU sampler runs. A repeated tid with a CHANGED
+        /* First print per tid only: PM lanes are re-created per dispatch and
+         * high-churn titles stamp thousands of [thr] lines per minute
+         * (bg_230: 206k lines/185s), all of it under the stderr lock while
+         * the CPU sampler is trying to run. A repeated tid with a CHANGED
          * name still prints (rename visibility); same tid+name is silent.
-         * Bounded open-address set protected with the cached log flag. */
+         * Best-effort open-address set, no lock: a race only duplicates a
+         * line, never loses the first one. */
         #define THR_SEEN_N 4096
         static unsigned long s_seen_t[THR_SEEN_N];
         static char         s_seen_n[THR_SEEN_N][24];
@@ -57,7 +55,6 @@ void ps3_thread_setname(uintptr_t thread_handle, const char* name)
         if (fresh)
             fprintf(stderr, "[thr] tid=%lu name=%s\n", tid, name);
       }
-      ReleaseSRWLockExclusive(&log_lock);
     }
 
     /* Resolved dynamically: keeps the binary loadable and linkable on
@@ -76,12 +73,6 @@ void ps3_thread_setname(uintptr_t thread_handle, const char* name)
 void ps3_thread_setname(uintptr_t thread_handle, const char* name)
 {
     (void)thread_handle;
-    if (name) {
-#ifdef __APPLE__
-        pthread_setname_np(name);
-#else
-        pthread_setname_np(pthread_self(), name);
-#endif
-    }
+    if (name) pthread_setname_np(pthread_self(), name);
 }
 #endif

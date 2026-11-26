@@ -310,13 +310,49 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     }
 }
 
-/* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
-const char* cellGame_get_title_id(void) { return s_title_id; }
+/* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it.
+ *
+ * Self-healing title id: the accessor is the last-chance hook for hosts that
+ * never call cellGame_init_from_paramsfo. MS1's boot harness
+ * (recomp/game/main.cpp) sets ppu_vfs_root but never reads PARAM.SFO, so the
+ * "BLES00000" placeholder flowed into cellDiscGameGetBootDiscInfo and every
+ * /dev_hdd0/game/<id> path the title built from it (m3_first_frames.log: it
+ * stats /dev_hdd0/game/BLES00000/USRDIR/patch_override_ps3.bin). If the id is
+ * still the placeholder on first use, probe PARAM.SFO at the layouts the
+ * harnesses actually use -- for a disc dump the VFS root IS the PS3_GAME
+ * directory (PARAM.SFO at its root), plus the PS3_GAME/ and parent-dir
+ * variants -- and run the full init from the first one that exists. One probe
+ * per process; keeps the placeholder if none parse. */
+const char* cellGame_get_title_id(void)
+{
+    static int probed = 0;
+    if (!probed) {
+        probed = 1;
+        if (strcmp(s_title_id, "BLES00000") == 0 &&
+            ppu_vfs_root && *ppu_vfs_root && strcmp(ppu_vfs_root, ".") != 0) {
+            static const char* layouts[] = {
+                "%s/PARAM.SFO", "%s/PS3_GAME/PARAM.SFO", "%s/../PARAM.SFO",
+            };
+            for (unsigned i = 0; i < sizeof layouts / sizeof layouts[0]; i++) {
+                char cand[CELL_GAME_PATH_MAX];
+                snprintf(cand, sizeof cand, layouts[i], ppu_vfs_root);
+                HOST_STAT_T st;
+                if (HOST_STAT(cand, &st) == 0 && (st.st_mode & S_IFMT) != S_IFDIR) {
+                    printf("[cellGame] get_title_id: no boot-time SFO init; reading '%s'\n", cand);
+                    cellGame_init_from_paramsfo(cand);
+                    break;
+                }
+            }
+        }
+    }
+    return s_title_id;
+}
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
 {
     printf("[cellGame] BootCheck()\n");
+    cellGame_get_title_id();   /* one-shot SFO probe: the id must be real before paths are built */
 
     /* Build paths based on title ID */
     snprintf(s_content_info_path, sizeof(s_content_info_path),

@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_fps_stats.h"   /* FPS_STATS=1 present-rate report */
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 
@@ -332,7 +333,7 @@ typedef struct {
     ID3D12DescriptorHeap*      smp_heap;
     u32                        smp_step, smp_ring_used;
     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
-    u64                        smp_keys[SMP_CACHE_SLOTS];
+    u32                        smp_keys[SMP_CACHE_SLOTS];
     u32                        n_samplers;
 
     ID3D12RootSignature*       rootsig_x;
@@ -1527,20 +1528,13 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxAnisotropy = 1;
     return sd;
 }
-/* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
- * they decode alike. The previous key kept wrap bits 0-11 (U and V, none of W at bits 16-19) and shifted the 21-bit
- * LOD field of control0 left by 18, which drops its top seven bits: min LOD (control0 bits 19-30) above bit 20
- * and the W address mode were lost, so states differing only there reused another state's descriptor. */
-static u64 sampler_key(const rsx_dsp_texture* t)
+static u32 sampler_key(const rsx_dsp_texture* t)
 {
-    const u64 minf    = (t->filter >> 16) & 0x7;
-    const u64 magf    = (t->filter >> 24) & 0x7;
-    const u64 wrap_u  = t->wrap & 0xF;
-    const u64 wrap_v  = (t->wrap >> 8) & 0xF;
-    const u64 wrap_w  = (t->wrap >> 16) & 0xF;
-    const u64 max_lod = (t->control0 >> 7) & 0xFFF;
-    const u64 min_lod = (t->control0 >> 19) & 0xFFF;
-    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30);
+    const u32 minf = (t->filter >> 16) & 0x7;
+    const u32 magf = (t->filter >> 24) & 0x7;
+    const u32 wrap = t->wrap & 0xFFF;
+    const u32 lod  = (t->control0 >> 7) & 0x1FFFFF;
+    return minf | (magf << 3) | (wrap << 6) | (lod << 18);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1655,7 +1649,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
     h.ptr += (size_t)slot * g.smp_step;
     return h;
 }
-static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
+static u32 sampler_slot(const rsx_dsp_texture* t, u32 key)
 {
     for (u32 i = 0; i < g.n_samplers; i++)
         if (g.smp_keys[i] == key) return 1 + i;
@@ -3229,56 +3223,6 @@ static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
     return h;
 }
 
-/* The R32F snapshot is sized from the clip of the first pass that bound the
- * zeta. A title that first binds its full-screen zeta with a smaller clip
- * (a 512x512 pass into a 1280x720 depth buffer) kept a 512x512 snapshot, and
- * every later full-size read of that depth saw 0 outside the top-left
- * corner. Grow the snapshot to the largest clip bound since, within the
- * depth resource. */
-static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
-{
-    zdepth_t* z = &g.zdepths[i];
-    if (!z->snapshot) return;
-    u32 nw = rt_w < z->w ? rt_w : z->w, nh = rt_h < z->h ? rt_h : z->h;
-    if (nw < z->snapshot_w) nw = z->snapshot_w;
-    if (nh < z->snapshot_h) nh = z->snapshot_h;
-    if (nw == z->snapshot_w && nh == z->snapshot_h) return;
-    D3D12_HEAP_PROPERTIES hp = {0};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd = {0};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = nw;
-    rd.Height = nh;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R32_FLOAT;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    ID3D12Resource* snap = NULL;
-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
-            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
-            &IID_ID3D12Resource, (void**)&snap))) {
-        fprintf(stderr, "[zetatrack] snapshot grow failed %u:0x%X %ux%u\n",
-                z->location, z->offset, nw, nh);
-        return;
-    }
-    fprintf(stderr, "[zetatrack] snapshot %u:0x%X grown %ux%u -> %ux%u\n",
-            z->location, z->offset, z->snapshot_w, z->snapshot_h, nw, nh);
-    /* The open command list may still read the old one. */
-    retire_texture(z->snapshot);
-    z->snapshot = snap;
-    z->snapshot_w = nw;
-    z->snapshot_h = nh;
-    z->snapshot_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    srv_write_zdepth(SRV_ZDEPTH_BASE + i, z->snapshot);
-    uav_write_zdepth(UAV_ZDEPTH_BASE + i, z->snapshot);
-    /* The depth resource still holds what the old snapshot held (a clear
-     * would have invalidated both): resolve it again at the next read. */
-    if (z->snapshot_valid) z->had_write = 1;
-    z->snapshot_valid = 0;
-}
-
 /* Returns DSV slot 1+i. Slot 0 is the legacy shared depth fallback. */
 static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 {
@@ -3294,10 +3238,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         zdepth_t* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) {
-                zdepth_grow_snapshot(i, rt_w, rt_h);
-                return 1 + i;
-            }
+            if (z->w >= want_w && z->h >= want_h) return 1 + i;
             slot = i;
             break;
         }
@@ -4339,7 +4280,7 @@ static ID3D12PipelineState* get_pso(
         LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
     }
-    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* 32-bit exports, depth export */
+    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
@@ -4356,30 +4297,6 @@ static ID3D12PipelineState* get_pso(
         unnorm_mask |= 1u << uu;
         unnorm_dim[uu][0] = ut.width;
         unnorm_dim[uu][1] = ut.height;
-        /* A depth texture bound to a zeta's snapshot reads that host
-         * resource, which is as large as the largest pass that used the zeta
-         * (bounded by the zeta), not as large as the texture. Texel
-         * coordinates address the resource, so divide by its size: a texture
-         * smaller than the zeta then reads its top-left corner, as it does in
-         * VRAM, instead of a stretched copy of the whole depth buffer. */
-        if ((ut.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) ==
-                TEX_FMT_DEPTH24_D8) {
-            for (u32 zi = 0; zi < g.n_zdepths; zi++) {
-                const zdepth_t* z = &g.zdepths[zi];
-                if (z->location != ut.location || z->offset != ut.offset)
-                    continue;
-                /* Only when the bind will take the snapshot (it has, or
-                 * will copy, a depth-writing pass); a zeta that was only
-                 * cleared is read from guest memory at texture size. */
-                if (z->snapshot && (z->had_write || z->snapshot_valid) &&
-                    z->snapshot_w >= ut.width &&
-                    z->snapshot_h >= ut.height) {
-                    unnorm_dim[uu][0] = z->snapshot_w;
-                    unnorm_dim[uu][1] = z->snapshot_h;
-                }
-                break;
-            }
-        }
     }
     key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
     if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
@@ -4468,7 +4385,7 @@ static ID3D12PipelineState* get_pso(
     if (ld_fp_constants_buffered()) {
         fi = rsx_fp_decompile_buffered_ex(
             fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
-            sizeof(ps_hlsl), &decompiled_constant_count);
+            sizeof(ps_hlsl), &decompiled_constant_count, NULL);
         if (fi > 0 &&
             decompiled_constant_count != g.fp_constants.count)
             fi = -1;
@@ -5965,7 +5882,7 @@ static u64 live_legacy_pso_key(void)
 
     u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
     key = fnv1a(fp_uc, fp_size, key);
-    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x4Eu;
+    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     render_state_t rs;
     decode_render_state(&rs);
@@ -6940,15 +6857,6 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     u32 texture_mask = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
     for (u32 u = 0; u < SMP_TABLE_SIZE; u++) smp_slots[u] = SMP_DEFAULT;
-    /* A draw that samples its own zeta while not writing depth (deferred
-     * lighting reading the scene depth it also depth-tests against, soft
-     * particles) reads the snapshot: the zeta does not change during such a
-     * draw, so that is what RSX returns. Before, it fell back to guest VRAM,
-     * which the host-side depth never reaches (depth 0). A draw that writes
-     * the zeta it reads keeps that fallback. */
-    const int self_zeta_read = current_zslot &&
-        !((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) &&
-          (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u));
     /* LD_UNITS=1: every enabled texture unit of every draw that samples PS1
      * VRAM, once per distinct combination.
      *
@@ -7020,21 +6928,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * descriptor actually declares; failing that, the most recently drawn
          * one, which is the only other defensible answer. */
         int sampled = -1;
-        /* An address can be both a colour target and a zeta (a shadow map
-         * pass that binds the same memory as both, colour writes masked).
-         * A depth-format read of an address with a written host zeta is a
-         * depth read: try the zeta first. Before, the colour surface at the
-         * same address was taken (zeros). */
-        int zeta_pref = 0;
-        if ((t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
-            for (u32 i = 0; i < g.n_zdepths; i++)
-                if (g.zdepths[i].location == t.location &&
-                    g.zdepths[i].offset == t.offset &&
-                    (g.zdepths[i].had_write || g.zdepths[i].snapshot_valid)) {
-                    zeta_pref = 1;
-                    break;
-                }
-        if (!zeta_pref) { u32 best_gen = 0;
+        { u32 best_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
@@ -7133,7 +7027,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 fprintf(stderr, "\n");
             }
         }
-        if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
+        if (sampled < 0 && g.surfaces[target].location == t.location &&
             g.surfaces[target].offset == t.offset) {
             /* Reads its own render target: sample a copy of it. */
             slots[u] = surface_feedback_srv(target);
@@ -7174,7 +7068,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 for (u32 i = 0; i < g.n_zdepths; i++)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
-                        (current_zslot != 1 + i || self_zeta_read)) {
+                        current_zslot != 1 + i) {
                         if (zdepth_snapshot(1 + i))
                             sampled_depth = (int)i;
                         else {
@@ -7303,17 +7197,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
-    /* The guest viewport is in pixels; an antialiased surface's clip is in
-     * samples (aa_sx x aa_sy per pixel), so map NDC over the pixel extent. */
-    const float Wv = W / (float)sf.aa_sx;
-    const float Hv = H / (float)sf.aa_sy;
     float xf[8] = {1, 1, 1, 0, 0, 0, 0, 0};
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
-        xf[0] = vp.scale[0] / (Wv * 0.5f);
-        xf[1] = -(vp.scale[1] / (Hv * 0.5f));
+        xf[0] = vp.scale[0] / (W * 0.5f);
+        xf[1] = -(vp.scale[1] / (H * 0.5f));
         xf[2] = vp.scale[2];
-        xf[4] = (vp.translate[0] - Wv * 0.5f) / (Wv * 0.5f);
-        xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
+        xf[4] = (vp.translate[0] - W * 0.5f) / (W * 0.5f);
+        xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
         xf[6] = vp.translate[2];
     }
     u8* cbdst = g.cb_mapped + g.cb_used;
@@ -7352,10 +7242,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     {
         const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
         const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-        /* The scissor is in pixels too: scale it to the sample grid. */
-        const LONG ax = (LONG)sf.aa_sx, ay = (LONG)sf.aa_sy;
-        const LONG sx = (LONG)(sh & 0xFFFFu) * ax, sw = (LONG)(sh >> 16) * ax;
-        const LONG sy = (LONG)(sv & 0xFFFFu) * ay, svh = (LONG)(sv >> 16) * ay;
+        const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
+        const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
         const int written = g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] != 0 ||
                             g.rsx.seen[M_SCISSOR_VERTICAL >> 2] != 0;
         if (written) {
@@ -7578,21 +7466,15 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        /* ZSTENCIL_CLEAR_VALUE is laid out as the zeta is: depth24 << 8 |
-         * stencil8 for Z24S8, a bare depth16 for Z16 (SURFACE_FORMAT depth
-         * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
-         * would clear it to 255/16777215, nearly the near plane, and every
-         * LESS or LEQUAL draw into it would then fail. The nv40 reset
-         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. Same
-         * decode as the draw engine's clear. */
+        /* ZSTENCIL_CLEAR_VALUE (Z24S8 layout: depth24 << 8 | stencil8; nv40
+         * reset 0xFFFFFF00 = depth 1.0, stencil 0 — so never-written streams
+         * keep the old hardcoded behaviour). Previously decoded upstream but
+         * discarded here: every guest depth clear forced 1.0/0. */
         {
             const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
-            const int z16 = sf.depth_format == 1u;
-            const float cd = !zs ? 1.0f
-                           : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
-                                 : (float)(zs >> 8) / 16777215.0f;
+            const float cd = (float)(zs >> 8) / 16777215.0f;
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
-                clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
+                clear_flags, zs ? cd : 1.0f, (UINT8)(zs & 0xFFu), 0, NULL);
         }
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
@@ -8442,8 +8324,10 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
     {
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
-        if (SUCCEEDED(present_hr))
+        if (SUCCEEDED(present_hr)) {
             ld_present_measure_record(g_ld_frames);
+            rsx_fps_stats_on_present();   /* FPS_STATS=1 (shared with the legacy backend) */
+        }
         else {
             fprintf(stderr,
                     "[d3d-fail] movie Present hr=0x%08lX frame=%u\n",
@@ -8986,8 +8870,10 @@ void rsx_live_draw_present(u32 buffer_id)
     ld_flush(LD_FLUSH_PRESENT);
     {
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
-        if (SUCCEEDED(present_hr))
+        if (SUCCEEDED(present_hr)) {
             ld_present_measure_record(g_ld_frames + 1u);
+            rsx_fps_stats_on_present();   /* FPS_STATS=1 (shared with the legacy backend) */
+        }
         else {
             fprintf(stderr,
                     "[d3d-fail] Present hr=0x%08lX frame=%u "

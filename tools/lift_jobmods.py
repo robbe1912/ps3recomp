@@ -58,7 +58,7 @@ EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
 
-def manual_link_targets(raw, base=BASE):
+def manual_link_targets(raw, base=BASE, imm_base=None):
     """Return targets built into the link register by hand:
         ila  $r0, off
         a    $r0, $r0, $r126        (r126 = module load base, from the entry's
@@ -66,10 +66,19 @@ def manual_link_targets(raw, base=BASE):
     Every job module's entry does this once (`ila $r0, entry+0xAC ... br body`):
     the body returns with `bi $r0` to base+off, an address no branch names, so
     the lift has no entry there. Without it the return unwinds to the manager's
-    drain (drain-mismatch return_pc=0x3258 pc=0x4AEC), the restart re-enters the
-    entry function from its start, the prologue runs twice and the job leaves
+    drain (drain-mismatch return_pc=0x3258 pc=0x4AEC), the restart re-enters
+    the entry function from its start, the prologue runs twice and the job leaves
     on a garbage r0 (`exit: synthesised stop at LS 0xE81C`). Seeding base+off
-    is exact: the offset is an immediate."""
+    is exact: the offset is an immediate.
+
+    `imm_base` serves modules linked at a NON-ZERO base (MS1's C0DEC0DE WWS
+    job images: link base 0x4000, declared at image header +0x28). There the
+    immediate is already an absolute local-store address, so the module-
+    relative window [0x30, len(raw)) would reject every one of them; pass the
+    link base and the window becomes [imm_base+0x30, imm_base+len(raw)) with
+    the immediate itself as the target."""
+    lo = imm_base + 0x30 if imm_base else 0x30
+    hi = imm_base + len(raw) if imm_base else len(raw)
     out = []
     for off in range(0x30, len(raw) - 20, 4):
         w = struct.unpack_from(">I", raw, off)[0]
@@ -79,14 +88,14 @@ def manual_link_targets(raw, base=BASE):
         for k in range(1, 5):
             w2 = struct.unpack_from(">I", raw, off + 4 * k)[0]
             if (w2 >> 21) & 0x7FF == 0x0C0 and (w2 & 0x7F) == 0 and ((w2 >> 7) & 0x7F) == 0:
-                if imm % 4 == 0 and 0x30 <= imm < len(raw):        # a $r0, $r0, $rX
-                    out.append(base + imm)
+                if imm % 4 == 0 and lo <= imm < hi:              # a $r0, $r0, $rX
+                    out.append(imm if imm_base else base + imm)
                 break
     return sorted(set(out))
 
 
 
-def switch_table_targets(raw, base=BASE):
+def switch_table_targets(raw, base=BASE, imm_base=None):
     """Return the targets of position-independent switch tables.  The
     compiler emits, for `switch`:
         ila  $rT, tbl_off ; a $rT, $rT, $r126      ($rT = LS address of table)
@@ -96,30 +105,40 @@ def switch_table_targets(raw, base=BASE):
     so no absolute address of any case ever appears in the code: the lift
     only ever reached the cases by luck (`bi $r2` computed at run time,
     BRANCH-TO-0 unresolved pc=0x7A08 in jobmod ef33c6c99dc7). A table is
-    accepted only when some `ila` in the module names its offset."""
+    accepted only when some `ila` in the module names its offset.
+
+    `imm_base`: as in manual_link_targets, for modules linked at a non-zero
+    base the `ila` names the ABSOLUTE table address and the entries resolve
+    to absolute targets."""
     ilas = set()
     for off in range(0x30, len(raw) - 4, 4):
         w = struct.unpack_from(">I", raw, off)[0]
         if (w >> 25) & 0x7F == 0x21:                          # ila $rX, i18
             ilas.add((w >> 7) & 0x3FFFF)
+    lo = imm_base + 0x30 if imm_base else 0x30
+    hi = imm_base + len(raw) if imm_base else len(raw)
     out = []
     for off in range(0x30, len(raw) - 16, 4):
         w = struct.unpack_from(">I", raw, off)[0]
         if (w >> 21) & 0x7FF != 0x1A8 or (w & 0x7F) != 0:     # bi $rA (rt field 0)
             continue
-        tbl = off + 4
+        tbl = (imm_base + off + 4) if imm_base else (off + 4)
         if tbl not in ilas:
             continue
+        tbl_file = off + 4                                     # file offset of table
         targets = []
-        while tbl + 4 * len(targets) + 4 <= len(raw):
-            e = struct.unpack_from(">I", raw, tbl + 4 * len(targets))[0]
+        while tbl_file + 4 * len(targets) + 4 <= len(raw):
+            e = struct.unpack_from(">I", raw, tbl_file + 4 * len(targets))[0]
             t = (tbl + e) & 0xFFFFFFFF
-            if t % 4 or not (0x30 <= t < len(raw)):
+            if t % 4 or not (lo <= t < hi):
                 break
-            targets.append(base + t)
+            targets.append(t if imm_base else base + t)
         if len(targets) >= 2:
             out += targets
     return sorted(set(out))
+
+
+
 
 
 

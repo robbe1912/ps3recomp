@@ -52,6 +52,9 @@ typedef struct ppu_thread_info {
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    char         wait_tag[40]; /* RD_PROBE_THREADSTATES: primitive this thread is
+                                  blocked in (ppu_thread_wait_begin); cleared at
+                                  wait end or the next syscall/HLE entry */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -76,6 +79,13 @@ extern ppu_thread_info g_ppu_threads[PPU_THREAD_MAX];
 
 /* Stack allocator (shared) */
 extern vm_stack_alloc g_vm_stack_alloc;
+/* Bounded guest-stack leases for host-only callback threads (ppu_loader.cpp
+ * guest-call entry). Leases come from the same VM stack region guest threads
+ * use and are pooled for reuse across host-thread churn. cookie carries the
+ * loader's TLS pointer across reuse. */
+int  ppu_callback_stack_lease(uint32_t* top_out, uint64_t* cookie_out);
+void ppu_callback_stack_set_cookie(uint32_t top, uint64_t cookie);
+void ppu_callback_stack_release(uint32_t top);
 
 /* Callback to invoke recompiled code - must be set by the runtime */
 extern ppu_thread_entry_fn g_ppu_thread_entry_trampoline;
@@ -89,6 +99,14 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+/* RD_PROBE_THREADSTATES: blocked-on tagging read by threadstate_probe.c */
+void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+void ppu_thread_wait_end(ppu_context* ctx);
+void* ppu_thread_host_handle(unsigned tid);
+const char* ppu_thread_wait_tag(unsigned tid);
+/* RD_PROBE_MAINSPIN: main thread's ppu_context (lives outside the table) */
+void* ppu_prof_main_ctx(void);
+void rd_threadstate_probe_start(void);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

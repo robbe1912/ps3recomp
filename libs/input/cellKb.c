@@ -279,3 +279,49 @@ s32 cellKbClearBuf(u32 port_no)
     s_kb_ports[port_no].event_count = 0;
     return CELL_OK;
 }
+
+/* cellKbGetConfiguration (NID 0x1F71ECBE): report the per-port setup the
+ * guest last requested via SetReadMode/SetCodeType. Guest CellKbConfig
+ * layout (big-endian u32s): +0x00 arrange, +0x04 rmode, +0x08 codetype,
+ * +0x0C led. */
+s32 cellKbGetConfiguration(u32 port_no, void* config)
+{
+    unsigned long long ea = (unsigned int)(uintptr_t)config;
+
+    if (!s_kb_initialized)
+        return CELL_KB_ERROR_UNINITIALIZED;
+
+    if (port_no >= CELL_KB_MAX_KEYBOARDS || !config)
+        return CELL_KB_ERROR_INVALID_PARAMETER;
+
+    KbPortState* kb = &s_kb_ports[port_no];
+    vm_write32(ea + 0x00, 0);                       /* CELL_KB_ARRANGEMENT_101 */
+    vm_write32(ea + 0x04, kb->rmode);
+    vm_write32(ea + 0x08, kb->codetype);
+    vm_write32(ea + 0x0C, kb->led);
+    return CELL_OK;
+}
+
+/* cellKbRead (NID 0xFF0A21B7): same data as cellKbGetData -- kept as its
+ * own export because titles poll whichever the SDK generated. */
+s32 cellKbRead(u32 port_no, CellKbData* data)
+{
+    return cellKbGetData(port_no, data);
+}
+
+/* cellKbCnvRawCode (NID 0x4AB1FA77): stateless RAW->ASCII conversion used
+ * for text entry; caps lock XORs with shift for letters like the real kb. */
+u16 cellKbCnvRawCode(u32 arrange, u32 mkey, u32 led, u16 rawcode)
+{
+    (void)arrange;
+    u32 m = mkey;
+    int shifted = (m & (CELL_KB_MKEY_L_SHIFT | CELL_KB_MKEY_R_SHIFT)) != 0;
+    int caps    = (led & CELL_KB_LED_CAPS_LOCK) != 0;
+
+    if (caps && rawcode >= CELL_KEYC_A && rawcode <= CELL_KEYC_Z)
+        m ^= (CELL_KB_MKEY_L_SHIFT | CELL_KB_MKEY_R_SHIFT); /* toggle for letters */
+    else
+        (void)shifted;
+
+    return kb_raw_to_ascii(rawcode, m);
+}

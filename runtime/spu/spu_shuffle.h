@@ -1,5 +1,7 @@
 /* Checked host byte-shuffle implementation. Header-only so standalone lifted
- * callers retain their existing link contract. No process-wide ISA change. */
+ * callers retain their existing link contract. No process-wide ISA change:
+ * a unit built with SSSE3 enabled gets the SSSE3 form as plain inline code,
+ * a baseline unit calls it after a CPUID test. */
 #ifndef PS3RECOMP_SPU_SHUFFLE_H
 #define PS3RECOMP_SPU_SHUFFLE_H
 #include "../../include/ps3emu/ps3types.h"
@@ -22,6 +24,14 @@
 #include <arm_neon.h>
 #else
 #define SPU_SHUFB_NEON 0
+#endif
+
+/* SPU_SHUFB_UNIT_SSSE3: the compiler builds this unit with SSSE3 enabled, and
+ * the build switch SPU_SIMD selects the x86 forms of the hot SPU helpers. */
+#if SPU_SHUFB_X86 && defined(__SSSE3__) && defined(SPU_SIMD) && SPU_SIMD
+#define SPU_SHUFB_UNIT_SSSE3 1
+#else
+#define SPU_SHUFB_UNIT_SSSE3 0
 #endif
 
 #ifdef __cplusplus
@@ -64,7 +74,7 @@ static inline int spu_shufb_simd_available(void) {
 }
 
 #if SPU_SHUFB_X86
-#if defined(__GNUC__) || defined(__clang__)
+#if !SPU_SHUFB_UNIT_SSSE3 && (defined(__GNUC__) || defined(__clang__))
 __attribute__((target("ssse3")))
 #endif
 static inline u128 spu_shufb_ssse3(u128 a, u128 b, u128 c) {
@@ -108,7 +118,9 @@ static inline u128 spu_shufb_neon(u128 a, u128 b, u128 c) {
 #endif
 
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-#if SPU_SHUFB_X86
+#if SPU_SHUFB_UNIT_SSSE3
+    return spu_shufb_ssse3(a, b, c);
+#elif SPU_SHUFB_X86
     if (spu_shufb_simd_available()) return spu_shufb_ssse3(a, b, c);
 #elif SPU_SHUFB_NEON
     return spu_shufb_neon(a, b, c);

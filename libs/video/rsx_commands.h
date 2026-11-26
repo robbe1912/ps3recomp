@@ -200,9 +200,6 @@ extern "C" {
 #define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
 #define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
 #define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
-#define NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE     0x00000380
-#define NV4097_SET_DEPTH_BOUNDS_MIN             0x00000384  /* float */
-#define NV4097_SET_DEPTH_BOUNDS_MAX             0x00000388  /* float */
 
 /* Culling */
 #define NV4097_SET_CULL_FACE_ENABLE             0x0000183C
@@ -412,7 +409,7 @@ void rsx_state_init(rsx_state* state);
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
 
 /* Process a command buffer segment.
- * buf:  pointer to command buffer data (host memory)
+ * buf:  aligned host-order u32 words. The caller decodes guest byte order.
  * size: size in bytes
  * Returns number of methods processed. */
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size);

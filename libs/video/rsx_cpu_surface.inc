@@ -2,9 +2,9 @@
 #include "ps3emu/guest_read_sync.h"
 #include "rsx_surface_readback.h"
 #include "rsx_cpu_surface_profile.h"
-#include <stdatomic.h>
 #include "rsx_cpu_surface_snapshot.h"
 #include "rsx_fifo_boundary.h"
+#include <stdatomic.h>
 typedef struct CpuSurfaceRequest {
     struct CpuSurfaceRequest *next;
     u32 address, bytes;
@@ -31,7 +31,7 @@ static u64 s_cpu_surface_fence_value;
 static int s_cpu_surface_live;
 static int s_cpu_surface_recording;
 static void cpu_surface_fail(const char *operation, HRESULT result) {
-    fprintf(stderr,"[CPUSURFACE] %s failed: 0x%08lX\n",operation,(unsigned long)result);rsx_gpu_fault_report(s_d3d.device);abort();
+    fprintf(stderr,"[CPUSURFACE] %s failed: 0x%08lX\n",operation,(unsigned long)result);abort();
 }
 #define CPU_SURFACE_HR(call) do { HRESULT _result=(call); if(FAILED(_result))cpu_surface_fail(#call,_result); } while(0)
 static int s_cpu_surface_profile;
@@ -64,6 +64,97 @@ static void cpu_surface_profile_emit(CpuSurfaceRequest *request) {
             (unsigned long)s_cpu_surface_thread,(unsigned long long)p->queued,
             (unsigned long long)p->started,(unsigned long long)p->finished);
 }
+/* Client-visible surface views. A client thread serves a read itself when
+ * guest memory already holds every write recorded for each surface the read
+ * touches. Any other read takes the queued path.
+ * The renderer owns one view for each slot of the surface pool. It is the
+ * only writer of a view, and only between two stores of an odd sequence
+ * number. A reader uses the fields only when it reads the same even sequence
+ * number before and after them (a seqlock). Stores are release and loads are
+ * acquire, so a reader that sees the new sequence number also sees the bytes
+ * the renderer packed into guest memory first. x86-64 keeps load-load and
+ * store-store order as other processors observe them. Every field is one
+ * aligned 64-bit word.
+ * The views form one table. s_cpu_surface_views holds the table address in
+ * bits 0 to 46 and the entry count in bits 48 to 63, so a reader gets both
+ * with one load. The renderer replaces the table only to add entries. It
+ * never frees a table, because a reader can still hold an older address, and
+ * it gives every entry of a replaced table an odd sequence number.
+ * The request profile check compiles this block without <stdatomic.h>, so it
+ * uses the C11 atomic builtins.
+ * The renderer packs bytes only while its view is not ready. The load that
+ * follows a served read is as current as the load that follows a queued hit:
+ * both loads run after the handler returns. */
+typedef struct CpuSurfaceView {
+    _Atomic u64 sequence;   /* odd while the renderer changes this view */
+    _Atomic u64 begin, end; /* guest byte range [begin, end), both 0: no surface */
+    _Atomic u64 ready;      /* 1: a renderer copy of this surface would be a hit */
+    _Atomic u64 noted;      /* 1 after a client read served this surface; the prefetch refresh takes it */
+} CpuSurfaceView;
+#define CPU_SURFACE_VIEW_ADDRESS 0x7FFFFFFFFFFFull   /* table address: bits 0 to 46 */
+#define CPU_SURFACE_VIEW_COUNT 48                    /* entry count: bits 48 to 63 */
+enum { CPU_SURFACE_VIEW_CHANGING, CPU_SURFACE_VIEW_CLEAR, CPU_SURFACE_VIEW_PENDING, CPU_SURFACE_VIEW_READY };
+static _Atomic u64 s_cpu_surface_views;
+static int s_cpu_surface_fast;      /* RSX_CPU_SURFACE_FAST=0 keeps every read queued */
+static _Atomic u64 s_cpu_surface_fast_served;
+static u64 cpu_surface_view_load(const _Atomic u64 *value) {
+    return __c11_atomic_load(value,__ATOMIC_ACQUIRE);
+}
+static void cpu_surface_view_store(_Atomic u64 *value,u64 next) {
+    __c11_atomic_store(value,next,__ATOMIC_RELEASE);
+}
+static u64 cpu_surface_view_exchange(_Atomic u64 *value,u64 next) {
+    return __c11_atomic_exchange(value,next,__ATOMIC_ACQ_REL);
+}
+static u64 cpu_surface_view_increase(_Atomic u64 *value) {
+    return __c11_atomic_fetch_add(value,1,__ATOMIC_RELAXED)+1;
+}
+/* One client read of guest bytes [address, address+bytes) against view v. */
+static int cpu_surface_view_probe(const CpuSurfaceView *v,u32 address,u32 bytes) {
+    u64 sequence=cpu_surface_view_load(&v->sequence);
+    if(sequence&1)return CPU_SURFACE_VIEW_CHANGING;
+    u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end),ready=cpu_surface_view_load(&v->ready);
+    if(cpu_surface_view_load(&v->sequence)!=sequence)return CPU_SURFACE_VIEW_CHANGING;
+    if((u64)address>=end || (u64)address+bytes<=begin)return CPU_SURFACE_VIEW_CLEAR;
+    return ready?CPU_SURFACE_VIEW_READY:CPU_SURFACE_VIEW_PENDING;
+}
+/* Client thread. Returns 1 when it served the read, so no request is queued.
+ * A view that changes or waits for a copy makes the read take the queued
+ * path. A read that touches no surface takes the queued path too. */
+/* Hooks of rsx_deform_surface.inc, the CPU buffer of a paint target. They
+ * are NULL while that file is not in the build, or until its init runs:
+ * then every path below is as it was. */
+static struct {
+    int (*serve)(u32 address,u32 bytes);   /* 1: the CPU buffer holds every byte of the range */
+    int (*owned)(u32 rsx_offset);          /* 1: level 0 of a listed surface, buffer mode on   */
+    u64 (*sequence)(void);                 /* sum of the paint sequence numbers               */
+} s_cpu_surface_deform;
+static int cpu_surface_fast_request(u32 address,u32 bytes,u32 client_thread) {
+    if(!s_cpu_surface_fast)return 0;
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,bytes))return 1;
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views);
+    CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
+    u64 hits=0;
+    for(u64 i=views>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
+        int state=cpu_surface_view_probe(v,address,bytes);
+        if(state!=CPU_SURFACE_VIEW_CLEAR && state!=CPU_SURFACE_VIEW_READY)return 0;
+        if(state==CPU_SURFACE_VIEW_READY){
+            if(!cpu_surface_view_load(&v->noted))cpu_surface_view_store(&v->noted,1);
+            hits++;
+        }
+    }
+    if(!hits)return 0;
+    CpuSurfaceRequest fast={0};fast.address=address;fast.bytes=bytes;fast.client_thread=client_thread;
+    fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
+    fast.profile.matched=fast.profile.hits=hits;cpu_surface_profile_emit(&fast);
+    u64 served=cpu_surface_view_increase(&s_cpu_surface_fast_served);
+    if(s_cpu_surface_profile && !(served&1023))fprintf(stderr,"[CPUSURFACE_FAST] served=%llu\n",(unsigned long long)served);
+    return 1;
+}
+/* Layout of the state that the snapshot range check reads twice: the view
+ * table, the sum of its sequence numbers, the sequence number of the recorded
+ * draws, and the number of surfaces that hold a range. */
+enum { CPU_SURFACE_SNAPSHOT_TABLE, CPU_SURFACE_SNAPSHOT_SEQUENCES, CPU_SURFACE_SNAPSHOT_PENDING, CPU_SURFACE_SNAPSHOT_MATCHED, CPU_SURFACE_SNAPSHOT_SEEN };
 static void cpu_surface_fence_wait(void) {
     if(s_cpu_surface_fence_value==UINT64_MAX)cpu_surface_fail("GPU fence counter overflow",E_FAIL);
     u64 value=++s_cpu_surface_fence_value;
@@ -83,7 +174,6 @@ static void cpu_surface_fence_wait(void) {
          * that the copy is complete; keep the original bounded deadline. */
     }
 }
-
 /* GPU fence completion. A removed device reports UINT64_MAX as the completed
  * value of every fence; that is a failure, never a completion. */
 static int cpu_surface_fence_reached(ID3D12Fence *fence,u64 value) {
@@ -98,6 +188,67 @@ static void cpu_surface_fence_block(ID3D12Fence *fence,HANDLE event,u64 value,co
     if(cpu_surface_fence_reached(fence,value))return;
     CPU_SURFACE_HR(fence->lpVtbl->SetEventOnCompletion(fence,value,event));
     if(WaitForSingleObject(event,30000)!=WAIT_OBJECT_0 || !cpu_surface_fence_reached(fence,value))cpu_surface_fail(operation,E_FAIL);
+}
+/* Renderer thread only: one client-visible view for each slot of the surface
+ * pool. CPU_SURFACE_CAPACITY is the slot count of the pool. */
+static int cpu_surface_view_index(OffRT *r) {
+    int index=(int)(r-s_d3d.off_rt);
+    if(index<0 || index>=CPU_SURFACE_CAPACITY)cpu_surface_fail("surface view index",E_INVALIDARG);
+    return index;
+}
+/* Renderer thread. The view of slot `index`, or NULL when the table has no
+ * entry for it. */
+static CpuSurfaceView *cpu_surface_view_entry(int index) {
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views);
+    if((u64)index>=views>>CPU_SURFACE_VIEW_COUNT)return NULL;
+    return (CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS)+index;
+}
+/* Renderer thread. The view of slot `index`. A slot beyond the table adds
+ * entries: a table of twice the count (16 at first), then the old table
+ * retires. Returns NULL when the table cannot grow. That slot then has no
+ * view, and reads of it keep the queued path. */
+static CpuSurfaceView *cpu_surface_view_slot(int index) {
+    CpuSurfaceView *view=cpu_surface_view_entry(index);
+    if(view)return view;
+    u64 views=cpu_surface_view_load(&s_cpu_surface_views),count=views>>CPU_SURFACE_VIEW_COUNT;
+    CpuSurfaceView *old=(CpuSurfaceView *)(uintptr_t)(views&CPU_SURFACE_VIEW_ADDRESS);
+    u64 next=count?count*2:16;
+    while(next<=(u64)index && next<=0x8000)next*=2;
+    if(next>0xFFFF)return NULL;
+    CpuSurfaceView *table=(CpuSurfaceView *)calloc((size_t)next,sizeof(CpuSurfaceView));
+    if(!table)return NULL;
+    if((uintptr_t)table&~CPU_SURFACE_VIEW_ADDRESS){free(table);return NULL;}
+    for(u64 i=0;i<count;i++) {
+        cpu_surface_view_store(&table[i].sequence,cpu_surface_view_load(&old[i].sequence));
+        cpu_surface_view_store(&table[i].begin,cpu_surface_view_load(&old[i].begin));
+        cpu_surface_view_store(&table[i].end,cpu_surface_view_load(&old[i].end));
+        cpu_surface_view_store(&table[i].ready,cpu_surface_view_load(&old[i].ready));
+        cpu_surface_view_store(&table[i].noted,cpu_surface_view_load(&old[i].noted));
+    }
+    cpu_surface_view_store(&s_cpu_surface_views,(uintptr_t)table|next<<CPU_SURFACE_VIEW_COUNT);
+    for(u64 i=0;i<count;i++)cpu_surface_view_store(&old[i].sequence,cpu_surface_view_load(&old[i].sequence)+1);
+    return table+index;
+}
+/* Renderer thread. Publishes r as cpu_surface_read and cpu_surface_copy see
+ * it now: the guest bytes r owns and whether a copy of r would be a hit. The
+ * new view is visible only after all four fields are stored. */
+static void cpu_surface_view_update(OffRT *r) {
+    CpuSurfaceView *v=cpu_surface_view_slot(cpu_surface_view_index(r));
+    if(!v)return;
+    int live=r->res && r->cpu_address && !(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off));
+    u64 begin=live?(u64)r->cpu_address:0,end=live?begin+(u64)r->cpu_pitch*r->h:0;
+    u64 ready=!r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation;
+    u64 sequence=cpu_surface_view_load(&v->sequence);
+    cpu_surface_view_store(&v->sequence,sequence+1);
+    cpu_surface_view_store(&v->begin,begin);cpu_surface_view_store(&v->end,end);cpu_surface_view_store(&v->ready,ready);
+    cpu_surface_view_store(&v->sequence,sequence+2);
+}
+/* Renderer thread. r left its slot. No client may serve the old range, and a
+ * noted read must not reach the next surface of the slot. */
+static void cpu_surface_view_retire(OffRT *r) {
+    cpu_surface_view_update(r);
+    CpuSurfaceView *v=cpu_surface_view_entry(cpu_surface_view_index(r));
+    if(v)cpu_surface_view_exchange(&v->noted,0);
 }
 /* Prefetched copies of opted-in surfaces. RSX_CPU_SURFACE_PREFETCH lists up
  * to four RSX surface offsets (1-8 hex digits each, comma separated); none by
@@ -197,7 +348,7 @@ static int cpu_surface_prefetch_take(OffRT *r) {
     if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)((u64)r->cpu_pitch*r->h),r->cpu_pitch,
         mapped,(size_t)e->readback_bytes,e->readback_pitch,width,r->h,r->cpu_format))cpu_surface_fail("prefetched surface packing",E_INVALIDARG);
     D3D12_RANGE empty={0,0};e->readback->lpVtbl->Unmap(e->readback,0,&empty);
-    r->cpu_generation=r->gpu_generation;e->used++;
+    r->cpu_generation=r->gpu_generation;e->used++;cpu_surface_view_update(r);
     return 1;
 }
 /* Follow the surface at e->off. Returns it, or NULL when it is not live. */
@@ -266,6 +417,9 @@ static void cpu_surface_prefetch_refresh(void) {
     CpuSurfacePrefetch *entries[CPU_SURFACE_PREFETCH_MAX];OffRT *surfaces[CPU_SURFACE_PREFETCH_MAX];unsigned count=0;
     for(unsigned i=0;i<s_cpu_surface_prefetch_count;i++) {
         CpuSurfacePrefetch *e=&s_cpu_surface_prefetch[i];OffRT *r=cpu_surface_prefetch_track(e);
+        /* A read a client thread served itself asks for the next copy as well. */
+        CpuSurfaceView *view=r?cpu_surface_view_entry(cpu_surface_view_index(r)):NULL;
+        if(view && cpu_surface_view_exchange(&view->noted,0))e->wanted=1;
         if(r && e->wanted && r->gpu_generation && r->gpu_generation!=e->generation && cpu_surface_prefetch_width(r)){entries[count]=e;surfaces[count++]=r;}
     }
     if(!count)return;
@@ -321,8 +475,9 @@ static void cpu_surface_prefetch_shutdown(void) {
 }
 static void cpu_surface_copy(OffRT *r) {
     extern uint8_t *vm_base;
+    if(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off))return;
     if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->gpu_generation || r->cpu_generation==r->gpu_generation){if(s_cpu_surface_profile_active)s_cpu_surface_profile_active->hits++;return;}
-    if(cpu_surface_prefetch_take(r))return;
+    if(cpu_surface_prefetch_take(r))return;   /* the prefetched copy holds this generation */
     unsigned bpp=rsx_surface_readback_bpp(r->cpu_format);
     if(!bpp || r->cpu_pitch%bpp)cpu_surface_fail("unsupported guest surface layout",E_INVALIDARG);
     u32 width=r->w;
@@ -375,7 +530,7 @@ static void cpu_surface_copy(OffRT *r) {
     if(!mapped || rsx_surface_readback_rows(vm_base+r->cpu_address,(size_t)guest_bytes,r->cpu_pitch,
         mapped,(size_t)bytes,pitch,width,r->h,r->cpu_format))cpu_surface_fail("guest surface packing",E_INVALIDARG);
     D3D12_RANGE empty={0,0};r->cpu_readback->lpVtbl->Unmap(r->cpu_readback,0,&empty);
-    r->cpu_generation=r->gpu_generation;
+    r->cpu_generation=r->gpu_generation;cpu_surface_view_update(r);
     if(s_cpu_surface_profile_active) {
         s_cpu_surface_profile_active->packing+=cpu_surface_tick()-profile_begin;
         s_cpu_surface_profile_active->copies++;
@@ -387,6 +542,7 @@ static void cpu_surface_copy(OffRT *r) {
         r->cpu_address,r->off,r->cpu_pitch,width,r->h,r->cpu_format&31u,(unsigned long long)r->gpu_generation);
 }
 static void cpu_surface_read(u32 address,u32 bytes) {
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,bytes))return;
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
         OffRT *r=&s_d3d.off_rt[i];
         if(!r->res || !r->cpu_address)continue;
@@ -450,6 +606,7 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
     for(int i=0;i<CPU_SURFACE_CAPACITY;i++) {
         OffRT *r=&s_d3d.off_rt[i];
         if(!r->res || !r->cpu_address || !r->cpu_pitch || !r->h)continue;
+        if(s_cpu_surface_deform.owned&&s_cpu_surface_deform.owned(r->off))continue;
         views[view_count]=(RsxCpuSurfaceSnapshotView){r->cpu_address,r->cpu_pitch,r->h};
         targets[view_count++]=r;
     }
@@ -466,6 +623,8 @@ static int cpu_surface_snapshot(const VmReadSnapshotRange *ranges,u32 count,
                 (uint64_t)views[j].pitch*views[j].height;
             if(begin<view_end && end>views[j].address)intersects=1;
         }
+        /* A range the CPU buffer holds needs no view and no copy. */
+        if(intersects&&s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(ranges[i].address,ranges[i].bytes))intersects=0;
         bindings[i].view_index=UINT32_MAX;
         if(intersects && !rsx_cpu_surface_snapshot_bind(&ranges[i],1,
             views,view_count,&bindings[i]))
@@ -560,6 +719,7 @@ static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
         cpu_surface_read(address,bytes);s_cpu_surface_profile_active=previous;
         direct.profile.finished=direct.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&direct);return;
     }
+    if(cpu_surface_fast_request(address,bytes,client_thread))return;
     CpuSurfaceRequest request={0};request.address=address;request.bytes=bytes;request.client_thread=client_thread;request.status=-1;request.queued_ms=GetTickCount64();request.profile.queued=cpu_surface_tick();
     request.done=CreateEventA(NULL,FALSE,FALSE,NULL);
     if(!request.done)cpu_surface_fail("CPU read event creation",E_FAIL);
@@ -582,11 +742,61 @@ static void cpu_surface_request(u32 address,u32 bytes,void *opaque) {
     cpu_surface_profile_emit(&request);
     CloseHandle(request.done);
 }
+/* Snapshot fast path, client thread. RSX_CPU_SURFACE_SNAPSHOT_FAST=1 enables
+ * it; by default every snapshot request takes the FIFO boundary path.
+ * A request is served on the calling thread when the renderer holds nothing
+ * for its bytes: no recorded draw targets a range, and every surface that
+ * meets a range is current and holds the whole range. The guest bytes are
+ * then the bytes a scalar read of the same addresses serves on its calling
+ * thread (cpu_surface_fast_request). The check does not consume the FIFO: a
+ * draw that the guest published and the renderer did not record yet is not
+ * seen, as for a scalar read.
+ * The client reads the bytes into its own buffer and then repeats the check.
+ * The renderer writes the guest bytes of a surface only while that surface
+ * is not current, and it changes a view or the recorded draws only between
+ * two steps of a sequence number. An equal second check proves that no such
+ * change fell between the first check and the end of the read, so the bytes
+ * are one state of the memory. A declined request leaves the staging buffer
+ * unchanged and takes the boundary path. */
+/* Defined with the recorded draws of the prompt service. */
+static int cpu_surface_snapshot_clear(const VmReadSnapshotRange *ranges,u32 count,u64 *seen);
+static int cpu_surface_snapshot_recheck(const VmReadSnapshotRange *ranges,u32 count,const u64 *seen);
+static int s_cpu_surface_snapshot_fast;   /* RSX_CPU_SURFACE_SNAPSHOT_FAST=1 */
+static _Atomic u64 s_cpu_surface_snapshot_served, s_cpu_surface_snapshot_queued;
+/* Returns 1 when it served the request and staging holds the bytes. Returns 0
+ * when the request takes the boundary path. */
+static int cpu_surface_snapshot_fast(const VmReadSnapshotRange *ranges,u32 count,void *staging,u32 output_bytes,u32 client_thread) {
+    extern uint8_t *vm_base;
+    if(!s_cpu_surface_snapshot_fast)return 0;
+    if(!ranges || !staging || !count || count>VM_READ_SNAPSHOT_MAX_RANGES || !output_bytes || output_bytes>VM_READ_SNAPSHOT_MAX_BYTES)return 0;
+    for(u32 i=0;i<count;i++)
+        if(!ranges[i].bytes || (u64)ranges[i].address+ranges[i].bytes>0x100000000ull || (u64)ranges[i].output_offset+ranges[i].bytes>output_bytes)return 0;
+    unsigned char bytes[VM_READ_SNAPSHOT_MAX_BYTES];
+    u64 seen[CPU_SURFACE_SNAPSHOT_SEEN];
+    if(!cpu_surface_snapshot_clear(ranges,count,seen))goto queued;
+    memcpy(bytes,staging,output_bytes);
+    for(u32 i=0;i<count;i++) {
+        SIZE_T copied=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),vm_base+ranges[i].address,bytes+ranges[i].output_offset,ranges[i].bytes,&copied) || copied!=ranges[i].bytes)goto queued;
+    }
+    if(!cpu_surface_snapshot_recheck(ranges,count,seen))goto queued;
+    memcpy(staging,bytes,output_bytes);
+    CpuSurfaceRequest fast={0};fast.address=ranges[0].address;fast.bytes=output_bytes;fast.client_thread=client_thread;
+    fast.profile.queued=fast.profile.started=fast.profile.finished=fast.profile.returned=cpu_surface_tick();
+    fast.profile.matched=fast.profile.hits=seen[CPU_SURFACE_SNAPSHOT_MATCHED];cpu_surface_profile_emit(&fast);
+    u64 served=cpu_surface_view_increase(&s_cpu_surface_snapshot_served);
+    if(!(served&4095))fprintf(stderr,"[CPUSURFACE_SNAPSHOT_FAST] served=%llu queued=%llu\n",(unsigned long long)served,(unsigned long long)cpu_surface_view_load(&s_cpu_surface_snapshot_queued));
+    return 1;
+queued:
+    cpu_surface_view_increase(&s_cpu_surface_snapshot_queued);
+    return 0;
+}
 static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 count,
     void *staging,u32 output_bytes,void *opaque) {
     (void)opaque;
     if((LONG)GetCurrentThreadId()==InterlockedCompareExchange(&s_cpu_surface_thread,0,0))
         return VM_READ_SNAPSHOT_UNAVAILABLE;
+    if(cpu_surface_snapshot_fast(ranges,count,staging,output_bytes,(u32)GetCurrentThreadId()))return VM_READ_SNAPSHOT_OK;
     CpuSurfaceRequest request={0};request.address=ranges&&count?ranges[0].address:0;request.bytes=output_bytes;
     request.snapshot_ranges=ranges;request.snapshot_count=count;request.snapshot_staging=staging;
     request.snapshot_output_bytes=output_bytes;request.snapshot_result=VM_READ_SNAPSHOT_FAILED;
@@ -604,6 +814,7 @@ static int cpu_surface_snapshot_request(const VmReadSnapshotRange *ranges,u32 co
     request.profile.returned=cpu_surface_tick();cpu_surface_profile_emit(&request);CloseHandle(request.done);
     return request.snapshot_result;
 }
+
 /* Eager submission after writes to listed surfaces. RSX_CPU_SURFACE_EAGER
  * lists up to four RSX surface offsets (1-8 hex digits, comma separated);
  * none by default. When a recorded draw or clear writes a listed surface, the
@@ -694,8 +905,13 @@ typedef struct CpuSurfaceRange { u64 begin, end; } CpuSurfaceRange;
 static CpuSurfaceRange s_cpu_surface_pending[CPU_SURFACE_PENDING_MAX];
 static unsigned s_cpu_surface_pending_count;
 static int s_cpu_surface_pending_overflow;
+/* The recorded draws of the current batch, visible to client threads. The
+ * renderer thread is the only writer. It changes the list only between two
+ * steps of this sequence number, so a client that reads the same even number
+ * before and after the list saw one state of the list. */
+static _Atomic u64 s_cpu_surface_pending_sequence;
 static int s_cpu_surface_prompt;
-static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+static void cpu_surface_pending_insert(u32 address,u32 pitch,u32 height) {
     if(!address || address==0xffffffffu || !pitch)return;
     if(!height){s_cpu_surface_pending_overflow=1;return;}   /* unknown extent: serve nothing early */
     u64 begin=address,end=begin+(u64)pitch*height;
@@ -705,15 +921,64 @@ static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
     s_cpu_surface_pending[s_cpu_surface_pending_count].begin=begin;
     s_cpu_surface_pending[s_cpu_surface_pending_count++].end=end;
 }
+/* Renderer thread. Each recorded draw or clear registers its targets here. */
+static void cpu_surface_pending_add(u32 address,u32 pitch,u32 height) {
+    if(s_cpu_surface_deform.serve&&s_cpu_surface_deform.serve(address,(u32)((u64)pitch*height)))return;
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
+    cpu_surface_pending_insert(address,pitch,height);
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
+}
 static int cpu_surface_pending_overlaps(u32 address,u32 bytes) {
     if(s_cpu_surface_pending_overflow)return 1;
     for(unsigned i=0;i<s_cpu_surface_pending_count;i++)
         if((u64)address<s_cpu_surface_pending[i].end && (u64)address+bytes>s_cpu_surface_pending[i].begin)return 1;
     return 0;
 }
-/* render_frame consumed and submitted every recorded draw. */
+/* Client thread. 1 when the renderer holds nothing for the bytes of the
+ * ranges: no recorded draw targets a range, and the one surface that meets a
+ * range is current and holds the whole range. seen gets the view table, the
+ * sum of the sequence numbers of its entries, the sequence number of the
+ * recorded draws, and the number of surfaces that hold a range. */
+static int cpu_surface_snapshot_clear(const VmReadSnapshotRange *ranges,u32 count,u64 *seen) {
+    u64 table=cpu_surface_view_load(&s_cpu_surface_views),sequences=0,matched=0;
+    if(s_cpu_surface_deform.sequence)sequences+=s_cpu_surface_deform.sequence();
+    CpuSurfaceView *v=(CpuSurfaceView *)(uintptr_t)(table&CPU_SURFACE_VIEW_ADDRESS);
+    u32 owners[VM_READ_SNAPSHOT_MAX_RANGES]={0};
+    for(u64 i=table>>CPU_SURFACE_VIEW_COUNT;i;i--,v++) {
+        u64 sequence=cpu_surface_view_load(&v->sequence);
+        sequences+=sequence;
+        if(sequence&1)return 0;
+        int holds=0;
+        for(u32 j=0;j<count;j++) {
+            u64 begin=cpu_surface_view_load(&v->begin),end=cpu_surface_view_load(&v->end);
+            u64 first=ranges[j].address,last=first+ranges[j].bytes;
+            if(first>=end || last<=begin)continue;
+            /* The range meets this surface. The surface must be current and own every byte of the range. */
+            if(!cpu_surface_view_load(&v->ready) || first<begin || last>end || owners[j]++)return 0;
+            holds=1;
+        }
+        if(cpu_surface_view_load(&v->sequence)!=sequence)return 0;
+        matched+=holds;
+    }
+    u64 pending=cpu_surface_view_load(&s_cpu_surface_pending_sequence);
+    if(pending&1)return 0;
+    for(u32 j=0;j<count;j++)if(cpu_surface_pending_overlaps(ranges[j].address,ranges[j].bytes))return 0;
+    if(cpu_surface_view_load(&s_cpu_surface_pending_sequence)!=pending || cpu_surface_view_load(&s_cpu_surface_views)!=table)return 0;
+    seen[CPU_SURFACE_SNAPSHOT_TABLE]=table;seen[CPU_SURFACE_SNAPSHOT_SEQUENCES]=sequences;seen[CPU_SURFACE_SNAPSHOT_PENDING]=pending;seen[CPU_SURFACE_SNAPSHOT_MATCHED]=matched;
+    return 1;
+}
+/* Client thread. 1 when the renderer changed no view and no recorded draw
+ * since cpu_surface_snapshot_clear wrote seen. */
+static int cpu_surface_snapshot_recheck(const VmReadSnapshotRange *ranges,u32 count,const u64 *seen) {
+    u64 now[CPU_SURFACE_SNAPSHOT_SEEN];
+    return cpu_surface_snapshot_clear(ranges,count,now) && now[CPU_SURFACE_SNAPSHOT_TABLE]==seen[CPU_SURFACE_SNAPSHOT_TABLE] &&
+        now[CPU_SURFACE_SNAPSHOT_SEQUENCES]==seen[CPU_SURFACE_SNAPSHOT_SEQUENCES] && now[CPU_SURFACE_SNAPSHOT_PENDING]==seen[CPU_SURFACE_SNAPSHOT_PENDING];
+}
+/* render_frame submitted every recorded draw. */
 static void cpu_surface_batch_submitted(void) {
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
     s_cpu_surface_pending_count=0;s_cpu_surface_pending_overflow=0;
+    cpu_surface_view_store(&s_cpu_surface_pending_sequence,cpu_surface_view_load(&s_cpu_surface_pending_sequence)+1);
 }
 static void cpu_surface_service_ready(void) {
     if(!s_cpu_surface_prompt)return;
@@ -725,7 +990,7 @@ static void cpu_surface_service_ready(void) {
     CpuSurfaceRequest *pending=s_cpu_surface_head;
     for(CpuSurfaceRequest **link=&pending;*link;) {
         CpuSurfaceRequest *request=*link;
-        /* Snapshot requests retain their existing owned FIFO-boundary barrier. */
+        /* Snapshot requests retain their owned FIFO-boundary barrier. */
         if(request->snapshot_ranges){kept=s_cpu_surface_tail;break;}
         if(cpu_surface_pending_overlaps(request->address,request->bytes)){kept=request;link=&request->next;continue;}
         *link=request->next;request->next=NULL;*ready_tail=request;ready_tail=&request->next;
@@ -778,6 +1043,8 @@ static void cpu_surface_init(void) {
     s_cpu_surface_prompt=!(prompt&&prompt[0]=='0'&&!prompt[1]);
     const char *flush=getenv("RSX_CPU_SURFACE_FLUSH");
     s_cpu_surface_flush=!(flush&&flush[0]=='0'&&!flush[1]);
+    const char *fast=getenv("RSX_CPU_SURFACE_FAST");s_cpu_surface_fast=!(fast&&fast[0]=='0'&&!fast[1]);
+    const char *snapshot_fast=getenv("RSX_CPU_SURFACE_SNAPSHOT_FAST");s_cpu_surface_snapshot_fast=snapshot_fast&&snapshot_fast[0]=='1'&&!snapshot_fast[1];
     cpu_surface_batch_submitted();
     cpu_surface_eager_configure(getenv("RSX_CPU_SURFACE_EAGER"));
     if(s_cpu_surface_profile) {
@@ -788,7 +1055,6 @@ static void cpu_surface_init(void) {
         &IID_ID3D12CommandAllocator,(void **)&s_cpu_surface_alloc));
     CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateCommandList(s_d3d.device,0,D3D12_COMMAND_LIST_TYPE_DIRECT,
         s_cpu_surface_alloc,NULL,&IID_ID3D12GraphicsCommandList,(void **)&s_cpu_surface_list));
-    rsx_gpu_fault_name((ID3D12Object*)s_cpu_surface_list,L"RSX CPU surface copy");
     CPU_SURFACE_HR(s_cpu_surface_list->lpVtbl->Close(s_cpu_surface_list));
     CPU_SURFACE_HR(s_d3d.device->lpVtbl->CreateFence(s_d3d.device,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void **)&s_cpu_surface_fence));
     s_cpu_surface_event=CreateEventA(NULL,FALSE,FALSE,NULL);if(!s_cpu_surface_event)cpu_surface_fail("GPU event creation",E_FAIL);
@@ -799,7 +1065,7 @@ static void cpu_surface_retire(OffRT *r) {
     cpu_surface_prefetch_retire(r);
     cpu_surface_copy(r);
     if(r->cpu_readback){r->cpu_readback->lpVtbl->Release(r->cpu_readback);r->cpu_readback=NULL;}
-    r->cpu_address=r->cpu_pitch=0;r->gpu_generation=r->cpu_generation=0;
+    r->cpu_address=r->cpu_pitch=0;r->gpu_generation=r->cpu_generation=0;cpu_surface_view_retire(r);
 }
 static void cpu_surface_shutdown(void) {
     vm_read_sync_set_handler(NULL,NULL);
@@ -831,6 +1097,8 @@ static void cpu_surface_capture(D3D12DrawRecord *draw) {
         if (recorded_offset && recorded_offset == st->surface_color_offset[source] && draw->cpu_pitch[i])
             cpu_surface_eager_note(recorded_offset,draw->cpu_address[i]);
     }
+    /* Every recorded draw/clear passes here; its targets are pending until
+     * the batch is submitted. Then serve the reads none of them touch. */
     for(unsigned i=0;i<4;i++)cpu_surface_pending_add(draw->cpu_address[i],draw->cpu_pitch[i],draw->rt_h);
     cpu_surface_service_ready();
 }
@@ -842,9 +1110,10 @@ static void cpu_surface_bind(int index,const D3D12DrawRecord *draw,unsigned targ
     if(r->cpu_pitch!=pitch)r->cpu_generation=0;
     r->cpu_address=address;r->cpu_pitch=pitch;r->cpu_format=draw->rt_fmt;
     if(address && vm_read_sync_mark_range(address,(u64)pitch*r->h))cpu_surface_fail("guest surface registration",E_INVALIDARG);
+    cpu_surface_view_update(r);
 }
 static void cpu_surface_written(int primary,const int secondary[3]) {
-    if(primary>=0)s_d3d.off_rt[primary].gpu_generation++;
-    for(int i=0;i<3;i++)if(secondary[i]>=0)s_d3d.off_rt[secondary[i]].gpu_generation++;
+    if(primary>=0){s_d3d.off_rt[primary].gpu_generation++;cpu_surface_view_update(&s_d3d.off_rt[primary]);}
+    for(int i=0;i<3;i++)if(secondary[i]>=0){s_d3d.off_rt[secondary[i]].gpu_generation++;cpu_surface_view_update(&s_d3d.off_rt[secondary[i]]);}
 }
 #undef CPU_SURFACE_HR

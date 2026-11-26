@@ -12,12 +12,16 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
+extern void spu_indirect_branch(spu_context*);   /* spu_channels.c (resolver) */
 
 #include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_dec_* */
 
@@ -228,12 +232,12 @@ static int spu_step(spu_context* ctx) {
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
     spu_ins d; spu_decode1(insn, pc, &d);
-    uint32_t next = (pc + 4) & 0x3FFFC;
+    uint32_t next = pc + 4;
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il:  DST = spu_il(I); break;
-    case SPU_ilh: DST = spu_ilh((uint16_t)I); break;
+    case SPU_il:  DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_ilh: DST = spu_ilh(I); break;
     case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
@@ -260,7 +264,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_cg:   DST = spu_cg(A,B); break;
     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
     case SPU_mpyi: DST = spu_mpyi(A,I); break;
-    case SPU_mpyui: DST = spu_mpyui(A,I); break;
+    case SPU_mpyui:DST = spu_mpyui(A,I); break;
     /* logical */
     case SPU_and: DST = spu_and(A,B); break;
     case SPU_or:  DST = spu_or(A,B); break;
@@ -306,6 +310,8 @@ static int spu_step(spu_context* ctx) {
     case SPU_rotmai:DST = spu_rotmai(A,I); break;
     case SPU_roth: DST = spu_roth(A,B); break;
     case SPU_rothi:DST = spu_rothi(A,I); break;
+    case SPU_rothmi: DST = spu_rothmi(A,I); break;
+    case SPU_rotmahi:DST = spu_rotmahi(A,I); break;
     case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
     case SPU_shlqbii:DST = spu_shlqbii(A,I); break;
     case SPU_shlqby: DST = spu_shlqby(A,B); break;
@@ -349,6 +355,9 @@ static int spu_step(spu_context* ctx) {
     case SPU_fa: DST = spu_fa(A,B); break;
     case SPU_fs: DST = spu_fs(A,B); break;
     case SPU_fm: DST = spu_fm(A,B); break;
+    case SPU_dfa: DST = spu_dfa(A,B); break;
+    case SPU_dfs: DST = spu_dfs(A,B); break;
+    case SPU_dfm: DST = spu_dfm(A,B); break;
     case SPU_fcgt: DST = spu_fcgt(A,B); break;
     case SPU_fceq: DST = spu_fceq(A,B); break;
     case SPU_cflts: DST = spu_cflts(A,I); break;
@@ -374,20 +383,15 @@ static int spu_step(spu_context* ctx) {
     case SPU_clgthi:DST = spu_clgthi(A,I); break;
     /* integer / byte extras */
     case SPU_bg:    DST = spu_bg(A,B); break;
-    case SPU_bgx:   DST = spu_bgx(A,B,DST); break;   /* RR: rt is accumulator + dest */
     case SPU_absdb: DST = spu_absdb(A,B); break;
     case SPU_avgb:  DST = spu_avgb(A,B); break;
     case SPU_sumb:  DST = spu_sumb(A,B); break;
     case SPU_mpys:  DST = spu_mpys(A,B); break;
     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha: DST = spu_mpyhha(A,B,DST); break;   /* RR (0x346): rt is accumulator + dest, NOT RRR */
-    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,DST); break;
+    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
-    case SPU_rothmi:   DST = spu_rothmi(A,I); break;
-    case SPU_rotmah:   DST = spu_rothma(A,B); break;
-    case SPU_rotmahi:  DST = spu_rotmahi(A,I); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
     case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
     case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
@@ -396,68 +400,58 @@ static int spu_step(spu_context* ctx) {
     /* channels */
     case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
     case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
-    case SPU_rchcnt: DST = spu_pref_u32(spu_rchcnt(ctx, d.ch)); break;   /* count in the preferred word, rest zero (as the lifter) */
+    case SPU_rchcnt: DST = spu_splat_u32(spu_rchcnt(ctx, d.ch)); break;
     /* hints / no-ops */
     case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
     case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
-    case SPU_fscrwr: break;
-    case SPU_mfspr: DST = spu_mfspr(A); break;      /* SPRs read as zero */
-    case SPU_fscrrd: DST = spu_fscrrd(A); break;    /* FPSCR reads as zero */
-    /* double precision */
-    case SPU_dfa:  DST = spu_dfa(A,B); break;
-    case SPU_dfs:  DST = spu_dfs(A,B); break;
-    case SPU_dfm:  DST = spu_dfm(A,B); break;
-    case SPU_dfma: DST = spu_dfma(A,B,DST); break;   /* RR: rt is accumulator + dest */
-    case SPU_dfms: DST = spu_dfms(A,B,DST); break;
-    case SPU_dfnms:DST = spu_dfnms(A,B,DST); break;
-    case SPU_dfnma:DST = spu_dfnma(A,B,DST); break;
-    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
-    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
-    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
-    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
-    case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
+    case SPU_mfspr: case SPU_fscrrd: case SPU_fscrwr: break;
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
+    case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt;
         { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
     case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    /* bi/iret carry the interrupt enable/disable bits (E = 0x40000 sets
-     * int_enable, D = 0x80000 clears it), effective when the branch is taken,
-     * exactly as the lifter decodes them. */
-    #define SPU_IED_BITS() do { \
+    /* bi* interrupt-control bits mirror the lifted path (spu_channels.c):
+     * E (0x40000) sets int_enable, D (0x80000) clears it. A branch to srr0
+     * with interrupts re-enabled is the interrupt RETURN: bail to the host
+     * dispatcher so the register file saved at TAKE is restored
+     * (spu_irq_regs_maybe_restore). Branching in-place keeps the handler's
+     * regs and derails the continuation -- the MS1 wwsjob PM run#53 wedged
+     * exactly there: StallAck fired, iret was swallowed, and the loop after
+     * srr0 spun forever on derailed registers. */
+#define SPU_IRET_BAIL(tgt) do { \
         if (insn & 0x40000u) ctx->int_enable = 1; \
-        else if (insn & 0x80000u) ctx->int_enable = 0; \
-    } while (0)
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
-    case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
-    case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
-        DST = spu_link((pc + 4) & 0x3FFFC);
-        if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
-            next = tg;
-            SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */
-        break; }
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC;
-        /* The handler preserves every register: on a return to the point the
-         * interrupt was taken, restore the register file saved there. The
-         * lifted dispatch path does this in spu_irq_regs_maybe_restore; an iret
-         * executed here has to as well, or the snapshot stays armed and later
-         * lands on an unrelated dispatch. */
-        SPU_IED_BITS();
-        if (ctx->irq_saved && next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
-            memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
-            ctx->irq_saved = 0;
-        }
+        if (insn & 0x80000u) ctx->int_enable = 0; \
+        if (ctx->irq_saved && ctx->int_enable && \
+            (tgt) == (ctx->irq_resume_pc & 0x3FFFC) && (tgt)) { \
+            ctx->pc = (tgt); ctx->status = SPU_STATUS_RUNNING; \
+            ctx->stop_code = 0; return 2; } } while (0)
+    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IRET_BAIL(next); break;
+    case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC;
+        if (insn & 0x40000u) ctx->int_enable = 1;
+        if (insn & 0x80000u) ctx->int_enable = 0;
         break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_iret: ctx->int_enable = 1; next = ctx->srr0 & 0x3FFFC;
+        ctx->pc = next; ctx->status = SPU_STATUS_RUNNING; ctx->stop_code = 0;
+        return 2;
+    case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IRET_BAIL(next); } break;
+    case SPU_binz: if (PREF(DST) != 0) { next = PREF(A) & 0x3FFFC; SPU_IRET_BAIL(next); } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IRET_BAIL(next); } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IRET_BAIL(next); } break;
+#undef SPU_IRET_BAIL
     case SPU_stop: case SPU_stopd:
-        ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
+        /* Hardening (Fix A, interpreter side): a policy excursion executing
+         * a ZERO word read it as stop 0x0000 and killed the lane
+         * (native_usercheck.err:4502 "synthesised stop 0x0000 at LS
+         * 0x39004"). A real policy stop carries a code; zero stops only
+         * come from virgin LS. Bail recoverably to the TAKE-time register
+         * file at srr0, like SPU_IRET_BAIL. */
+        if (ctx->policy_mode && I == 0 && ctx->irq_saved &&
+            spu_pm_recoverable_bail(ctx, pc, 0))
+            return 2;
+        ctx->pc = next; ctx->stop_code = (uint32_t)I;
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
     /* conditional halts (assertions): stop the SPU when the condition holds,
      * else continue. The preferred word of ra is compared. */
@@ -492,6 +486,8 @@ static int spu_step(spu_context* ctx) {
 }
 
 SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc = 0;
+uint64_t g_spu_interp_budget = 0;   /* host-armed step ceiling, 0 = off */
+int g_spu_interp_budget_hit = 0;
 SPU_THREAD_LOCAL uint64_t g_spu_interp_steps   = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
@@ -514,12 +510,20 @@ void spu_trace_dump(uint32_t at) {
         fprintf(stderr, "   0x%05X -> 0x%05X\n", s_trace[idx].from, s_trace[idx].to);
     }
 }
+static uint32_t pm_gate_lw(spu_context* c, uint32_t a) {
+    return ((uint32_t)c->ls[a & 0x3FFFCu] << 24)
+         | ((uint32_t)c->ls[(a + 1) & 0x3FFFFu] << 16)
+         | ((uint32_t)c->ls[(a + 2) & 0x3FFFFu] << 8)
+         |  (uint32_t)c->ls[(a + 3) & 0x3FFFFu];
+}
+extern void spu_halt(spu_context*);   /* spu_channels.c (guard yield below) */
+
 
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
-static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t budget, int native_call) {
+static uint32_t interp_run_until_impl(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t local_budget, int native_call) {
     native_freeze();
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
@@ -538,22 +542,29 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
     static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
+    /* SPU_KH_TRACE=1: see the [kh] hook below. */
+    static int s_kh=-1; if(s_kh<0){const char*e=getenv("SPU_KH_TRACE");s_kh=(e&&e[0]=='1')?1:0;}
+    static int s_khn=0;
     for (;;) {
-        if (budget && steps>=budget) {
-            g_spu_interp_steps=steps; return ctx->pc;
-        }
-        /* Owned-job mode must not consume an enabled IRQ window entirely
-         * inside the policy interpreter before the drain can observe it. */
-        if (spu_native_owned_policy(ctx) && ctx->int_enable && !ctx->irq_saved &&
+        if (local_budget && steps>=local_budget) { g_spu_interp_steps=steps; return ctx->pc; }
+        /* An enable/disable window may span only a few instructions. Deliver
+         * an unmasked pending interrupt before the next instruction, including
+         * a kernel-service transfer; a periodic scheduler poll can miss it. */
+        if (ctx->int_enable && !ctx->irq_saved &&
             (ctx->event_status & ctx->event_mask))
-            spu_take_interrupt(ctx,NULL);
+            spu_take_interrupt(ctx, NULL);
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
-         * Preserve the legacy CRI return convention while invoking the HLE. */
+         * Preserve the legacy CRI return convention while invoking the HLE.
+         * The third arm mirrors spu_indirect_branch's "standalone" rule: a
+         * non-policy context (MS1's img-2 ATRAC task and its interpreted
+         * codec) whose syscallAddr is 0xA70 and with nothing lifted there
+         * takes the HLE too. */
         if (ctx->pc == 0xA70u) {
             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
+            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u) ||
+                (sc == 0xA70u && !ctx->policy_mode && !spu_lifted_lookup(ctx, 0xA70u))) {
                 extern void spu_spurs_taskset_syscall(spu_context*);
                 int _save = ctx->image_id; ctx->image_id = 22;
                 spu_spurs_taskset_syscall(ctx);
@@ -562,34 +573,549 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
                 continue;
             }
         }
+
+        /* SPURS kernel services: exit-to-kernel / select-workload sit at
+         * reserved LS addresses the HLE resolver intercepts -- there is no
+         * code at them in a policy lane's LS (the real kernel would be there).
+         * Interpreted policy flow MUST hand back instead of executing the
+         * zeros: the wwsjob PM's select bisl stepped 0x9D0->0x9D4 and the
+         * synthesised stop there killed every Execute phase. */
+        if (ctx->policy_mode &&
+            (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
+             ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS)) {
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc;
+            /* Round 30: the ONLY legit wi_state clearer besides
+             * spu_context_init. Counted so a run can verify no other site
+             * zeroes it behind our back (bg_287's wi==0-at-pass-entry
+             * mystery). */
+            { static int s_kh = 0;
+              if (s_kh++ < 8 || (s_kh % 4096) == 0)
+                  fprintf(stderr, "[walkin] HANDOFF wi=%d->0 img=%d #%d\n",
+                          ctx->wi_state, ctx->wi_img, s_kh),
+                  fflush(stderr); }
+            ctx->pm_designed = 1;   /* designed cooperative handoff (R33) */
+            ctx->wi_link_pending = 0;   /* kernel cycle over (R34) */
+            if (ctx->pm_win_touched) {
+                static int s_wh = 0;
+                if (s_wh++ < 24)
+                    fprintf(stderr, "[pm-window] EXIT class=handoff pc=0x%05X "
+                            "wi=%d 12A0=0x%08X 12C0=0x%08X 12D0=0x%08X\n",
+                            (uint32_t)ctx->pc & SPU_LS_MASK, ctx->wi_state,
+                            pm_gate_lw(ctx, 0x12A0), pm_gate_lw(ctx, 0x12C0),
+                            pm_gate_lw(ctx, 0x12D0)),
+                    fflush(stderr);
+            }
+            return ctx->pc;
+        }
+        /* Round 14 [pm-gate]: the wwsjob PM's state-2->3 advance decoded
+         * from spurspm_46EAABFB56B7B1B5_11136.bin:
+         *   0x2BD8: handler 0x21A0(8) must return nonzero, then 0x1A08
+         *           scans (12D0==0 ? 2 : 12D0-1) slot words at a table
+         *           derived from the 0xC00 descriptor; ZERO slots are
+         *           SKIPPED (brz 0x1A2C); a nonzero slot -> 0x2C18 launch.
+         *           ALL-ZERO table -> r3==0 -> 0x12A0 never becomes 3
+         *           (= the kExecuteCommands park; bg_269 invariant).
+         *   0x2940: launch scan over the 0xEB0 table tests bit 0x40000000
+         *           per entry; none set -> no claim (img 210 never
+         *           dispatches).
+         * Log the decision points while interpreted. */
+        if (ctx->policy_mode) {
+            static int _gt = -1;
+            if (_gt < 0) { const char* e = getenv("SPU_PM_GATE_TRACE");
+                           _gt = (e && *e == '0') ? 0 : 1; }
+            /* Round 28: walk-in span tracking, outside _gt so the retire
+             * guard runs with gate tracing off. wi_state transitions on
+             * every fetch: 1 while pc is inside a staged module span, 2
+             * once it has left toward PM code, 0 at kernel handoff (above).
+             * A retire/prep (0x2EF0) reached with wi_state==2 means the PM
+             * is about to re-prepare a slot while a walk-in module from
+             * this cycle is still logically in flight -- on hardware the
+             * kernel would not preempt the SPU mid-job here; our
+             * per-quantum restart does. SPU_PM_RETIRE_GUARD=0 rolls back. */
+            { uint32_t wpc28 = (uint32_t)ctx->pc & SPU_LS_MASK;
+              int win28 = 0, wslot28 = -1;
+              for (int i = 0; i < 4; i++)
+                  if (ctx->resident_code[i].size
+                      && wpc28 >= ctx->resident_code[i].lsa
+                      && wpc28 < ctx->resident_code[i].lsa
+                                   + ctx->resident_code[i].size) {
+                      win28 = 1; wslot28 = i; break;
+                  }
+              if (wpc28 >= 0x2EF0u && wpc28 < 0x3078u) ctx->pm_win_touched = 1;
+              if (wpc28 == 0x3064u) {
+                  static int s_ml = 0;
+                  if (s_ml++ < 8 || (s_ml % 1024) == 0)
+                      fprintf(stderr, "[pm-yield] 0x3064 LAUNCH bisl "
+                              "target=0x%05X wi=%d 12A0=0x%08X #%d\n",
+                              (uint32_t)ctx->gpr[5]._u32[0] & SPU_LS_MASK,
+                              ctx->wi_state, pm_gate_lw(ctx, 0x12A0), s_ml),
+                      fflush(stderr);
+              }
+              if (win28) {
+                  static int s_went = 0;
+                  if (ctx->wi_state != 1) {
+                      ctx->wi_state = 1;
+                      /* Round 34: capture the bisl link (prev fetch + 4)
+                       * at span entry -- the PM continuation the module's
+                       * stop must return to (0x3068-class). */
+                      ctx->wi_resume_link = (ctx->wi_prev_pc + 4u) & SPU_LS_MASK;
+                      if (wslot28 >= 0) {
+                          ctx->wi_img = ctx->resident_code[wslot28].image_id;
+                          ctx->wi_span_lo = ctx->resident_code[wslot28].lsa;
+                          ctx->wi_span_hi = ctx->resident_code[wslot28].lsa
+                                          + ctx->resident_code[wslot28].size;
+                      }
+                      if (s_went++ < 16 || (s_went % 4096) == 0)
+                          fprintf(stderr, "[walkin] ENTER pc=0x%05X img=%d "
+                                  "span=[0x%05X,0x%05X) link=0x%05X #%d\n",
+                                  wpc28, ctx->wi_img,
+                                  ctx->wi_span_lo, ctx->wi_span_hi,
+                                  ctx->wi_resume_link, s_went),
+                          fflush(stderr);
+                  }
+              } else if (ctx->wi_state == 1) {
+                  static int s_wxit = 0;
+                  ctx->wi_state = 2;
+                  /* Round 30 (c): ret-to = gpr0 (bi $r0's target = where
+                   * the PM resumes), r4 = the module's job parameter at
+                   * exit. bg_288 class: the 210 entry stub no-ops and
+                   * returns instantly when its parameter is 0 (brz r81
+                   * -> low-LS job-done vector at module+0x24 path) --
+                   * r4==0 at EXIT names a launch-parameter defect. */
+                  if (s_wxit++ < 16 || (s_wxit % 1024) == 0)
+                      fprintf(stderr, "[walkin] EXIT pc=0x%05X img=%d "
+                              "ret-to=0x%05X r3=0x%08X r4=0x%08X "
+                              "(pc left span toward PM) #%d\n",
+                              wpc28, ctx->wi_img,
+                              (uint32_t)(ctx->gpr[0]._u32[0] & SPU_LS_MASK),
+                              ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                              s_wxit),
+                      fflush(stderr);
+                  /* Round 31: bg_288's smoking EXIT (pc=0x2D68, r3=0) is
+                   * the module calling a PM service IN THE SAME LS (bi
+                   * indirect; SPURS jobmods branch straight into the
+                   * kernel's low-LS code) and the service failing. 0x2D40+
+                   * feeds brsl 0x2C18, the launch walk over the
+                   * 0xDF0/0x11B0/0xEB0 tables -- r3=0 means the walk found
+                   * nothing claimable. The module's output-publish path
+                   * aborts on that (jobstop=0 forever). Dump the walk's
+                   * exact inputs at the failing return so the empty table
+                   * names itself. */
+                  if (ctx->gpr[3]._u32[0] == 0
+                      && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= ctx->wi_span_lo
+                      && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) <  ctx->wi_span_hi) {
+                      static int s_sf = 0;
+                      if (s_sf++ < 8 || (s_sf % 256) == 0) {
+                          uint32_t r0 = (uint32_t)(ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                          fprintf(stderr, "[svc-fail] pm=0x%05X ret-to=0x%05X "
+                                  "img=%d: walk inputs -- 1290(ticket)=0x%08X "
+                                  "12D0=0x%08X 12C0=0x%08X 1300=0x%08X "
+                                  "12A0=0x%08X\n",
+                                  wpc28, r0, ctx->wi_img,
+                                  pm_gate_lw(ctx, 0x1290),
+                                  pm_gate_lw(ctx, 0x12D0),
+                                  pm_gate_lw(ctx, 0x12C0),
+                                  pm_gate_lw(ctx, 0x1300),
+                                  pm_gate_lw(ctx, 0x12A0));
+                          fprintf(stderr, "[svc-fail] EB0[0..3]=");
+                          for (int _e = 0; _e < 4; _e++)
+                              fprintf(stderr, " %08X", pm_gate_lw(ctx, 0xEB0 + 8*_e));
+                          fprintf(stderr, " 11B0w0=0x%08X DF0w0=0x%08X "
+                                  "1420=0x%08X\n",
+                                  pm_gate_lw(ctx, 0x11B0),
+                                  pm_gate_lw(ctx, 0x0DF0),
+                                  pm_gate_lw(ctx, 0x1420));
+                          fflush(stderr);
+                      }
+                  }
+              }
+              ctx->wi_prev_pc = wpc28;
+              if (wpc28 == 0x2EF0u) {
+                  static int s_rg = -1;
+                  if (s_rg < 0) { const char* e = getenv("SPU_PM_RETIRE_GUARD");
+                                  s_rg = (e && e[0] == '0') ? 0 : 1; }
+                  if (s_rg) {
+                      /* Round 30: the round-28 stall on wi==2 was WRONG and
+                       * wedge-shaped. wi==2 at 0x2EF0 means the module
+                       * returned to PM flow THIS cycle (span exit already
+                       * happened); that retire is legit NEXT-job prep, and
+                       * stalling it froze the machine at this pc forever
+                       * (bg_287: retire_stall lines climbing, zero jobstop).
+                       * pc can never be inside the module span here
+                       * (0x2EF0 < span base 0x4000), so "retire while the
+                       * module is mid-run" is not even representable at this
+                       * site -- a mid-run park ends the pass by halt with
+                       * wi_state==1, and the round-29 pc-RESUME is what
+                       * continues it. Guard is now diagnostic-only: log the
+                       * decision inputs, never stall. SPU_PM_RETIRE_GUARD=0
+                       * silences the log too. */
+                      static int s_rn = 0;
+                      if (s_rn++ < 24 || (s_rn % 256) == 0) {
+                          extern uint8_t* vm_base;
+                          uint32_t qea = pm_gate_lw(ctx, 0x13F0);
+                          uint32_t gw = 0;
+                          if (vm_base && qea)
+                              gw = __builtin_bswap32(
+                                  *(const uint32_t*)(vm_base + (qea & 0x3FFFFFFFu) + 0x10));
+                          fprintf(stderr, "[pm-gate] TIMEOUT-RETIRE "
+                                  "12A0=0x%08X 12D0=0x%08X 1420=0x%08X "
+                                  "guest@0x%08X+0x10=0x%08X wi=%d img=%d "
+                                  "-- retire proceeds (guard diagnostic)\n",
+                                  pm_gate_lw(ctx, 0x12A0), pm_gate_lw(ctx, 0x12D0),
+                                  pm_gate_lw(ctx, 0x1420), qea, gw,
+                                  ctx->wi_state, ctx->wi_img);
+                          fflush(stderr);
+                      }
+                  }
+              }
+              /* Round 32: bg_289 froze at {12A0=0 (post-0x3014 fsmbi reset),
+               * 12C0=0xFFFFFFF1 PARKED, 12D0=-1} with live bit-30 0xEB0
+               * entries -- the claim cycle never re-runs. Decode:
+               *   0x1900 ori r0,r0,-16; 0x1904 stqa r0,0x12C0
+               *     = THE PARK (12C0 |= ~15, keeps low nibble = buffer
+               *     count; makes 12C0 signed-negative). Taken at 0x18F8
+               * when the 0x2B88 decrementer helper returns r3==0.
+               *   0x2B04-0x2B0C: state-0 handler claims ONLY if
+               *     cgti(12C0,-1) -- parked = claim unreachable.
+               *   Un-park writers: ONLY 0x2F2C (prep, writes slot+1,
+               *     reached via the claim itself) and 0x2A34 (attach
+               *     re-init). Once parked in state 0, no in-module path
+               *     back except attach re-init. Parked + state-0 is the
+               *     wedge signature. */
+              if (wpc28 == 0x1904u) {
+                  static int s_pk = 0;
+                  if (s_pk++ < 12 || (s_pk % 512) == 0) {
+                      fprintf(stderr, "[pm-park] 0x1904 writes 12C0=0x%08X "
+                              "(old=0x%08X) 12A0=0x%08X 12D0=0x%08X "
+                              "12F0=0x%08X EB0w0=0x%08X dec=0x%08X "
+                              "#%d\n",
+                              ctx->gpr[0]._u32[0], pm_gate_lw(ctx, 0x12C0),
+                              pm_gate_lw(ctx, 0x12A0), pm_gate_lw(ctx, 0x12D0),
+                              pm_gate_lw(ctx, 0x12F0), pm_gate_lw(ctx, 0xEB0),
+                              ctx->gpr[5]._u32[0], s_pk);
+                      fflush(stderr);
+                  }
+              }
+              if (wpc28 == 0x2B0Cu) {
+                  /* claim gate decision: pc just arrived here with 12C0 in
+                   * r2 (loaded 0x2B04). Log when WORK IS AVAILABLE (EB0[0]
+                   * bit30) but the gate blocks -- the wedge discriminator. */
+                  static int s_cg = 0;
+                  uint32_t eb0 = pm_gate_lw(ctx, 0xEB0);
+                  if ((eb0 & 0x40000000u)
+                      && (ctx->gpr[2]._u32[0] & 0x80000000u)) {
+                      if (s_cg++ < 12 || (s_cg % 512) == 0) {
+                          fprintf(stderr, "[pm-gate] CLAIM-BLOCKED 12C0="
+                                  "0x%08X (parked) 12A0=0x%08X "
+                                  "EB0w0=0x%08X -- work posted, claim "
+                                  "disabled #%d\n",
+                                  ctx->gpr[2]._u32[0],
+                                  pm_gate_lw(ctx, 0x12A0), eb0, s_cg);
+                          fflush(stderr);
+                      }
+                  }
+              }
+            }
+             if (_gt) {
+            { /* Round 23: walk-in probe. The PM launches staged jobmods by
+               * sequentially walking into their bytes (no indirect branch,
+               * so resident-code DISPATCH never fires). On FIRST entry into
+               * any resident_code span, compare LS bytes at pc against the
+               * module's guest source and the PM's own image (staged from
+               * the SPURS instance ELF): match=module is the healthy
+               * launch, match=NEITHER means the span was overwritten
+               * between staging and walk-in (restage race). Capped 16. */
+              static int s_inspan = 0, s_win = 0;
+              uint32_t wpc = (uint32_t)ctx->pc & SPU_LS_MASK;
+              int win = 0, wslot = -1;
+              for (int i = 0; i < 4; i++)
+                  if (ctx->resident_code[i].size
+                      && wpc >= ctx->resident_code[i].lsa
+                      && wpc < ctx->resident_code[i].lsa
+                                   + ctx->resident_code[i].size) {
+                      win = 1; wslot = i; break;
+                  }
+              if (win && !s_inspan && s_win < 16) {
+                  s_win++;
+                  extern uint8_t* vm_base;
+                  const char* verdict = "no-source";
+                  uint32_t wls[4] = {0,0,0,0}, wmod[4] = {0,0,0,0};
+                  if (wslot >= 0) {
+                      uint32_t msrc = ctx->resident_code[wslot].source_ea
+                                    + (wpc - ctx->resident_code[wslot].lsa);
+                      const uint8_t* a = ctx->ls + wpc;
+                      const uint8_t* b = vm_base + msrc;
+                      int mod_ok = vm_base && memcmp(a, b, 16) == 0;
+                      int pm_ok = vm_base
+                          && memcmp(a, vm_base + 0x10135E00u + (wpc - 0xA00u),
+                                    16) == 0;
+                      verdict = mod_ok ? "match=module"
+                              : pm_ok ? "match=PM" : "match=NEITHER";
+                      for (int k = 0; k < 4; k++) {
+                          wls[k]  = __builtin_bswap32(
+                              *(const uint32_t*)(a + 4*k));
+                          wmod[k] = vm_base ? __builtin_bswap32(
+                              *(const uint32_t*)(b + 4*k)) : 0;
+                      }
+                  }
+                  fprintf(stderr, "[walkin] pc=0x%05X img=%d %s "
+                          "ls=%08X %08X mod=%08X %08X\n", wpc,
+                          wslot >= 0 ? ctx->resident_code[wslot].image_id : -1,
+                          verdict, wls[0], wls[1], wmod[0], wmod[1]);
+                  fflush(stderr);
+              }
+              if (win && !s_inspan && wslot >= 0) {
+                  /* Round 24 (c): walk-in native handoff. Sequential entry
+                   * into a staged jobmod span never passes an indirect
+                   * branch, so the resident-code fast path in
+                   * spu_indirect_branch never ran and the module has been
+                   * interpreted (~100ms/quantum) -- slower than the PM's
+                   * retire window, so the PM retires+republishes livelocked
+                   * jobs that were still running. Exit the interpreter with
+                   * the resolver trampoline armed: spu_indirect_branch
+                   * resolves pc in the resident_code span and tail-calls
+                  * the lift, running the module at native speed; the lift
+                  * stop/return paths (synthesised-stop, link-honoring
+                  * staged-span exit) hand control back exactly as they do
+                  * for bisl-launched staged codecs. MISS keeps the
+                  * interpreter (status quo). SPU_WALKIN_NATIVE=1 opts IN:
+                  * bg_281 regression -- default ON produced 7.8M native
+                  * re-dispatches, FPS 0, jobstop 0. Even at REAL function
+                  * starts (0x40B0/0x4110 are registered) the lift re-runs
+                  * the prologue on mid-module guest state and its return
+                  * never advances the walk-in site. Sequential walk-ins are
+                  * NOT bisl launches. */
+                  static int s_nat = -1;
+                  if (s_nat < 0) { const char* e = getenv("SPU_WALKIN_NATIVE");
+                                  s_nat = (e && e[0] == '1' && !e[1]) ? 1 : 0; }
+                  if (s_nat) {
+                      extern int spu_walkin_lift(uint32_t pc, int img, int rel);
+                      if (spu_walkin_lift(wpc,
+                              ctx->resident_code[wslot].image_id,
+                              ctx->resident_code[wslot].rel)) {
+                          static int s_hd = 0;
+                          if (s_hd++ < 8 || (s_hd % 64) == 0)
+                              fprintf(stderr, "[walkin] NATIVE handoff pc=0x%05X "
+                                      "img=%d (lift hit -- module runs compiled)\n",
+                                      wpc, ctx->resident_code[wslot].image_id),
+                              fflush(stderr);
+                          g_spu_trampoline_fn = spu_indirect_branch;
+                          g_spu_interp_steps = steps;
+                          return ctx->pc;
+                      }
+                  }
+              }
+              s_inspan = win; }
+                if (ctx->pc == 0x2C08u) {
+                    static int _n2 = 0;
+                    if (_n2++ < 40) {
+                        uint32_t cur = ctx->gpr[2]._u32[0] & SPU_LS_MASK;
+                        fprintf(stderr, "[pm-gate] 0x2C08 verdict r3=0x%08X "
+                                "slot[-2]=0x%08X slot[-1]=0x%08X (cur=0x%05X) "
+                                "12D0=0x%08X 12A0=0x%08X C00w0=0x%08X%s\n",
+                                ctx->gpr[3]._u32[0],
+                                pm_gate_lw(ctx, cur - 16), pm_gate_lw(ctx, cur - 8), cur,
+                                pm_gate_lw(ctx, 0x12D0), pm_gate_lw(ctx, 0x12A0),
+                                pm_gate_lw(ctx, 0xC00),
+                                ctx->gpr[3]._u32[0] ? " -> ADVANCE 12A0=3"
+                                                    : " -> STAY 2 (park)");
+                        fflush(stderr);
+                    }
+                } else if (ctx->pc == 0x2BD8u) {
+                    static int _n0 = 0;
+                    if (_n0++ < 16)
+                        fprintf(stderr, "[pm-gate] state2 entry 12D0=0x%08X "
+                                "12A0=0x%08X C00w0=0x%08X\n",
+                                pm_gate_lw(ctx, 0x12D0), pm_gate_lw(ctx, 0x12A0),
+                                pm_gate_lw(ctx, 0xC00)), fflush(stderr);
+                } else if (ctx->pc == 0x2BE4u) {
+                    /* return of the 0x21A0(8) tag-drain: r3==0 means the
+                     * PM believes a DMA tag never completed -- a HOST
+                     * tag-writeback defect candidate (bg_270 mission b). */
+                    static int _nt = 0;
+                    if (_nt++ < 32) {
+                        fprintf(stderr, "[pm-gate] tagdrain ret r3=0x%08X "
+                                "12A0=0x%08X%s\n", ctx->gpr[3]._u32[0],
+                                pm_gate_lw(ctx, 0x12A0),
+                                ctx->gpr[3]._u32[0] ? "" : " -- DRAIN FAILED");
+                        fflush(stderr);
+                    }
+                } else if (ctx->pc == 0x29A4u) {
+                    /* 0x29A4 brz $r73: r73 = word & 0x40000000 (the
+                     * launchable-bit test), r5 = raw entry word, r68 =
+                     * current entry address in the 0xEB0 table. */
+                    static int _n4 = 0;
+                    if (_n4++ < 64) {
+                        fprintf(stderr, "[pm-gate] 0xEB0 scan el@0x%05X "
+                                "word=0x%08X bit30=%s\n",
+                                ctx->gpr[68]._u32[0] & SPU_LS_MASK,
+                                ctx->gpr[5]._u32[0],
+                                (ctx->gpr[73]._u32[0] & 0x40000000u) ? "SET"
+                                                                     : "clear");
+                        fflush(stderr);
+                    }
+                } else if (ctx->pc == 0x2224u || ctx->pc == 0x2ECCu
+                           || ctx->pc == 0x3014u) {
+                    /* the three other writers of the state cell 12A0
+                     * (0x2C0C covered above): 0x2224 := 2 (SN handler
+                     * retry), 0x2ECC := claim-helper return code (!=1),
+                     * 0x3014 := 0/FF mask -- the WEDGE regression, reached
+                     * after the retire routine zeroed the 0xEB0 table,
+                     * FF-filled 0x11B0 and re-issued the gather via
+                     * 0x26E4 (call site 0x2F5C). */
+                    static int _nw = 0;
+                    if (_nw++ < 64) {
+                        unsigned wr = (ctx->pc == 0x2224u) ? 2
+                                  : (ctx->pc == 0x2ECCu) ? 0
+                                  : (unsigned)-1;
+                        fprintf(stderr, "[pm-gate] STATE pc=0x%05X old=0x%08X "
+                                "-> %s (12D0=0x%08X 12C0=0x%08X)\n",
+                                ctx->pc, pm_gate_lw(ctx, 0x12A0),
+                                wr == 2 ? "2 (SN retry)"
+                                  : wr == 0 ? "claim-ret-code"
+                                            : "0/FF (RETIRE+REGRESS)",
+                                pm_gate_lw(ctx, 0x12D0),
+                                pm_gate_lw(ctx, 0x12C0));
+                        fflush(stderr);
+                    }
+                } else if (ctx->pc == 0x2F5Cu) {
+                    /* retire path: about to call the gather 0x26E4 and
+                     * then wipe 0xEB0 / re-FF 0x11B0. */
+                    static int _nr = 0;
+                    if (_nr++ < 32)
+                        fprintf(stderr, "[pm-gate] RETIRE slot: gather call "
+                                "0x26E4 (12A0=0x%08X)\n",
+                                pm_gate_lw(ctx, 0x12A0)), fflush(stderr);
+                } else if (ctx->pc == 0x2710u || ctx->pc == 0x1570u) {
+                    /* 0x2710: busy-bit ALLOC on LS 0x1290 (first clear
+                     * bit; all-ones -> error path 0x2788). 0x1570: FREE
+                     * bit r3 -- only the job-COMPLETION path reaches it.
+                     * If 0x1290 marches toward 0xFFFFFFFF with no frees,
+                     * claimed-but-never-run jobs leak the 32-slot ticket
+                     * space: the allocator wedges FULL forever. */
+                    static unsigned _alloc = 0, _free = 0;
+                    static int _na = 0;
+                    if (_na++ < 48) {
+                        if (ctx->pc == 0x2710u) _alloc++; else _free++;
+                        fprintf(stderr, "[pm-gate] %s 0x1290=0x%08X "
+                                "(allocs=%u frees=%u)%s\n",
+                                ctx->pc == 0x2710u ? "ALLOC" : "FREE ",
+                                pm_gate_lw(ctx, 0x1290), _alloc, _free,
+                                pm_gate_lw(ctx, 0x1290) == 0xFFFFFFFFu
+                                    ? " FULL!" : "");
+                        fflush(stderr);
+                    }
+                } else if (ctx->pc == 0x3244u) {
+                    /* Round 18: the atomic CLAIM on the guest joblist slot
+                     * (0x3244..0x32AC: GETLLAR line to LS 0x80 at EA $r7,
+                     * then PUTLLC 0xB4). The launch scan's bit30 comes from
+                     * THIS line's words: builder 0x1C68 copies input bit30
+                     * into the 0xEB0 entry. Log the guest 16B at claim time
+                     * so the healthy->wedge transition of the producer's
+                     * descriptors (0x4/0xC nibble = launchable vs 0x8 =
+                     * standby-only) is directly visible. */
+                    { extern uint8_t* vm_base;
+                      uint32_t ce = ((uint32_t)ctx->gpr[7]._u8[0] << 24)
+                                  | ((uint32_t)ctx->gpr[7]._u8[1] << 16)
+                                  | ((uint32_t)ctx->gpr[7]._u8[2] << 8)
+                                  | (uint32_t)ctx->gpr[7]._u8[3];
+                      static int _nc = 0;
+                      if (_nc++ < 24 || (_nc % 512) == 0) {
+                          fprintf(stderr, "[pm-gate] CLAIM guest 0x%08X:", ce);
+                          if (vm_base && ce > 0x10000u && ce < 0xF0000000u) {
+                              /* EA bit31 MFC alias: dump the NORMALIZED
+                               * target (what the transfer actually hits). */
+                              const unsigned char* g = vm_base + (0x40000000u | (ce & 0x3FFFFFFFu));
+                              for (int k = 0; k < 16; k += 4)
+                                  fprintf(stderr, " %02X%02X%02X%02X",
+                                          g[k], g[k+1], g[k+2], g[k+3]);
+                          } else fprintf(stderr, " <bad ea>");
+                          fprintf(stderr, "\n"); fflush(stderr);
+                      } }
+                }
+            }
+        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && stop_lsa && ctx->pc == (stop_lsa & SPU_LS_MASK)) {
-            g_spu_interp_steps=steps; g_spu_interp_last_pc=ctx->pc; return ctx->pc;
-        }
-        /* Cheap empty-registry path; guards run only at explicit entry PCs.
-         * Instrumented instruction streams always retain interpretation. */
+        int in_span = ctx->interp_span_lo < ctx->interp_span_hi &&
+                      ctx->pc >= ctx->interp_span_lo && ctx->pc < ctx->interp_span_hi;
+        /* M18: in the SPURS policy kernel-home window ([img_ls_base,
+         * img_ls_base+0xA00)) the img_ls_base-relative lift entries are the
+         * kernel stubs, and their lifted bodies exit in LABEL space (pc=0x80
+         * for guest 0xA80) -- rejoining there derails the wwsjob SN handler
+         * into guest 0x80 garbage and the list-stall ack is never written
+         * (1500+ observed cycles of exactly two interpreted steps). Keep the
+         * interpreter in charge inside that window. */
+        int in_kh = ctx->policy_mode && ctx->img_ls_base &&
+                    ctx->pc >= ctx->img_ls_base &&
+                    ctx->pc <  ctx->img_ls_base + 0xA00u;
+        /* in_span: inside a runtime-staged module the same-LS lifts of another
+         * image are stale bytes -- keep interpreting instead of rejoining. */
+        static int s_forceint = -1;
+        if (s_forceint < 0) s_forceint = getenv("SPU_PM_INTERP") ? 1 : 0;
+        /* Explicit native leaves preserve the existing rejoin and forced-PM policy.
+         * The legacy global ceiling reports an attempted step before decoding;
+         * reserve that final step rather than changing its boundary convention. */
         if (native_count && ctx->pc<0x40000 && !(ctx->pc&3) &&
             (native_entries[ctx->pc>>7] & (1u<<((ctx->pc>>2)&31))) &&
-            !_tr && !_cap && !_g1 && !g_spu_ls_watch_n &&
+            !_tr && !_cap && !_g1 && !s_kh && !g_spu_ls_watch_n &&
             g_spu_ls_probe<=0 && g_spu_smc_watch<=0 &&
             !native_instrumented) {
+            uint64_t remaining=(local_budget ? local_budget : UINT64_MAX)-steps;
+            if (g_spu_interp_budget) {
+                uint64_t legacy=g_spu_interp_budget>steps ? g_spu_interp_budget-steps-1 : 0;
+                if (legacy<remaining) remaining=legacy;
+            }
             uint32_t last=g_spu_interp_last_pc;
-            if (native_try(ctx,stop_lsa,(budget ? budget : UINT64_MAX)-steps,budget!=0,&last,&steps)) {
+            if (native_try(ctx,stop_lsa,remaining,local_budget || g_spu_interp_budget,&last,&steps)) {
                 g_spu_interp_last_pc=last;
                 continue;
             }
         }
         int owned_mode=spu_native_owned_policy(ctx);
-        int can_rejoin=!owned_mode || (!budget && (!stop_lsa || (native_call && ctx->host_depth>0 && stop_lsa==ctx->drain_ret_pc)) && !_tr && !_cap && !_g1 &&
-            !native_instrumented && spu_native_owned_can_run(ctx,ctx->pc));
-        if (can_rejoin && ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) {
-            g_spu_interp_steps=steps; g_spu_interp_last_pc=ctx->pc; return ctx->pc;
-        }
+        int owned_rejoin=owned_mode && !in_kh && !local_budget &&
+            (!stop_lsa || (native_call && ctx->host_depth>0 && stop_lsa==ctx->drain_ret_pc)) &&
+            !g_spu_interp_budget && !_tr && !_cap && !_g1 && !s_kh &&
+            !native_instrumented && spu_native_owned_can_run(ctx,ctx->pc);
+        int _rej = owned_mode
+            ? (owned_rejoin && spu_lifted_lookup(ctx,ctx->pc))
+            : (!in_span && !in_kh && ctx->image_id >= 0 &&
+               !s_forceint && spu_lifted_lookup(ctx,ctx->pc));
+        if (((stop_lsa && ctx->pc == (stop_lsa & SPU_LS_MASK)) || _rej)) {
+            /* M21: a rejoin hands control back to the DISPATCHER -- re-arm the
+             * trampoline like the SMC microstep exits do. Without this the
+             * SPU_DRAIN loop (which clears g_spu_trampoline_fn before each
+             * dispatch) sees a NULL trampoline when the resolver returns and
+             * ends the run at the rejoin pc (observed: kh handler's 0xA8C
+             * brsl->0x2210 stall-ack service never dispatched, 487 run-end
+             * cycles at pc=0x2210 status=RUNNING). The stop_lsa disjunct stays
+             * unarmed: that return pops the caller's drain frame. */
+            if (_rej && !(stop_lsa && ctx->pc == (stop_lsa & SPU_LS_MASK))) g_spu_trampoline_fn = spu_indirect_branch;
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }
+        { static int _rj = 0; /* M21: trace the kh handler's 0xA8C brsl->0x2210 rejoin decision */
+          if (ctx->policy_mode && ctx->image_id == 200 && ctx->pc >= 0x2000 && ctx->pc < 0x3000 && _rj++ < 40)
+            fprintf(stderr, "[rejoin] pc=0x%05X span=%d kh=%d img=%d lu=%d stop=0x%X\n",
+                    ctx->pc, in_span, in_kh, ctx->image_id,
+                    !!(spu_lifted_lookup(ctx, ctx->pc)), stop_lsa); }
         g_spu_interp_last_pc = ctx->pc;
+        if (s_kh && ctx->policy_mode && ctx->pc >= ctx->img_ls_base && ctx->pc < ctx->img_ls_base + 0xA00u) {
+            /* SPU_KH_TRACE: per-step trace of interpreted SPURS kernel-home
+             * code (vector handler + scheduler). The wwsjob SN handler's
+             * Load->Run advance (ceqhi on loadJobState) lives here; log op +
+             * key register lanes so the failing compare is visible. */
+            uint32_t _m = ctx->pc & SPU_LS_MASK;
+            uint32_t _iw = ((uint32_t)ctx->ls[_m] << 24) | ((uint32_t)ctx->ls[_m+1] << 16) |
+                           ((uint32_t)ctx->ls[_m+2] << 8) | ctx->ls[_m+3];
+            spu_ins _d; spu_decode1(_iw, _m, &_d);
+            { static int s_khmax = -1; if (s_khmax < 0) { const char* e = getenv("SPU_KH_MAX"); s_khmax = e ? atoi(e) : 6000; } if (s_khn++ < (uint64_t)s_khmax)
+                fprintf(stderr, "[kh] %05X %-8s r3=%08X r8=%08X r13=%08X r15=%08X\n",
+                        _m, spu_op_name[_d.op],
+                        ctx->gpr[3]._u32[0], ctx->gpr[8]._u32[0],
+                        ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); }
+        }
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
             if (inr) { _g1in = 1; }
@@ -606,6 +1132,15 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        /* Host-armed step ceiling (g_spu_interp_budget): differential
+         * harnesses bound interpreted runs so a task spinning on a host-
+         * absent producer cannot interpret forever. 0 (default) = off and
+         * behavior is unchanged. */
+        if (g_spu_interp_budget && steps >= g_spu_interp_budget) {
+            g_spu_interp_budget_hit = 1;
+            g_spu_interp_steps = steps;
+            return ctx->pc;
+        }
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {
@@ -621,7 +1156,42 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
-        if (spu_step(ctx)) {
+        int _r = spu_step(ctx);
+        if (_r == 2) {  /* iret bail: the host must restore the saved
+            register file (spu_irq_regs_maybe_restore) and re-dispatch at
+            srr0 -- interpreting the continuation in-place ran it with the
+            handler's registers (wwsjob PM wedge). Arm the dispatch so
+            whichever host frame regains control (drain loop or the driver's
+            SPU_DRAIN) resumes at pc instead of unwinding to run end. */
+            { static int _bn = 0; if (_bn++ < 16) {
+                fprintf(stderr, "[pm-iret] interp bail -> pc=0x%05X srr0=0x%05X ie=%d steps=%llu\n",
+                        ctx->pc & 0x3FFFC, ctx->srr0 & SPU_LS_MASK, (int)ctx->int_enable,
+                        (unsigned long long)steps);
+                if (_bn <= 3 || (_bn % 64) == 0) {   /* name the loop + state */
+                    fprintf(stderr, "[pm-iret] last %d PCs:", rn);
+                    for (int k = rn; k > 0; k--) fprintf(stderr, " %05X", ring[(rc - k) & 63]);
+                    fprintf(stderr, "\n");
+                    {
+                    #define HB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+                    fprintf(stderr, "[pm-iret] LS state: 12A0=%08X 12C0=%08X 12D0=%08X 12E0=%08X 12F0=%08X 14E0=%08X 14F0=%08X 14F8=%08X\n",
+                        HB(0x12A0),HB(0x12C0),HB(0x12D0),HB(0x12E0),HB(0x12F0),HB(0x14E0),HB(0x14F0),HB(0x14F8));
+                    #undef HB
+                    }
+                    { extern uint8_t* vm_base;
+                      if (vm_base) { const uint8_t* g = vm_base + 0x40244380u;
+                        fprintf(stderr, "[pm-iret] guest 0x40244380 @bail:");
+                        for (int o = 0; o < 0x30; o += 8)
+                            fprintf(stderr, " %02X%02X%02X%02X%02X%02X%02X%02X",
+                                g[o],g[o+1],g[o+2],g[o+3],g[o+4],g[o+5],g[o+6],g[o+7]);
+                        fprintf(stderr, "\n"); fflush(stderr); } } } } }
+            /* Equal IRET continuation PCs do not establish idleness: guest
+             * instructions can progress between returns. Preserve normal IRQ
+             * register restoration and redispatch without a synthetic halt. */
+            { extern volatile unsigned g_spu_iret_bails; g_spu_iret_bails++; }
+            g_spu_trampoline_fn = spu_indirect_branch;   /* pending re-dispatch */
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc;
+            return ctx->pc; }
+        if (_r) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
              * with {CELL_OK, data1, data2, data3} in the in-mailbox -- which is
@@ -646,8 +1216,142 @@ static uint32_t spu_interp_run_until_scoped_body(spu_context* ctx, uint32_t star
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
                 fprintf(stderr,"\n"); fflush(stderr); _tr--; }
+            { /* Round 24(a)/26: stop-and-signal codes from inside a staged
+               * jobmod span -- resident slots regardless of lift presence
+               * (round 25: most walk-in code sits in UNREGISTERED spans, so
+               * the lifted flag says which; silence overall = module never
+               * stops in-span, exits by link-return or is retired mid-run).
+               * Compare healthy job-end codes vs the last before a retire. */
+              uint32_t _jp = (uint32_t)ctx->pc & SPU_LS_MASK;
+              for (int _i = 0; _i < 4; _i++)
+                  if (ctx->resident_code[_i].size
+                      && _jp >= ctx->resident_code[_i].lsa
+                      && _jp < ctx->resident_code[_i].lsa
+                               + ctx->resident_code[_i].size) {
+                      extern int spu_walkin_lift(uint32_t, int, int);
+                      int _lf = spu_walkin_lift(
+                          _jp, ctx->resident_code[_i].image_id,
+                          (int)ctx->resident_code[_i].rel);
+                      static int _jn = 0;
+                      if (_jn++ < 32 || (_jn % 128) == 0)
+                          fprintf(stderr, "[jobstop] img=%d lifted=%d code=0x%04X "
+                                  "pc=0x%05X r3=0x%08X r4=0x%08X\n",
+                                  ctx->resident_code[_i].image_id, _lf,
+                                  ctx->stop_code, _jp,
+                                  ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]),
+                          fflush(stderr);
+                      break;
+                  } }
+            /* Round 34: a module STOP inside a walk-in span is the job's
+             * completion signal -- on HW the return lands at the bisl link
+             * (0x3068) and the PM window completes. Flag the link resume
+             * so the next pass continues the PM flow instead of restarting
+             * at the entry and stranding the window (bg_291). */
+            if (ctx->policy_mode && ctx->wi_state
+                && !ctx->wi_link_pending) {
+                ctx->wi_link_pending = 1;
+                { static int s_ys = 0;
+                  if (s_ys++ < 8 || (s_ys % 256) == 0)
+                      fprintf(stderr, "[pm-yield] module STOP code=0x%04X "
+                              "pc=0x%05X link=0x%05X wi=%d #%d\n",
+                              ctx->stop_code,
+                              (uint32_t)ctx->pc & SPU_LS_MASK,
+                              ctx->wi_resume_link, ctx->wi_state, s_ys),
+                      fflush(stderr); }
+            }
+            if (ctx->pm_win_touched) {
+                static int s_ws = 0;
+                if (s_ws++ < 24)
+                    fprintf(stderr, "[pm-window] EXIT class=stop code=0x%04X "
+                            "pc=0x%05X wi=%d pend=%d 12A0=0x%08X 12C0=0x%08X\n",
+                            ctx->stop_code, (uint32_t)ctx->pc & SPU_LS_MASK,
+                            ctx->wi_state, ctx->wi_link_pending,
+                            pm_gate_lw(ctx, 0x12A0), pm_gate_lw(ctx, 0x12C0)),
+                    fflush(stderr);
+            }
+            ctx->pm_designed = 1;   /* genuine stop/halt exit: designed (R33) */
             return ctx->stop_code; }
     }
+}
+
+#ifdef _WIN32
+typedef struct {
+    int enabled, depth, policy;
+    LARGE_INTEGER frequency, begin;
+    double epoch, policy_ms, other_ms, max_ms;
+    unsigned long long policy_calls, other_calls, unwind_calls;
+} InterpStats;
+static _Thread_local InterpStats s_interp_stats = { .enabled = -1 };
+
+static void interp_stats_finish(int unwound)
+{
+    InterpStats* s = &s_interp_stats;
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+    double now = (double)end.QuadPart / (double)s->frequency.QuadPart;
+    double elapsed = (double)(end.QuadPart - s->begin.QuadPart) * 1000.0 /
+                     (double)s->frequency.QuadPart;
+    if (!s->epoch) s->epoch = (double)s->begin.QuadPart / (double)s->frequency.QuadPart;
+    if (s->policy) { s->policy_ms += elapsed; s->policy_calls++; }
+    else { s->other_ms += elapsed; s->other_calls++; }
+    if (elapsed > s->max_ms) s->max_ms = elapsed;
+    s->unwind_calls += unwound != 0;
+    s->depth = 0;
+    if (now - s->epoch >= 1.0) {
+        fprintf(stderr, "[SPUINTERP] tid=%lu window_ms=%.3f policy_ms=%.3f"
+                " other_ms=%.3f policy_calls=%llu other_calls=%llu max_ms=%.3f"
+                " unwind_calls=%llu\n",
+                GetCurrentThreadId(), (now - s->epoch) * 1000.0, s->policy_ms,
+                s->other_ms, s->policy_calls, s->other_calls, s->max_ms, s->unwind_calls);
+        s->epoch = now; s->policy_ms = s->other_ms = s->max_ms = 0;
+        s->policy_calls = s->other_calls = s->unwind_calls = 0;
+    }
+}
+#endif
+
+uint32_t spu_interp_stats_mark(void)
+{
+#ifdef _WIN32
+    return (uint32_t)s_interp_stats.depth;
+#else
+    return 0;
+#endif
+}
+
+void spu_interp_stats_unwind(uint32_t mark)
+{
+#ifdef _WIN32
+    /* A nested driver must not close the still-live outer interpreter call. */
+    if ((uint32_t)s_interp_stats.depth > mark) interp_stats_finish(1);
+#else
+    (void)mark;
+#endif
+}
+
+uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa)
+{
+    return spu_interp_run_until_budget(ctx,start_lsa,stop_lsa,0);
+}
+
+static uint32_t spu_interp_run_until_budget_scoped_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t local_budget, int native_call)
+{
+#ifdef _WIN32
+    /* Wall time includes channel waits. The driver closes samples on longjmp.
+     * Count only outer calls to avoid recursive overlap. */
+    InterpStats* s = &s_interp_stats;
+    if (s->enabled < 0) { const char* e = getenv("SPU_INTERP_STATS");
+        s->enabled = e && atoi(e) != 0; }
+    if (!s->enabled || s->depth) return interp_run_until_impl(ctx, start_lsa, stop_lsa, local_budget, native_call);
+    if (!s->frequency.QuadPart) QueryPerformanceFrequency(&s->frequency);
+    QueryPerformanceCounter(&s->begin);
+    s->policy = ctx->policy_mode != 0;
+    s->depth = 1;
+    uint32_t result = interp_run_until_impl(ctx, start_lsa, stop_lsa, local_budget, native_call);
+    interp_stats_finish(0);
+    return result;
+#else
+    return interp_run_until_impl(ctx, start_lsa, stop_lsa, local_budget, native_call);
+#endif
 }
 
 void spu_dispatch(spu_context* ctx, uint32_t target) {
@@ -668,24 +1372,20 @@ void spu_dispatch(spu_context* ctx, uint32_t target) {
     }
 }
 
-uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
-    return spu_interp_run_until_budget(ctx,start_lsa,stop_lsa,0);
-}
-uint32_t spu_interp_run_until_budget(spu_context* ctx,uint32_t start_lsa,uint32_t stop_lsa,uint64_t budget) {
-    uint64_t saved=spu_sf_simd_enter();
-    uint32_t result=spu_interp_run_until_scoped_body(ctx,start_lsa,stop_lsa,budget,0);
+uint32_t spu_interp_run_until_budget(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t local_budget)
+{
+    uint64_t saved = spu_sf_simd_enter();
+    uint32_t result = spu_interp_run_until_budget_scoped_body(ctx, start_lsa, stop_lsa, local_budget, 0);
     spu_sf_simd_leave(saved);
     return result;
 }
 
-/* A dispatcher-owned host return is distinct from an arbitrary canonical stop.
- * Authorization is a call-local value, so nested execution/nonlocal exits
- * cannot leak permission into another interpreter invocation. */
+/* Permission belongs to this invocation, never TLS; retain stats/unwind and SIMD scopes. */
 uint32_t spu_interp_run_native_call(spu_context* ctx,uint32_t start,uint32_t stop) {
     int authorized=spu_native_owned_policy(ctx) && ctx->host_depth>0 &&
         stop && stop==ctx->drain_ret_pc;
     uint64_t saved=spu_sf_simd_enter();
-    uint32_t result=spu_interp_run_until_scoped_body(ctx,start,stop,0,authorized);
+    uint32_t result=spu_interp_run_until_budget_scoped_body(ctx,start,stop,0,authorized);
     spu_sf_simd_leave(saved);
     return result;
 }

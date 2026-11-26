@@ -30,12 +30,9 @@ s32 sceNpCommerce2Term(void)
     return CELL_OK;
 }
 
-/* SDK signature: (version, npId, handler, arg, ctx_id). The context id goes to the FIFTH argument; with three
- * parameters the id was written over the title's handler (the third argument). */
-s32 sceNpCommerce2CreateCtx(u32 version, const void* npId, u32 handler, u32 arg,
+s32 sceNpCommerce2CreateCtx(u32 version, const void* npId,
                               SceNpCommerce2Context* ctx)
 {
-    (void)npId; (void)handler; (void)arg;
     printf("[sceNpCommerce2] CreateCtx(version=%u)\n", version);
     if (!ctx) return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
 

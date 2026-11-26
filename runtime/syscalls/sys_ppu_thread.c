@@ -9,9 +9,7 @@
  * from inside a loop and so called exit 1,435 times in one run, staying alive
  * and holding whatever it held. Arm a jump in the thread proc and unwind to it
  * instead. PS3_NO_THREAD_EXIT_UNWIND=1 restores the old behaviour. */
-/* MinGW GCC ignores __declspec(thread) ("'thread' attribute directive
- * ignored"), which would make these two process-wide: MSVC only. */
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 #  define PPU_TLS __declspec(thread)
 #else
 #  define PPU_TLS __thread
@@ -47,21 +45,36 @@ ppu_thread_info       g_ppu_threads[PPU_THREAD_MAX];
 vm_stack_alloc        g_vm_stack_alloc;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
 
-/* Simple mutex for thread table access */
+/* Simple mutex for thread table + stack allocator access */
 #ifdef _WIN32
 static CRITICAL_SECTION s_table_lock;
-static int              s_table_lock_init = 0;
+static volatile LONG   s_table_lock_init = 0;
 #else
 static pthread_mutex_t  s_table_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+#ifdef _WIN32
+/* Build the Win32 critical section exactly once. Callback-stack leases can
+ * bring two host threads into table_lock() for the very first time at the
+ * same instant; the old check-then-init let both build the section and the
+ * loser's EnterCriticalSection corrupted the winner's wait state. One builder
+ * (CAS), everyone else waits for the published flag. */
+static void table_lock_init(void)
+{
+    if (s_table_lock_init) return;
+    if (InterlockedCompareExchange(&s_table_lock_init, 2, 0) == 0) {
+        InitializeCriticalSection(&s_table_lock);
+        s_table_lock_init = 1;   /* publish: section is built */
+    } else {
+        while (s_table_lock_init != 1) Sleep(0);
+    }
+}
 #endif
 
 static void table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
+    if (!s_table_lock_init) table_lock_init();
     EnterCriticalSection(&s_table_lock);
 #else
     pthread_mutex_lock(&s_table_lock);
@@ -75,6 +88,96 @@ static void table_unlock(void)
 #else
     pthread_mutex_unlock(&s_table_lock);
 #endif
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest callback stack leases (ppu_loader.cpp guest-call entry)
+ *
+ * Host-only callback threads (ticker, GCM flip/vblank handlers, sysutil
+ * pump) run recompiled callbacks with no guest thread of their own. They all
+ * used to run on one fixed guest stack address, so two concurrent callback
+ * threads overwrote each other's frames. A lease is a real stack carved from
+ * the same VM stack region guest threads use (guard page included), pooled
+ * and reused: a bounded set, handed to one host thread at a time and given
+ * back when that thread exits, so churn cannot exhaust the region. The
+ * loader attaches its TLS block to the lease via the cookie so TLS stays
+ * bounded with the stacks.
+ * -----------------------------------------------------------------------*/
+#define CB_STACK_POOL_MAX 16
+typedef struct cb_stack_lease {
+    uint32_t top;      /* initial sp for a callback: TOP of the usable stack */
+    uint64_t cookie;   /* opaque loader data (TLS tp); survives lease reuse */
+    int      in_use;
+} cb_stack_lease;
+static cb_stack_lease s_cb_pool[CB_STACK_POOL_MAX];
+static int            s_cb_pool_n = 0;
+
+/* Lease a callback stack. Returns 0 and fills *top and *cookie, or -1 when
+ * pool and the stack region are both exhausted. cookie==0 means the lease
+ * was never used before. */
+int ppu_callback_stack_lease(uint32_t* top_out, uint64_t* cookie_out)
+{
+    if (!top_out || !cookie_out) return -1;
+    *top_out = 0;
+    *cookie_out = 0;
+
+    table_lock();
+    /* The lease path can run before sys_ppu_thread_init (a callback thread
+     * firing during boot); init once, and never rewind an allocator that has
+     * already handed addresses out. */
+    if (!g_vm_stack_alloc.region_end)
+        vm_stack_alloc_init(&g_vm_stack_alloc);
+
+    int slot = -1;
+    for (int i = 0; i < s_cb_pool_n; i++) {
+        if (!s_cb_pool[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0 && s_cb_pool_n < CB_STACK_POOL_MAX) {
+        /* vm_stack_allocate returns the LOWEST usable address (the word above
+         * its guard page); usable range is [ret, ret + stack_size). The guest
+         * stack pointer must start at the TOP of that range, so a callback's
+         * first frame pushes (below sp) land in usable memory, not the guard
+         * page. Storing the low address made sp-0x40 fault on the guard. */
+        uint32_t low = vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE);
+        if (low) {
+            slot = s_cb_pool_n++;
+            s_cb_pool[slot].top    = low + VM_PPU_STACK_SIZE;
+            s_cb_pool[slot].cookie = 0;
+        }
+    }
+
+    int ok = -1;
+    if (slot >= 0) {
+        s_cb_pool[slot].in_use = 1;
+        *top_out    = s_cb_pool[slot].top;
+        *cookie_out = s_cb_pool[slot].cookie;
+        ok = 0;
+    }
+    table_unlock();
+    return ok;
+}
+
+/* Attach loader-owned data (the TLS tp) to a lease; it is handed back with
+ * the next lease of the same stack, so the TLS block is reused, not leaked. */
+void ppu_callback_stack_set_cookie(uint32_t top, uint64_t cookie)
+{
+    if (!top) return;
+    table_lock();
+    for (int i = 0; i < s_cb_pool_n; i++) {
+        if (s_cb_pool[i].top == top) { s_cb_pool[i].cookie = cookie; break; }
+    }
+    table_unlock();
+}
+
+/* Return a lease to the pool (host thread exited). */
+void ppu_callback_stack_release(uint32_t top)
+{
+    if (!top) return;
+    table_lock();
+    for (int i = 0; i < s_cb_pool_n; i++) {
+        if (s_cb_pool[i].top == top) { s_cb_pool[i].in_use = 0; break; }
+    }
+    table_unlock();
 }
 
 /* Find a free slot. Returns index or -1. Must be called under lock. */
@@ -151,12 +254,14 @@ static void* ppu_host_thread_proc(void* param)
           if (ps3_intr_is_handler(info->ctx.thread_id)) {
               fprintf(stderr, "[intr] thread %llu is an interrupt handler -- \n",
                       (unsigned long long)info->ctx.thread_id);
+              ppu_thread_wait_begin(&info->ctx, "intr_wait", info->ctx.thread_id, 0);
               while (ps3_intr_wait(info->ctx.thread_id)) {
                   s_exit_armed = 1;
                   if (setjmp(s_exit_jmp) == 0)
                       g_ppu_thread_entry_trampoline(&info->ctx);
                   s_exit_armed = 0;
               }
+              ppu_thread_wait_end(&info->ctx);
           } }
     } else {
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
@@ -234,6 +339,11 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        /* real handle (not the pseudo one: it resolves to the CALLING thread
+         * at use time, so the probe would sample itself) for ppu_thread_cpu_us */
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                        GetCurrentProcess(), &t->host_thread, 0, FALSE,
+                        DUPLICATE_SAME_ACCESS);
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -264,7 +374,7 @@ uint64_t ppu_thread_register_main(void)
 unsigned long long ppu_thread_cpu_us(unsigned tid)
 {
 #ifdef _WIN32
-    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;   /* main (tid 1) not in table */
+    if (tid < 1 || tid > PPU_THREAD_MAX) return 0;
     ppu_thread_info* t = &g_ppu_threads[tid - 1];
     if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) return 0;
     FILETIME c, e, k, u;
@@ -290,6 +400,9 @@ unsigned ppu_thread_prof_pc(unsigned tid)
  * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
  * iterate guest threads without depending on ppu_thread_info's layout. */
 static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+static void*    s_prof_main_ctx;      /* its ppu_context, captured on first dispatch
+                                        * (RD_PROBE_MAINSPIN reads main's registers) */
+static char s_main_wait_tag[40];      /* its RD_PROBE_THREADSTATES wait tag */
 
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
@@ -301,12 +414,33 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
         *tid = 1; *cia = s_prof_main_pc; *name = "main";
         return s_prof_main_pc != 0;
     }
-    if (t->state == PPU_THREAD_STATE_FREE) return 0;
     *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    if (idx == 0 && !t->prof_pc && s_prof_main_pc) {
+        /* register_main claims slot 0 but the main thread's real ctx (and its
+         * prof stamps) live outside the table: they land in s_prof_main_pc
+         * while the slot's ctx copy stays zeroed. Serve the breadcrumb or
+         * every probe round reports main parked at 0x0. */
+        *cia = s_prof_main_pc;
+    } else {
+        *cia = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    }
     *name = t->name;
     return 1;
 }
+
+/* Probe-only: host thread handle for RD_PROBE_THREADSTATES' backtrace
+ * sampler (threadstate_probe.c). NULL when the slot is dead or the thread
+ * was never started. */
+void* ppu_thread_host_handle(unsigned tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return NULL;
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    return (t->state != PPU_THREAD_STATE_FREE && t->host_thread)
+             ? (void*)t->host_thread : NULL;
+}
+/* RD_PROBE_MAINSPIN (threadstate_probe.c): the main guest thread's execution
+ * context. NULL until the main thread's first syscall/HLE dispatch. */
+void* ppu_prof_main_ctx(void) { return s_prof_main_ctx; }
 
 /* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
 void ppu_prof_stamp(void* vctx, unsigned lr)
@@ -315,12 +449,74 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (_n++ < 0)
+    if (!in_range) { s_prof_main_pc = lr; s_prof_main_ctx = vctx; s_main_wait_tag[0] = 0; return; }
+    /* Bounded by construction: first 24 stamps only (0 <= _n < 24).
+     * _n is 64-bit because an int version was COUNTED past 2^31 during a
+     * hot spin loop (live read: _n = 0x91002FA1 = 2,432,520,609 dispatches
+     * from one guest loop at ~3M syscalls/s; the 02:49 build's canary
+     * printed per call once _n went negative -> 8.6 GB of [prof-stamp]
+     * lines). The "negative _n" corruption canary from that incident was
+     * removed: honest counting reaches negative on int, so it proved
+     * nothing, and the 8-byte counter cannot go negative by counting. */
+    { static unsigned long long _n = 0; unsigned long long n = _n++;
+      if (n < 24)
         fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
                 vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
+    if (in_range) {
         t->prof_pc = lr;
+        /* Any syscall entry ends the previous wait -- a tag therefore only
+         * ever means "blocked in this wait" (or "one call past it" for the
+         * error-return paths that skip their wait_end). */
+        t->wait_tag[0] = 0;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * RD_PROBE_THREADSTATES: blocked-on tagging for threadstate_probe.c.
+ * Wait-capable syscalls stamp what they are about to block on right before
+ * the blocking loop and clear it on the way out; the stamp above clears it on
+ * the next syscall/HLE entry, so a stale tag cannot outlive one call.
+ * Deliberately lock-free: the worst race is a torn tag read in the diagnostic
+ * print. The main thread's ctx lives outside the table (see s_prof_main_pc)
+ * -- same fallback.
+ * -----------------------------------------------------------------------*/
+
+void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b)
+{
+    char* p = (char*)ctx - offsetof(ppu_thread_info, ctx);
+    ppu_thread_info* t = (ppu_thread_info*)p;
+    char* tag = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX)
+              ? t->wait_tag : s_main_wait_tag;
+    int n = snprintf(tag, 40, "%s", kind ? kind : "?");
+    if (n < 0) n = 0;
+    if (n > 30) n = 30;              /* keep room for the args, NUL included */
+    if (a) n += snprintf(tag + n, 40 - n, " a=%llX", (unsigned long long)a);
+    if (b) n += snprintf(tag + n, 40 - n, " b=%llX", (unsigned long long)b);
+    (void)n;
+}
+
+void ppu_thread_wait_end(ppu_context* ctx)
+{
+    char* p = (char*)ctx - offsetof(ppu_thread_info, ctx);
+    ppu_thread_info* t = (ppu_thread_info*)p;
+    char* tag = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX)
+              ? t->wait_tag : s_main_wait_tag;
+    tag[0] = 0;
+}
+
+const char* ppu_thread_wait_tag(unsigned tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return NULL;
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    if (t->state == PPU_THREAD_STATE_FREE) {
+        /* slot 0 never registers for a boot that keeps main's ctx outside
+         * the table -- serve the static fallback (see ppu_prof_snapshot) */
+        if (tid == 1) return s_main_wait_tag[0] ? s_main_wait_tag : NULL;
+        return NULL;
+    }
+    if (tid == 1 && !t->wait_tag[0] && s_main_wait_tag[0])
+        return s_main_wait_tag;   /* main's tags land in the static (ctx out of table) */
+    return t->wait_tag[0] ? t->wait_tag : NULL;
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)
@@ -433,6 +629,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         return CELL_OK;
     }
 
+#include "../platform/thread_name.h"   /* ps3_thread_setname: CPU-time attribution */
+
     /* Create the host thread. Give it a large RESERVED stack: each recompiled
      * guest call is a real host call, so deep guest call chains nest deeply on
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
@@ -446,6 +644,13 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
+    /* CPU-time attribution: give the host thread the guest's own thread name
+     * so per-thread samples in ETW/Process Explorer read "ppu:<name>" instead
+     * of an anonymous tid. Includes this close to the site because the file's
+     * include block is shared with C and C++ consumers of this header. */
+    { char _tn[40]; snprintf(_tn, sizeof _tn, "ppu:%.32s",
+                             t->name[0] ? t->name : "guest");
+      ps3_thread_setname((uintptr_t)t->host_thread, _tn); }
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
@@ -572,6 +777,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     table_unlock();
 
     /* Wait for completion */
+    ppu_thread_wait_begin(ctx, "ppu_thread_join", tid, 0);
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
 #else
@@ -581,6 +787,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     pthread_mutex_unlock(&t->finish_mutex);
 #endif
+    ppu_thread_wait_end(ctx);
 
     /* Write exit status */
     if (status_addr != 0) {
@@ -1281,17 +1488,17 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
-    /* Initialize stack allocator */
-    vm_stack_alloc_init(&g_vm_stack_alloc);
+    /* Initialize the stack allocator unless it is already live: a callback
+     * stack leased before this point must not be initialized over, or the
+     * allocator would hand its address out a second time. */
+    if (!g_vm_stack_alloc.region_end)
+        vm_stack_alloc_init(&g_vm_stack_alloc);
 
     /* Clear thread table */
     memset(g_ppu_threads, 0, sizeof(g_ppu_threads));
 
 #ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
+    table_lock_init();
 #endif
 
     lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);

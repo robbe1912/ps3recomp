@@ -81,7 +81,6 @@ typedef struct rsx_be_render_state {
     u32 color_mask;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
-    u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
@@ -107,7 +106,6 @@ typedef struct rsx_be_render_state {
 
 /* ---- the backend interface ---------------------------------------------- */
 
-#define RSX_BE_HAS_COLOR_SNAPSHOT 1
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -137,11 +135,6 @@ typedef struct rsx_draw_backend {
     u32  (*color_target_create)(void* user, rsx_be_format fmt, u32 w, u32 h,
                                 const void* seed, u32 seed_row_bytes);
     void (*color_target_release)(void* user, u32 surface);
-    /* Optional. Write R,G,B,A rows into a rectangle of a colour target: pixels
-     * the guest put there outside any draw, with a 2D transfer. NULL when the
-     * backend cannot, and the engine then leaves the target as it is. */
-    void (*color_target_write)(void* user, u32 surface, u32 x, u32 y, u32 w,
-                               u32 h, const void* rows, u32 row_bytes);
     /* A texture handle for a colour target a texture unit names, wearing that
      * unit's TEXTURE_CONTROL1 crossbar. An uploaded texture bakes the crossbar
      * in when it is decoded, so only a surface bind needs this; 0 means the
@@ -192,11 +185,6 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
-    /* Optional: the depth bounds for the next draw, called before every
-     * draw like the stencil reference. The test itself is pipeline state
-     * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
-     * NULL draws as if the test were off. */
-    void (*set_depth_bounds)(void* user, float min, float max);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
@@ -217,20 +205,6 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
-
-    /* Optional: read a rectangle of a depth target back as floats in [0, 1],
-     * `out_pitch` bytes per row. Returns 0 on success. The engine uses it to
-     * store a depth buffer into guest memory when a texture reads those bytes
-     * in a format of its own (a D24S8 buffer as A8R8G8B8, a Z16 shadow map as
-     * DEPTH16); left NULL, such a texture reads guest memory as it is. */
-    int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
-                           float* out, u32 out_pitch);
-    /* Optional same-target colour feedback. Return a fresh, immutable texture
-     * of the target's full physical extent and storage format. Its GPU copy
-     * must execute after all preceding writes and before the next draw. The
-     * engine owns the returned handle and releases it with texture_release.
-     * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
-    u32 (*color_snapshot)(void* user, u32 surface);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -274,25 +248,6 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
-/* A flip the engine never sees as 0xE944 (a 0xFEAD driver word or the SetFlip
- * HLE, both handled by cellGcmSys): remember the buffer for the host's next
- * rsx_draw_engine_present() without presenting now. */
-void rsx_draw_engine_note_flip(u32 buffer_id);
-
-/* Guest memory and the surfaces the engine renders on the host GPU, kept
- * coherent around a 2D transfer (NV3089) that the FIFO walker performs on
- * guest memory. A title copies its rendered scene out to main memory for
- * post-processing, back into VRAM, and into its display buffer with such
- * transfers; on the engine those pixels exist only on the GPU.
- *
- * Before the transfer reads guest bytes, guest_read writes the pixels of any
- * engine surface in that rectangle back to guest memory. After it writes,
- * guest_wrote pushes the guest bytes into any engine surface the rectangle
- * falls in. `offset` is the rectangle's first byte, `pitch` the guest row
- * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
- * out with the same pitch take part; anything else is left alone. */
-void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
-void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 
 /* --- test hooks ---------------------------------------------------------- */
 

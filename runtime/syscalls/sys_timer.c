@@ -2,17 +2,16 @@
  * ps3recomp - Timer and time syscalls (implementation)
  */
 
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
-#endif
 #include "sys_timer.h"
-#include "../platform/native_short_sleep.h"
-#include <time.h>
+#include "ps3emu/loadtime_trace.h"   /* #11 load-stage timing (observer) */
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+/* RD_PROBE_THREADSTATES: blocked-on tagging (sys_ppu_thread.c) */
+extern void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+extern void ppu_thread_wait_end(ppu_context* ctx);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -109,13 +108,23 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
-int64_t sys_timer_usleep(ppu_context* ctx)
+static int64_t sys_timer_usleep_untraced(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (n++ < 60)
-        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
-        (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+      static unsigned n=0; if (n++ < 60 || (n % 2000) == 0)
+        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX #%u\n", ps3_qpc_us(),
+        (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia, n); }
+    /* PPU_USLEEP_BT=<hex lr>: dump the host/guest call chain once from the
+     * poll site whose lr matches -- "what is this loop waiting for". */
+    { static long s_ubt = -1;
+      if (s_ubt < 0) { const char* e = getenv("PPU_USLEEP_BT");
+                       s_ubt = e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_ubt && (uint32_t)ctx->lr == (uint32_t)s_ubt) {
+          static int fired = 0;
+          if (!fired) { fired = 1;
+              extern void ppu_log_host_chain(const char*);
+              ppu_log_host_chain("usleep-poll"); } } }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
      *
      * A title that is "hung" is usually not blocked on anything -- every thread
@@ -217,11 +226,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
 
+    ppu_thread_wait_begin(ctx, "timer_usleep", usec, 0);
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
-    if (usec > 0 && usec < 1000 && ps3_native_short_sleep(usec)) {
-        /* The checked monotonic deadline has passed in a blocking wait. */
-    } else if (usec >= 1000) {
+    if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {
             LARGE_INTEGER due;
@@ -246,8 +254,15 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        unsigned spin_n = 0;
         do {
-            SwitchToThread();
+            /* [MOD] Yield the core only every 32nd poll: SwitchToThread
+             * costs ~5-15us when a sibling guest thread is runnable, which
+             * is what inflated the observed 30us frame-clock sleeps to
+             * ~35-36us. Pause-spin between yields keeps the deadline tight
+             * (~1-2us) while staying cooperative. */
+            if ((++spin_n & 31u) == 0) SwitchToThread();
+            else YieldProcessor();
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
     }
@@ -259,16 +274,34 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         nanosleep(&ts, NULL);
     }
 #endif
+    ppu_thread_wait_end(ctx);
 
     return CELL_OK;
 }
+int64_t sys_timer_usleep(ppu_context* ctx)
+{
+    if (!loadtime_on()) return sys_timer_usleep_untraced(ctx);
+    const unsigned long long start = loadtime_us();
+    const unsigned long long requested = LV2_ARG_U64(ctx, 0);
+    char detail[224];
+    snprintf(detail,sizeof detail,"start_us=%llu usec=%llu guest_tid=%llu",start,requested,(unsigned long long)ctx->thread_id);
+    loadtime_event("wait_usleep_begin",detail);
+    const int64_t result = sys_timer_usleep_untraced(ctx);
+    if (loadtime_on()) {
+        const unsigned long long end = loadtime_us();
+        snprintf(detail,sizeof detail,"start_us=%llu end_us=%llu dur_us=%llu result=%lld usec=%llu guest_tid=%llu",start,end,end-start,(long long)result,requested,(unsigned long long)ctx->thread_id);
+        loadtime_event("wait_usleep_end",detail);
+    }
+    return result;
+}
+
 
 /* ---------------------------------------------------------------------------
  * sys_timer_sleep
  *
  * r3 = seconds
  * -----------------------------------------------------------------------*/
-int64_t sys_timer_sleep(ppu_context* ctx)
+static int64_t sys_timer_sleep_untraced(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
 
@@ -280,6 +313,23 @@ int64_t sys_timer_sleep(ppu_context* ctx)
 
     return CELL_OK;
 }
+int64_t sys_timer_sleep(ppu_context* ctx)
+{
+    if (!loadtime_on()) return sys_timer_sleep_untraced(ctx);
+    const unsigned long long start = loadtime_us();
+    const unsigned long long requested = LV2_ARG_U64(ctx, 0);
+    char detail[224];
+    snprintf(detail,sizeof detail,"start_us=%llu sec=%llu guest_tid=%llu",start,requested,(unsigned long long)ctx->thread_id);
+    loadtime_event("wait_sleep_begin",detail);
+    const int64_t result = sys_timer_sleep_untraced(ctx);
+    if (loadtime_on()) {
+        const unsigned long long end = loadtime_us();
+        snprintf(detail,sizeof detail,"start_us=%llu end_us=%llu dur_us=%llu result=%lld sec=%llu guest_tid=%llu",start,end,end-start,(long long)result,requested,(unsigned long long)ctx->thread_id);
+        loadtime_event("wait_sleep_end",detail);
+    }
+    return result;
+}
+
 
 /* ---------------------------------------------------------------------------
  * sys_time_get_current_time
@@ -287,43 +337,6 @@ int64_t sys_timer_sleep(ppu_context* ctx)
  * r3 = pointer to receive seconds (u64*)
  * r4 = pointer to receive nanoseconds (u64*)
  * -----------------------------------------------------------------------*/
-/* LV2 144: r3/r4 point to signed BE32 minute offsets. The first is the
- * standard UTC offset; the second is the current seasonal adjustment.
- * Derive the adjustment instead of assuming every DST shift is 60 minutes. */
-int64_t sys_time_get_timezone(ppu_context* ctx)
-{
-    uint32_t zone_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
-    if (!zone_addr || !dst_addr || zone_addr > UINT32_MAX - 3 || dst_addr > UINT32_MAX - 3)
-        return (int32_t)CELL_EFAULT;
-
-    time_t now = time(NULL);
-    struct tm local;
-    int32_t standard_minutes, daylight_minutes;
-#ifdef _WIN32
-    _tzset();
-    long west_seconds, daylight_bias;
-    if (localtime_s(&local, &now) || _get_timezone(&west_seconds) || _get_dstbias(&daylight_bias))
-        return (int32_t)CELL_EAGAIN;
-    standard_minutes = (int32_t)(-west_seconds / 60);
-    daylight_minutes = local.tm_isdst > 0 ? (int32_t)(-daylight_bias / 60) : 0;
-#else
-    if (!localtime_r(&now, &local)) return (int32_t)CELL_EAGAIN;
-    daylight_minutes = 0;
-    if (local.tm_isdst > 0) {
-        struct tm standard = local;
-        standard.tm_isdst = 0;
-        time_t standard_epoch = mktime(&standard);
-        if (standard_epoch == (time_t)-1) return (int32_t)CELL_EAGAIN;
-        daylight_minutes = (int32_t)(difftime(standard_epoch, now) / 60);
-    }
-    standard_minutes = (int32_t)(local.tm_gmtoff / 60) - daylight_minutes;
-#endif
-    write_be32(zone_addr, (uint32_t)standard_minutes);
-    write_be32(dst_addr, (uint32_t)daylight_minutes);
-    return CELL_OK;
-}
-
 int64_t sys_time_get_current_time(ppu_context* ctx)
 {
     uint32_t sec_addr  = LV2_ARG_PTR(ctx, 0);
@@ -380,20 +393,40 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
 
+    /* [MOD] High-resolution waitable timer. The old WaitForSingleObject(
+     * stop_event, ms) loop floored every period to whole milliseconds and
+     * forced sub-ms periods to 1ms, drifting guest pacing clocks (a 30us
+     * LV2 timer fired every ~1ms). SetWaitableTimer counts 100ns units and
+     * re-signals automatically for periodic due times, so the host clock
+     * matches LV2's high-res contract. */
+    HANDLE timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    if (!timer) return 0;
+
+    LONG period100ns = 0;
+    if (!t->one_shot) {
+        /* LONG saturates at ~214.7s of period; clamp (no guest timer that
+         * long is pacing-sensitive). */
+        uint64_t p = t->period_usec * 10ull;
+        period100ns = (p > 0x7FFFFFFFull) ? (LONG)0x7FFFFFFF : (LONG)p;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -((LONGLONG)t->delay_usec * 10); /* negative = relative */
+    SetWaitableTimer(timer, &due, period100ns, NULL, NULL, FALSE);
+
+    HANDLE hs[2] = { t->stop_event, timer };
     while (t->running) {
-        DWORD ms = (DWORD)(t->period_usec / 1000);
-        if (ms == 0) ms = 1;
-
-        DWORD result = WaitForSingleObject(t->stop_event, ms);
-        if (result == WAIT_OBJECT_0) {
-            break; /* stop signaled */
-        }
-
-        if (t->running) {
+        DWORD r = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0) break;          /* stop signaled */
+        if (r == WAIT_OBJECT_0 + 1) {           /* expired */
             timer_send_event(t);
+            if (t->one_shot) break;
+            continue;
         }
+        break;
     }
 
+    CancelWaitableTimer(timer);
+    CloseHandle(timer);
     return 0;
 }
 #else
@@ -402,11 +435,12 @@ static void* timer_thread_proc(void* param)
     sys_timer_info* t = (sys_timer_info*)param;
 
     pthread_mutex_lock(&t->mtx);
+    uint64_t remaining = t->delay_usec;
     while (!t->stop_flag) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(t->period_usec / 1000000);
-        ts.tv_nsec += (long)((t->period_usec % 1000000) * 1000);
+        ts.tv_sec  += (time_t)(remaining / 1000000);
+        ts.tv_nsec += (long)((remaining % 1000000) * 1000);
         if (ts.tv_nsec >= 1000000000L) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
@@ -419,6 +453,8 @@ static void* timer_thread_proc(void* param)
             pthread_mutex_unlock(&t->mtx);
             timer_send_event(t);
             pthread_mutex_lock(&t->mtx);
+            if (t->one_shot) break;
+            remaining = t->period_usec;
         }
     }
     pthread_mutex_unlock(&t->mtx);
@@ -435,6 +471,17 @@ static void timer_send_event(sys_timer_info* t)
     sys_event_queue_info* q = &g_sys_event_queues[t->event_queue_id - 1];
     if (!q->active)
         return;
+
+    /* [MOD] Producer visibility (first 8 fires per timer): ties a woken
+     * event_queue_receive to the timer that fed it. */
+    { static unsigned char n_fire[SYS_TIMER_MAX + 1];
+      const unsigned ti = (unsigned)(t - g_sys_timers) + 1u;
+      if (ti <= SYS_TIMER_MAX && n_fire[ti] < 8) {
+          n_fire[ti]++;
+          fprintf(stderr, "[MOD][timer] fire timer=%u -> q=%d src=0x%llX d1=0x%llX (n=%u)\n",
+                  ti, t->event_queue_id, (unsigned long long)t->source,
+                  (unsigned long long)t->data1, n_fire[ti]);
+      } }
 
     sys_event_t evt;
     evt.source = t->source;
@@ -504,6 +551,9 @@ int64_t sys_timer_create(ppu_context* ctx)
         write_be32(id_out_addr, timer_id);
     }
 
+    { static int _n = 0; if (_n++ < 32)
+        fprintf(stderr, "[MOD][timer] create -> id=%u\n", timer_id); }
+
     return CELL_OK;
 }
 
@@ -544,6 +594,8 @@ int64_t sys_timer_destroy(ppu_context* ctx)
 #endif
     }
 
+    fprintf(stderr, "[MOD][timer] destroy id=%u (q was %d)\n", timer_id, t->event_queue_id);
+
     t->active = 0;
     return CELL_OK;
 }
@@ -577,6 +629,9 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     t->source         = source;
     t->data1          = data1;
 
+    fprintf(stderr, "[MOD][timer] connect timer=%u -> queue=%u src=0x%llX data1=0x%llX\n",
+            timer_id, queue_id, (unsigned long long)source, (unsigned long long)data1);
+
     return CELL_OK;
 }
 
@@ -596,6 +651,8 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
     if (!t->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+
+    fprintf(stderr, "[MOD][timer] disconnect timer=%u (was q=%d)\n", timer_id, t->event_queue_id);
     t->event_queue_id = 0;
     return CELL_OK;
 }
@@ -609,9 +666,9 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_timer_start(ppu_context* ctx)
 {
-    uint32_t timer_id    = LV2_ARG_U32(ctx, 0);
-    /* uint64_t base_time = LV2_ARG_U64(ctx, 1); -- ignored for now */
-    uint64_t period      = LV2_ARG_U64(ctx, 2);
+    uint32_t timer_id  = LV2_ARG_U32(ctx, 0);
+    uint64_t base_time = LV2_ARG_U64(ctx, 1);
+    uint64_t period    = LV2_ARG_U64(ctx, 2);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -623,15 +680,47 @@ int64_t sys_timer_start(ppu_context* ctx)
     if (t->running)
         return (int64_t)(int32_t)CELL_EBUSY;
 
-    if (period == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    /* [MOD] PS3 semantics restored: period == 0 is a ONE-SHOT timer that
+     * fires once at the absolute base_time; a periodic timer fires first at
+     * base_time (0 = now, i.e. one full period from now) and then every
+     * period. The old code rejected period==0 outright and ignored
+     * base_time entirely, so every one-shot LV2 wait failed EINVAL. */
+    const int one_shot = (period == 0);
+    if (one_shot && base_time == 0)
+        return (int64_t)(int32_t)CELL_EINVAL; /* one-shot needs a fire time */
 
-    t->period_usec = period;
-    t->running     = 1;
+    uint64_t delay_us;
+    if (base_time != 0) {
+        /* base_time is absolute in the same clock domain
+         * sys_time_get_current_time reports; convert to a relative delay.
+         * A periodic timer whose base already passed fires on the next
+         * tick rather than at base + k*period -- close enough for every
+         * pacing use. */
+        extern unsigned long long ps3_qpc_us(void);
+        uint64_t now = ps3_qpc_us();
+        delay_us = (base_time > now) ? (base_time - now) : 0;
+    } else {
+        delay_us = period;
+    }
+    if (delay_us > 0x7FFFFFFFFFFFFFFFull / 10ull)
+        delay_us = 0x7FFFFFFFFFFFFFFFull / 10ull; /* keep *10 in LONGLONG */
+
+    t->base_time_us = base_time;
+    t->period_usec  = period;
+    t->one_shot     = one_shot;
+    t->delay_usec   = delay_us;
+    t->running      = 1;
+
+    fprintf(stderr, "[MOD][timer] start id=%u %s base=0x%llX delay=%lluu period=%lluu -> q=%d\n",
+            timer_id, one_shot ? "ONE-SHOT" : "periodic",
+            (unsigned long long)base_time, (unsigned long long)delay_us,
+            (unsigned long long)period, t->event_queue_id);
 
 #ifdef _WIN32
+#include "../platform/thread_name.h"   /* ps3_thread_setname: CPU-time attribution */
     t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);
     t->thread_handle = CreateThread(NULL, 0, timer_thread_proc, t, 0, NULL);
+    ps3_thread_setname((uintptr_t)t->thread_handle, "sys_timer");
 #else
     t->stop_flag = 0;
     pthread_create(&t->thread, NULL, timer_thread_proc, t);
@@ -684,16 +773,57 @@ int64_t sys_timer_stop(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_timer_get_information
+ *
+ * r3 = timer_id
+ * r4 = sys_timer_information_t* { u64 next_expire; u64 period; s32 state; }
+ * state: 1 = SYS_TIMER_STATE_RUN, 0 = SYS_TIMER_STATE_STOP.
+ * -----------------------------------------------------------------------*/
+int64_t sys_timer_get_information(ppu_context* ctx)
+{
+    uint32_t timer_id  = LV2_ARG_U32(ctx, 0);
+    uint32_t info_addr = LV2_ARG_PTR(ctx, 1);
+
+    if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_timer_info* t = &g_sys_timers[timer_id - 1];
+    if (!t->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    if (info_addr != 0) {
+        uint64_t next_expire = 0;
+        if (t->running) {
+            if (t->one_shot) {
+                next_expire = t->base_time_us;
+            } else {
+                /* UNKNOWN: the precise next expiry lives inside the host
+                 * waitable timer; report now+period, which is what guests
+                 * use this call for (deadline math) to within one period. */
+                extern unsigned long long ps3_qpc_us(void);
+                next_expire = ps3_qpc_us() + t->period_usec;
+            }
+        }
+        write_be64(info_addr + 0,  next_expire);
+        write_be64(info_addr + 8,  t->one_shot ? 0 : t->period_usec);
+        write_be32(info_addr + 16, t->running ? 1u : 0u);
+        write_be32(info_addr + 20, 0);
+    }
+
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[MOD][timer] get_information id=%u state=%d\n",
+                timer_id, t->running ? 1 : 0); }
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  *
- * NOTE: There are syscall number collisions in the existing table:
- *   SYS_TIMER_USLEEP (141) == SYS_EVENT_FLAG_WAIT (141)
- *   SYS_TIMER_SLEEP  (142) == SYS_EVENT_FLAG_TRYWAIT (142)
- *   SYS_TIME_GET_CURRENT_TIME (145) == SYS_EVENT_FLAG_CANCEL (145)
- * The event flag handlers are registered separately and will win.
- * Timer sleep/time functions should be called via wrapper functions
- * or fixed syscall numbers should be assigned.
- * For now, we register the timer-specific syscalls that don't collide.
+ * The historical syscall-number collisions with the event-flag table
+ * (141/142/145) are resolved -- lv2_syscall_table.h now defines
+ * SYS_EVENT_FLAG_WAIT=85 / SYS_TIMER_USLEEP=141 etc. as distinct slots --
+ * so every handler below registers plainly; no last-registration-wins.
  * -----------------------------------------------------------------------*/
 void sys_timer_init(lv2_syscall_table* tbl)
 {
@@ -709,16 +839,11 @@ void sys_timer_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_TIMER_STOP,                     sys_timer_stop);
     lv2_syscall_register(tbl, SYS_TIMER_CONNECT_EVENT_QUEUE,      sys_timer_connect_event_queue);
     lv2_syscall_register(tbl, SYS_TIMER_DISCONNECT_EVENT_QUEUE,   sys_timer_disconnect_event_queue);
+    lv2_syscall_register(tbl, SYS_TIMER_GET_INFORMATION,          sys_timer_get_information);
 
-    /* These have conflicting numbers with event flag syscalls.
-     * Register them here -- last registration wins. If events are
-     * registered after timers, the event handlers will override.
-     * The runtime should dispatch timer_usleep/sleep/get_current_time
-     * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
-    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE, sys_time_get_timezone);
 
-    /* Register these but be aware of collisions */
+    /* Time / sleep syscalls */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);

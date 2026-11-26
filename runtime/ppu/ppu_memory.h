@@ -54,6 +54,15 @@ extern uint8_t* vm_base;
 
 static inline void* vm_translate(uint32_t addr)
 {
+    /* LV1 dual mapping: descriptors written by SPU code carry alias-window
+     * VAs (base|0x05000000). Normalize through the same registry the SPU
+     * DMA paths use (spu_ea_alias.c) so HLE pointer translation, GUEST_PTR
+     * and vm_ptrN all see the same backing. Idempotent; fast path is one
+     * range compare. */
+    if (addr >= 0x45000000u && addr < 0x50000000u) {
+        extern uint32_t sysmem_spu_alias_fixup(uint32_t);
+        addr = sysmem_spu_alias_fixup(addr);
+    }
     return (void*)(vm_base + addr);
 }
 
@@ -136,8 +145,10 @@ void        ppu_resv_break_store(uint64_t ea);
  * SPURS idle service parked in `rdch SPU_RdEventStat` learns work was posted.
  * Declared here rather than pulling spu_coherency.h into every HLE module.
  *
- * spu_coh_is_reserved is a load of a global that stays zero until an SPU
- * reserves its first line, so the ordinary store pays one predictable branch. */
+ * g_spu_coh_armed (exported from spu_coherency.c) is the inline first gate:
+ * zero until an SPU reserves its first line, so the ordinary store pays one
+ * predicted compare and NO call. */
+extern volatile int g_spu_coh_armed;
 int         spu_coh_is_reserved(uint32_t addr);
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
@@ -148,7 +159,7 @@ void        spu_coh_notify_write(uint32_t addr);
 
 #define VM_WRITE_COH(addr, src, n)                                            \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
+        if (g_spu_coh_armed && spu_coh_is_reserved((uint32_t)(addr))) {      \
             spu_lockline_lock();                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
             spu_coh_notify_write((uint32_t)(addr));                           \

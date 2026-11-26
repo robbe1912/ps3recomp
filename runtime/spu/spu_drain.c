@@ -53,28 +53,14 @@ extern void spu_halt(spu_context*);
  * ended where it should not have (spurs_policy.c, [pm-end]). */
 static _Thread_local uint32_t t_recent[32];
 static _Thread_local uint32_t t_recent_n;
-/* The opt-in fast path has no complete recent-PC history. */
-static int s_fast_dispatch = -1;
-static int spu_fast_dispatch_init(void)
-{
-    const char* e = getenv("SPU_FAST_DISPATCH");
-    int fast = e && e[0] == '1';
-    const char* probes[] = {"MOTORSTORM_WWS_WAIT_TRACE", "SPU_NO_LS0_END", "SPU_EXITTRACE",
-                            "SPU_STEPTRACE", "SPU_STEPTRACE_FROM", "SPU_JOBDRAIN"};
-    for (unsigned i = 0; i < sizeof probes / sizeof probes[0]; ++i)
-        if (getenv(probes[i])) fast = 0;
-    __atomic_store_n(&s_fast_dispatch, fast, __ATOMIC_RELAXED);
-    return fast;
-}
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
-    if (__atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED) == 1) return 0;
     unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
     for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
     return k;
 }
 
-static void spu_task_launch_slow(spu_context* ctx, void* fn)
+void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -166,21 +152,6 @@ static void spu_task_launch_slow(spu_context* ctx, void* fn)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
-{
-    int fast = __atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED);
-    if (fast < 0) fast = spu_fast_dispatch_init();
-    if (fast && (ctx->pc & SPU_LS_MASK) && g_pm_flow_ctx != (void*)ctx) {
-        if (!ctx->policy_mode && ctx->host_depth) {
-            extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-            spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
-        }
-        ++ctx->steps;
-        return;
-    }
-    spu_task_launch_slow(ctx, fn);
-}
-
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
  * saves image_id in a call-site local and hands it back here so an image
  * adopted inside the callee cannot leak into the caller's continuation. A
@@ -253,7 +224,7 @@ unsigned spu_sn_defer_ticks(void)
  * the irete). State the handler legitimately publishes lives in LS/channels
  * and is untouched. Per-ctx slots; no nesting (interrupts stay disabled
  * until iret). */
-static void spu_irq_regs_save(spu_context* ctx)
+void spu_irq_regs_save(spu_context* ctx)
 {
     ctx->irq_saved = 1;
     ctx->irq_resume_pc = ctx->srr0;
@@ -311,6 +282,22 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
     }
     return 0;
 }
+/* Forced full-interpreter dispatch (SPU_PM_INTERP, policy modules)
+ * -- the mode spu_run_with_halt arms spu_pm_interp_trampoline under. A taken
+ * interrupt in that mode must enter the handler, and after iret resume the
+ * srr0 continuation, through the interpreter trampoline -- never the lift
+ * resolver. The policy image sits at RAW LS 0xA00 while its lifts register at
+ * image-relative label addresses, so spu_indirect_branch resolves a rawLS pc
+ * onto numerically colliding lift labels (rawLS 0x2B18 -> label 0x2B18; the
+ * img_ls_base retry -> label 0x2118) and the handler runs label-space code at
+ * rawLS addresses: the m61 malformed MFC commands (0x2B98/0x00, registers
+ * sliding through LSA/EA/size at pcs 0x2AE8/0x2B18) were exactly that. */
+static int pm_interp_forced(const spu_context* ctx)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("SPU_PM_INTERP") ? 1 : 0;
+    return s_on && ctx->policy_mode;
+}
 
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
@@ -361,7 +348,24 @@ void (*spu_take_interrupt(spu_context* ctx,
                   ctx->list_stall_stat, ctx->list_stall_mask,
                   js[0],js[1],js[2],js[3], js[4],js[5],js[6],js[7],
                   js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
-    return spu_indirect_branch;
+    { static int _n2 = 0;
+      if (_n2++ < 8) {
+          /* M18: dump the kernel-home bytes the vector lands in -- the SN
+           * handler at 0xA2C loops at 0xA68/0xA6C (stqx/brnz r3=1) and never
+           * reaches WrListStallAck; the raw words decide whether our decoder
+           * misreads them or the guest really spins there. */
+          const uint8_t* kb = ctx->ls + 0xA00;
+          fprintf(stderr, "[spu-int] VECDump A2C..A7C:");
+        for (uint32_t _o = 0x2C; _o <= 0xDC; _o += 4) {
+            uint32_t _w2 = ((uint32_t)kb[_o] << 24) | ((uint32_t)kb[_o+1] << 16) |
+                           ((uint32_t)kb[_o+2] << 8) | kb[_o+3];
+            fprintf(stderr, " %05X=%08X", 0xA00 + _o, _w2);
+        }
+          fprintf(stderr, "\n"); fflush(stderr); } }
+    /* Taken: forced-interp PM re-enters through the caller's interpreter
+     * trampoline (tf) so the handler stays in rawLS pc space; every other
+     * mode dispatches through the lift resolver as before. */
+    return pm_interp_forced(ctx) ? tf : spu_indirect_branch;
 }
 
 /* See the declaration in spu_context.h. */
@@ -375,7 +379,9 @@ void spu_depth_guard(spu_context* ctx)
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
+     * a ring names the loop. One ring per thread: a ring shared by every SPU
+     * thread is written on every lifted call and bounces its cache line
+     * between them (#327), and the cycle that trips is this thread's own. */
     enum { RING = 24 };
     static SPU_THREAD_LOCAL uint32_t s_ring[RING];
     static SPU_THREAD_LOCAL uint32_t s_n;
@@ -425,6 +431,7 @@ int spu_tailret_enabled(void)
  * reaches return_pc; only a pc with no lifted code behind it is unwound. */
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+extern void (*spu_lifted_lookup(const spu_context* ctx, uint32_t lsa))(spu_context*); /* spu_channels.c */
 
 static void spu_drain_call_scoped_body(spu_context* ctx, uint32_t return_pc)
 {
@@ -438,8 +445,11 @@ static void spu_drain_call_scoped_body(spu_context* ctx, uint32_t return_pc)
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
-            /* A queued owned-job tail may name the caller continuation directly. */
-            if ((g_spu_trampoline_fn == spu_indirect_branch || spu_native_owned_policy(ctx)) &&
+            /* Owned tails may name the genuine native caller continuation. */
+            /* The policy test is made one time per iteration. No guest code
+             * runs before the gate below, so the value cannot change. */
+            const int owned = spu_native_owned_policy(ctx);
+            if ((g_spu_trampoline_fn == spu_indirect_branch || owned) &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();
@@ -447,11 +457,205 @@ static void spu_drain_call_scoped_body(spu_context* ctx, uint32_t return_pc)
             }
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
-            if (spu_native_owned_policy(ctx) && !spu_native_owned_can_run(ctx,ctx->pc))
+            if (owned && !spu_native_owned_run_ok(ctx,ctx->pc))
                 fn=spu_indirect_branch;
             PS3_SPU_DISPATCH_BASE(fn);
             ctx->drain_ret_pc = (return_pc & SPU_LS_MASK) ? (return_pc & SPU_LS_MASK) : SPU_LS_SIZE;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
+            /* M12 [pm-clm]: explicit-trampoline probe. The pm-op probe in
+             * spu_indirect_branch only sees DYNAMIC dispatches (jump-table
+             * ops); the claim chain (0x2AA8 GETLLAR/PUTLLC on the spurs
+             * instance line), the post-claim continuation 0x1AB4, the module
+             * launch bi to LS[0x14C0]&0x3FFFF (0x4380) and the scan return
+             * 0x2244 are all EXPLICIT trampolines -- visible only here.
+             * pc space: lifted PM = label space, module launch = LS space. */
+            { static int s_clm = -1;
+              if (s_clm < 0) s_clm = getenv("SPU_PM_CLM") ? 1 : 0;
+              if (s_clm && ctx->policy_mode && ctx->image_id == 200) {
+                  static const uint32_t _w[38] = {
+                      0x2218, 0x1048, 0x2AA8, 0x2AC0, 0x2AE8, 0x2B08, 0x2B18,
+                      0x1AB4, 0x4380, 0x4390, 0x0288, 0x2258, 0x2244, 0x2250,
+                      0x26B8, 0x2B50, 0x2190, 0x24C4, 0x1A24, 0x260C,
+                      0x2498, 0x2050, 0x2098,
+                      /* M24: the module-loader candidates -- poller post-DMA
+                       * parse (0x24F0/0x260C already in), module fetch helper
+                       * (0x1F74/0x1F80), queue-refresh op (0x1B88) and the
+                       * op1 post-claim decision (0x1A6C). */
+                      0x2498, 0x2050, 0x2098,
+                      /* M25: the scheduler hub (0x2140) + its state-dispatch
+                       * targets (0x20C0/0x20C8) and the batch processor entry
+                       * (0x1F80 C-call is invisible here; its trampoline
+                       * continuations 0x2180/0x2184 wait event 0x20). */
+                      0x2140, 0x20C0, 0x20C8, 0x2180, 0x2184,
+                      /* M26: the module-mapper chain -- scanner op28 special
+                       * (0x17C0/0x1790 write LS 0x1330 = slot<<10), the
+                       * bufferSet selector (0x12A8/0x1398) and the op
+                       * dispatcher's claim staging (0x22C0). If none of
+                       * these ever fire, no op28 MAP record reached the
+                       * scan and the module slot stays empty. */
+                      0x17C0, 0x1790, 0x12A8, 0x1398, 0x22C0,
+                      0x24F0, 0x1F74, 0x1F80, 0x1B88, 0x1A6C,
+                      /* M27: launch-vector writers + launch path. 0x1A30
+                       * (claim chain head, writes LS 0x14C0 = r0), 0x21D8/
+                       * 0x21E0 (the 0x17D0 trampoline target: drain counter
+                       * r2 by r5, launch r0 when empty), 0x220C (bi to the
+                       * vector after the 0x29C0 kernel yield). If none of
+                       * these fire before the first scan, the pre-scan
+                       * vector update is our missing trigger. */
+                      0x1A30, 0x21D8, 0x21E0, 0x220C };
+                  uint32_t _p = ctx->pc & SPU_LS_MASK;
+                  for (int _i = 0; _i < 38; _i++) {
+                      if (_p == _w[_i]) {
+                          static int _c[38];
+                          static int s_clmmax = -1;
+                          if (s_clmmax < 0) { const char* m = getenv("SPU_PM_CLM_MAX"); s_clmmax = m ? atoi(m) : 60; }
+                          if (_c[_i]++ < s_clmmax) {
+                              fprintf(stderr, "[pm-clm] #%d pc=0x%05X dyn=%d "
+                                      "r3=%08X r0=%08X astat=%d ie=%d dep=%d "
+                                      "ret=0x%05X ev=%X/%X",
+                                      _c[_i] - 1, _p,
+                                      fn == spu_indirect_branch,
+                                      ctx->gpr[3]._u32[0], ctx->gpr[0]._u32[0],
+                                      ctx->atomic_stat, (int)ctx->int_enable,
+                                      ctx->host_depth,
+                                      return_pc & SPU_LS_MASK,
+                                      ctx->event_status, ctx->event_mask);
+                          /* M15: at the poller/entry/scan pcs dump the
+                           * state machine word (LS 0x12A0), the claim
+                           * param (LS 0x1400) and the queue-header status
+                           * word the poller cached (LS 0x1420) -- dating
+                           * the state-2 wedge needs the state value at
+                           * each pass. */
+                          /* M24: loader-path regs -- the poller's post-DMA
+                           * parse (0x24F0), the module-fetch helper (0x1F74/
+                           * 0x1F80), the queue-refresh op (0x1B88) and the
+                           * op1 post-claim decision (0x1A6C) get their
+                           * operand regs so the never-firing module fetch
+                           * is attributable at the dispatch that skips it. */
+                          /* M25: hub state table -- the three pipeline words
+                           * batch index 0x1300 decide which hub branch runs;
+                           * dating the never-taken else (batch processor =
+                           * module stager) needs their values at each pass. */
+                          if (_p == 0x2140 || _p == 0x20C0 || _p == 0x20C8) {
+                              const uint8_t* _H = ctx->ls;
+                              #define _HW(o) ((uint32_t)(_H[(o)]<<24)|((uint32_t)_H[(o)+1]<<16)|((uint32_t)_H[(o)+2]<<8)|_H[(o)+3])
+                              fprintf(stderr, " hub12A0=%08X 12C0=%08X 12F0=%08X 1300=%08X",
+                                      _HW(0x12A0), _HW(0x12C0), _HW(0x12F0), _HW(0x1300));
+                          }
+                          if (_p == 0x24F0 || _p == 0x1F74 || _p == 0x1F80 ||
+                              _p == 0x1B88 || _p == 0x1A6C) {
+                              fprintf(stderr, " r2=%08X r4=%08X r5=%08X r8=%08X",
+                                      ctx->gpr[2]._u32[0], ctx->gpr[4]._u32[0],
+                                      ctx->gpr[5]._u32[0], ctx->gpr[8]._u32[0]);
+                          }
+                          /* M27: launch-vector writers -- dump the vector
+                           * candidate (r0), the drain counter (r2) and the
+                           * step (r5), plus the current LS 0x14C0 vector. */
+                          if (_p == 0x1A30 || _p == 0x21D8 || _p == 0x21E0 || _p == 0x220C) {
+                              uint32_t _v = ((uint32_t)ctx->ls[0x14C0]<<24)|((uint32_t)ctx->ls[0x14C1]<<16)|((uint32_t)ctx->ls[0x14C2]<<8)|ctx->ls[0x14C3];
+                              fprintf(stderr, " r0=%08X r2=%08X r5=%08X r6=%08X vec14C0=%08X",
+                                      ctx->gpr[0]._u32[0], ctx->gpr[2]._u32[0],
+                                      ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], _v);
+                          }
+                          /* M26: at the op dispatcher dump the scan cursor
+                           * (r2) and the 8 record bytes at it -- the op
+                           * sequence the scanner walks, record by record. */
+                          if (_p == 0x2258 || _p == 0x22C0) {
+                              uint32_t _cu = ctx->gpr[2]._u32[0] & 0x3FFFCu;
+                              uint32_t _r0 = ((uint32_t)ctx->ls[_cu]<<24)|((uint32_t)ctx->ls[_cu+1]<<16)|((uint32_t)ctx->ls[_cu+2]<<8)|ctx->ls[_cu+3];
+                              uint32_t _r1 = ((uint32_t)ctx->ls[_cu+4]<<24)|((uint32_t)ctx->ls[_cu+5]<<16)|((uint32_t)ctx->ls[_cu+6]<<8)|ctx->ls[_cu+7];
+                              fprintf(stderr, " cur=%05X w0=%08X w1=%08X", _cu, _r0, _r1);
+                          }
+                          /* M27: once, dump the FULL op jump table
+                           * 0x1590..0x15B8 -- entries 4-7 (op16/20/24/28)
+                           * are undumped and rec5 is op20. */
+                          if (_p == 0x2258) {
+                              static int _jt;
+                              if (_jt < 3) {
+                                  _jt++;
+                                  fprintf(stderr, " jt1590:");
+                                  for (int _o = 0; _o <= 0x28; _o += 4)
+                                      fprintf(stderr, " %08X", ((uint32_t)ctx->ls[0x1590+_o]<<24)|((uint32_t)ctx->ls[0x1591+_o]<<16)|((uint32_t)ctx->ls[0x1592+_o]<<8)|ctx->ls[0x1593+_o]);
+                              }
+                          }
+                          if (_p == 0x2498 || _p == 0x2050 ||
+                              _p == 0x2098 || _p == 0x2218) {
+                              uint32_t _st = ((uint32_t)ctx->ls[0x12A0]<<24)|((uint32_t)ctx->ls[0x12A1]<<16)|((uint32_t)ctx->ls[0x12A2]<<8)|ctx->ls[0x12A3];
+                              uint32_t _cp = ((uint32_t)ctx->ls[0x1400]<<24)|((uint32_t)ctx->ls[0x1401]<<16)|((uint32_t)ctx->ls[0x1402]<<8)|ctx->ls[0x1403];
+                              uint32_t _qh = ((uint32_t)ctx->ls[0x1420]<<24)|((uint32_t)ctx->ls[0x1421]<<16)|((uint32_t)ctx->ls[0x1422]<<8)|ctx->ls[0x1423];
+                              fprintf(stderr, " st=%08X cp=%08X qh=%08X",
+                                      _st, _cp, _qh);
+                              fprintf(stderr, " vec14C0=%08X",
+                                      ((uint32_t)ctx->ls[0x14C0]<<24)|((uint32_t)ctx->ls[0x14C1]<<16)|((uint32_t)ctx->ls[0x14C2]<<8)|ctx->ls[0x14C3]);
+                          }
+                              /* M14: at the claim preamble dump the two EA
+                               * sources the claim chain reads -- LS 0x1C0/4
+                               * (staged spurs EA, BE64) and LS 0x13F0/4
+                               * (entry r4 word1 = queue EA) -- so the
+                               * provenance of a claim's target line is
+                               * readable directly. */
+                              if (_p == 0x2AC0) {
+                                  uint32_t _l1c = ((uint32_t)ctx->ls[0x1C0]<<24)|((uint32_t)ctx->ls[0x1C1]<<16)|((uint32_t)ctx->ls[0x1C2]<<8)|ctx->ls[0x1C3];
+                                  uint32_t _l1c4 = ((uint32_t)ctx->ls[0x1C4]<<24)|((uint32_t)ctx->ls[0x1C5]<<16)|((uint32_t)ctx->ls[0x1C6]<<8)|ctx->ls[0x1C7];
+                                  uint32_t _l3f0 = ((uint32_t)ctx->ls[0x13F0]<<24)|((uint32_t)ctx->ls[0x13F1]<<16)|((uint32_t)ctx->ls[0x13F2]<<8)|ctx->ls[0x13F3];
+                                  uint32_t _l3f4 = ((uint32_t)ctx->ls[0x13F4]<<24)|((uint32_t)ctx->ls[0x13F5]<<16)|((uint32_t)ctx->ls[0x13F6]<<8)|ctx->ls[0x13F7];
+                                  fprintf(stderr, " ls1C0=%08X:%08X ls13F0=%08X:%08X",
+                                          _l1c, _l1c4, _l3f0, _l3f4);
+                              }
+                          /* M23: at the scan dispatch dump the command buffer
+                           * ops from 0xC00; naming the cmds it sees vs the
+                           * queue's pending batch decides whether the module
+                           * fetch op ever arrives. */
+                          if (_p == 0x2258) {
+                              const uint8_t* _L = ctx->ls;
+                              #define _BW(o) ((uint32_t)(_L[(o)]<<24)|((uint32_t)_L[(o)+1]<<16)|((uint32_t)_L[(o)+2]<<8)|_L[(o)+3])
+                              fprintf(stderr, " bufC00=%08X %08X %08X %08X q12A0=%08X %08X %08X %08X tgt14C0=%08X qh1420=%08X",
+                                      _BW(0xC00), _BW(0xC04), _BW(0xC08), _BW(0xC0C),
+                                      _BW(0x12A0), _BW(0x12A4), _BW(0x12A8), _BW(0x12AC),
+                                      _BW(0x14C0), _BW(0x1420));
+                              { /* M24: diff the LIVE guest queue vs the stale
+                                 * LS copy -- the queue EA is LS 0x13F0. */
+                                extern uint8_t* vm_base;
+                                uint32_t _qea = _BW(0x13F0);
+                                if (vm_base && _qea > 0x1000 && _qea != 0xFFFFFFFFu) {
+                                    fprintf(stderr, " gQ+0=%08X %08X %08X %08X",
+                                            (uint32_t)vm_base[_qea]<<24 | (uint32_t)vm_base[_qea+1]<<16 | (uint32_t)vm_base[_qea+2]<<8 | vm_base[_qea+3],
+                                            (uint32_t)vm_base[_qea+4]<<24 | (uint32_t)vm_base[_qea+5]<<16 | (uint32_t)vm_base[_qea+6]<<8 | vm_base[_qea+7],
+                                            (uint32_t)vm_base[_qea+8]<<24 | (uint32_t)vm_base[_qea+9]<<16 | (uint32_t)vm_base[_qea+10]<<8 | vm_base[_qea+11],
+                                            (uint32_t)vm_base[_qea+12]<<24 | (uint32_t)vm_base[_qea+13]<<16 | (uint32_t)vm_base[_qea+14]<<8 | vm_base[_qea+15]);
+                                }
+                              }
+                          }
+                              /* M12 boot2: at 0x2B18 dump the merge operands so
+                               * the claimed byte index and written value are
+                               * readable: r14 = r3-3 (rot index), r13 = cbx
+                               * control (byte0 of merge), r4 = new-value word,
+                               * r5 = old byte, r16 = merged line (SPU bytes). */
+                              if (_p == 0x2B18)
+                                  fprintf(stderr, " ea=0x%08X r3=%u r14=%X r13=%02X%02X%02X%02X "
+                                          "r4=%02X%02X%02X%02X r5=%02X r16=%02X%02X%02X%02X.%02X%02X%02X%02X.%02X%02X%02X%02X.%02X%02X%02X%02X",
+                                          ctx->resv_ea,
+                                          ctx->gpr[3]._u32[0],
+                                          ctx->gpr[14]._u32[0] & 0xF,
+                                          ctx->gpr[13]._u8[3], ctx->gpr[13]._u8[2],
+                                          ctx->gpr[13]._u8[1], ctx->gpr[13]._u8[0],
+                                          ctx->gpr[4]._u8[3], ctx->gpr[4]._u8[2],
+                                          ctx->gpr[4]._u8[1], ctx->gpr[4]._u8[0],
+                                          ctx->gpr[5]._u8[0],
+                                          ctx->gpr[16]._u8[3], ctx->gpr[16]._u8[2],
+                                          ctx->gpr[16]._u8[1], ctx->gpr[16]._u8[0],
+                                          ctx->gpr[16]._u8[7], ctx->gpr[16]._u8[6],
+                                          ctx->gpr[16]._u8[5], ctx->gpr[16]._u8[4],
+                                          ctx->gpr[16]._u8[11], ctx->gpr[16]._u8[10],
+                                          ctx->gpr[16]._u8[9], ctx->gpr[16]._u8[8],
+                                          ctx->gpr[16]._u8[15], ctx->gpr[16]._u8[14],
+                                          ctx->gpr[16]._u8[13], ctx->gpr[16]._u8[12]);
+                              fprintf(stderr, "\n"); fflush(stderr);
+                          }
+                          break;
+                      }
+                  }
+              } }
             spu_task_launch_check(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
@@ -465,15 +669,21 @@ static void spu_drain_call_scoped_body(spu_context* ctx, uint32_t return_pc)
                         ctx->irq_frame = &f;
                     }
                     if (setjmp(f.env) == 0) {
-                        if (spu_native_owned_policy(ctx) && !spu_native_owned_can_run(ctx,ctx->pc))
+                        if (owned && !spu_native_owned_run_ok(ctx,ctx->pc))
                             vf=spu_indirect_branch;
                         PS3_SPU_DISPATCH(ctx, vf);
-                        vf(ctx);
+                    vf(ctx);
+                    { static int _vt = 0; if (ctx->policy_mode && ctx->image_id == 200 && _vt++ < 24) fprintf(stderr, "[vfret] post-take pc=0x%05X tramp=%d r0=0x%05X\n", ctx->pc & SPU_LS_MASK, g_spu_trampoline_fn != 0, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */
                         ctx->host_depth = f.depth;
                         ctx->image_id = f.image_id;
-                        g_spu_trampoline_fn = spu_indirect_branch;
+                        /* Forced-interp PM resumes the srr0 continuation
+                         * through the interpreter trampoline that was pending
+                         * at the take (fn); the resolver would run image-
+                         * relative lift labels at the rawLS continuation. */
+                        g_spu_trampoline_fn = pm_interp_forced(ctx)
+                                            ? fn : spu_indirect_branch;
                         SPU_DRAIN_POP_IRQ();
                     }
                     continue;
@@ -486,10 +696,25 @@ static void spu_drain_call_scoped_body(spu_context* ctx, uint32_t return_pc)
             SPU_DRAIN_POP_IRQ();
             return;
         }
+        /* M12b: the op1->0x1AB4 handoff dies between the claim's SPU_RET and
+         * this exit. If the claim returned a WRONG pc (r0 clobbered), this is
+         * where it shows: log the mismatch for the PM image before the
+         * resume/restart machinery papers over it. */
+        { static int s_x = -1;
+          if (s_x < 0) s_x = getenv("SPU_PM_CLM") ? 1 : 0;
+          if (s_x && ctx->policy_mode && ctx->image_id == 200) {
+              static int _n = 0;
+              if (_n++ < 40)
+                  fprintf(stderr, "[pm-exit] drain exit pc=0x%05X != ret=0x%05X r0=0x%05X dep=%d ie=%d ev=%X/%X\n",
+                          ctx->pc & SPU_LS_MASK, return_pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth,
+                          (int)ctx->int_enable, ctx->event_status, ctx->event_mask),
+                  fflush(stderr);
+          } }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
             spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            if (!fn) fn = (spu_drain_fn)spu_lifted_lookup(ctx, pc);
             if (fn) {
                 { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",

@@ -406,6 +406,25 @@ static int64_t sc_rsx_attribute(ppu_context* ctx)    { (void)ctx; return CELL_OK
  * -----------------------------------------------------------------------*/
 void sys_rsx_init(lv2_syscall_table* tbl)
 {
+    /* Real firmware numbers (per lv2 dumps / rpcs3): the RSX block is
+     * 623..634. The runtime first shipped them at 666..677, which is where
+     * ps1_netemu-era homebrew expected them -- but a title built against the
+     * retail SDK (MotorStorm) issues 630/631 and hits the loud unimplemented
+     * stub instead. Register BOTH blocks: the retail numbers first, the
+     * legacy 666..677 alias behind the same handlers so nothing that worked
+     * before breaks. Order is identical (12 slots, one apart). */
+    lv2_syscall_register(tbl, 623, sc_rsx_device_open);
+    lv2_syscall_register(tbl, 624, sc_rsx_device_close);
+    lv2_syscall_register(tbl, 625, sc_rsx_memory_allocate);
+    lv2_syscall_register(tbl, 626, sc_rsx_memory_free);
+    lv2_syscall_register(tbl, 627, sc_rsx_context_allocate);
+    lv2_syscall_register(tbl, 628, sc_rsx_context_free);
+    lv2_syscall_register(tbl, 629, sc_rsx_context_iomap);
+    lv2_syscall_register(tbl, 630, sc_rsx_context_iounmap);
+    lv2_syscall_register(tbl, 631, sc_rsx_context_attribute);
+    lv2_syscall_register(tbl, 632, sc_rsx_device_map);
+    lv2_syscall_register(tbl, 633, sc_rsx_device_unmap);
+    lv2_syscall_register(tbl, 634, sc_rsx_attribute);
     lv2_syscall_register(tbl, 666, sc_rsx_device_open);
     lv2_syscall_register(tbl, 667, sc_rsx_device_close);
     lv2_syscall_register(tbl, 668, sc_rsx_memory_allocate);

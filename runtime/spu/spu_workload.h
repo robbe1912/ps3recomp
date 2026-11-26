@@ -44,6 +44,28 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n);
 /* Register one lifted SPU binary under its image fingerprint. `name` is borrowed
  * (kept by pointer for logging — pass a string literal / static). Idempotent on
  * fingerprint: a second register of the same fp updates the entry. */
+/* CellSpursTaskInfo slot layout used by the restarter: task_info[t] at
+ * taskset + 0x80 + 0x30*t, TI_ARGS = +0x00 (128-bit CellSpursTaskArgument),
+ * TI_ELF = +0x10 (u64), TI_CONTEXT = +0x18 (u64 context_save_storage).
+ * Pure decision helper: the task's 128-bit CellSpursTaskArgument IS the
+ * register image the SPURS kernel hands the entry (the whole quad lands in
+ * r3; runtime precedent: [rwh] img=1 r3 == argument word0). It applies
+ * regardless of TI_CONTEXT: the context save area is a SEPARATE lane (the
+ * kernel saves/restores task state there between dispatches), and on a
+ * re-dispatch it is typically all-zero -- the first dispatch consumed it --
+ * so gating on ctx==0 starved every re-dispatch of its registers (the
+ * mstream hub: dispatch #1 worked via the game's eaContext+0x10 descriptor,
+ * dispatch #2 read zeros and went deaf from entry). Fills r3_out[4]
+ * big-endian from the slot; returns 1 when ANY word is nonzero, 0 when the
+ * argument is empty (caller falls back to the descriptor path). */
+static inline int spu_taskset_arg_fallback(const uint8_t* ti, uint32_t r3_out[4])
+{
+    for (int k = 0; k < 4; k++)
+        r3_out[k] = ((uint32_t)ti[k*4] << 24) | ((uint32_t)ti[k*4+1] << 16) |
+                    ((uint32_t)ti[k*4+2] << 8) | (uint32_t)ti[k*4+3];
+    return r3_out[0] != 0 || r3_out[1] != 0 || r3_out[2] != 0 || r3_out[3] != 0;
+}
+
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
                            const char* name);
 
@@ -54,11 +76,69 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
 
+/* As spu_workload_register_img, but records the LS base the lifted image was
+ * LINKED at (lift_base). C0DEC0DE WWS job binaries declare their link base in
+ * the image header (+0x28) and the policy module stages them exactly there,
+ * so their lifts use staged addresses verbatim and the staging resolver in
+ * spu_overlay_note_get needs no pc translation (rel = staged_lsa - lift_base,
+ * which is 0 when the module sits at its link base). base-0 (module-relative)
+ * lifts keep using spu_workload_register_img (lift_base 0). */
+void spu_workload_register_img_at(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                  int image_id, uint32_t lift_base,
+                                  const char* name);
+
+/* The link base recorded for a fingerprint (0 when unregistered or when the
+ * lift is module-relative). */
+uint32_t spu_workload_img_base(uint64_t fingerprint);
+
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 
 /* As spu_workload_find, but also returns the image's indirect-branch table id. */
 spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out);
+
+/* ---- staged-codec content probes --------------------------------------
+ * Some SPURS tasks (MS1 Multistream: flashATRAC / flashMP3 from
+ * /dev_flash/sys/external/*.pic) DMA a lifted codec into their own local
+ * store at a RUNTIME base and indirect-branch to base + e_entry. A static
+ * register_at(base) covers exactly one base of one host image; the task can
+ * stage the same codec at several per-task bases (observed 0x32880 under
+ * image 1, 0x33880 and 0x2F780 under image 2). Register the codec's primary
+ * PT_LOAD fingerprint here instead: the staged-codec probe in
+ * spu_indirect_branch (spu_channels.c) hashes the LS window each probe
+ * names on an unlifted branch. A hit identifies the staged codec AND its
+ * lift_base: a probe registered with lift_base == the implied staging base
+ * (a per-base LINK-BASE lift, like the PM jobmods' 0x4000 lifts) claims a
+ * resident_code slot (rel 0) and dispatches NATIVELY; a module-relative
+ * registration (lift_base 0) still serves the span through the interpreter
+ * -- the fallback for unobserved bases (e.g. flashMP3). Matching prefers
+ * exact lift_base (pass 1) before any first-fit, and registration is
+ * idempotent on (fingerprint, lift_base) so one codec may register one
+ * module probe plus one probe per staging base.
+ *   fingerprint: FNV-1a-64 over the PT_LOAD file bytes (the same slice
+ *                spu_elf_image fingerprints name ".text", since the primary
+ *                segment carries the code).
+ *   image_id:    the lifted image whose function table resolves it.
+ *   lift_base:   base the lift was linked at (module-relative lift: 0;
+ *                link-base lift: the staging base itself).
+ *   entry:       module offset of the entry (staged branch target = base+entry).
+ *   seg_vaddr:   module offset the hashed segment loads at (p_vaddr).
+ *   seg_size:    hashed segment size (p_filesz). */
+void spu_workload_register_stage_probe(uint64_t fingerprint, int image_id,
+                                       uint32_t lift_base, uint32_t entry,
+                                       uint32_t seg_vaddr, uint32_t seg_size,
+                                       const char* name);
+
+/* Try each registered probe at an unlifted branch target pc inside one SPU's
+ * local store. For every probe whose implied module base (pc - entry) keeps
+ * the hashed segment inside LS, hashes the staged bytes and compares against
+ * the registered fingerprint. On an exact match returns 1 and fills
+ * base_out (staged module base), image_id_out, lift_base_out and span_out
+ * (module bytes the claim should cover, i.e. seg_vaddr + seg_size).
+ * Returns 0 when nothing matches (leave the caller's fallback untouched). */
+int spu_workload_stage_probe(const uint8_t* ls, uint32_t pc,
+                             uint32_t* base_out, int* image_id_out,
+                             uint32_t* lift_base_out, uint32_t* span_out);
 
 /* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
  * kernel handoff: kernel context at LS 0x100, entry ABI of
@@ -70,7 +150,7 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
  * the workload sync header) and its command lists contain cross-lane barrier
  * commands, so a workload configured for N SPUs must be dispatched once per
  * spu_num or the un-run lanes deadlock every barrier. */
-/* Retire resident policy contexts after the owning scheduler has joined. */
+/* Owned policy contexts retire only after admitted work has returned. */
 void spurs_policy_release_instance(uint32_t spurs_ea);
 int spurs_policy_release_workload(uint32_t spurs_ea, uint32_t wid);
 
@@ -129,7 +209,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
  * is not blocked. Required for persistent SPURS service/worker tasks that loop
  * waiting on PPU-side signals (running them inline deadlocks). */
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea);
+                                uint32_t args_ea, const uint32_t* task_arg);
 
 /* Task dispatch receives an immutable owner. Generic async work is unowned. */
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,

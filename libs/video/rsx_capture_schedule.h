@@ -13,8 +13,6 @@ typedef struct rsx_capture_schedule {
     uint32_t burst_remaining;
     int burst_seen;
     int screen_only;
-    int presented_mode;
-    uint64_t presented_frames;
 } rsx_capture_schedule;
 
 static inline void rsx_capture_schedule_init(rsx_capture_schedule* s,
@@ -44,20 +42,6 @@ static inline int rsx_capture_schedule_arm(rsx_capture_schedule* s, uint32_t cou
     return 1;
 }
 
-/* Switch once to a bounded late phase; preserve capture indices and burst state. */
-static inline int rsx_capture_schedule_presented(rsx_capture_schedule* s,
-    uint32_t count, uint32_t stride)
-{
-    if (s->presented_mode || !count || count > RSX_CAPTURE_BURST_MAX || !stride || stride > 10000u) return 0;
-    s->presented_mode = 1;
-    s->presented_frames = 0;
-    s->start = 1;
-    s->done = 0;
-    s->count = count;
-    s->stride = stride;
-    return 1;
-}
-
 /* Overlap produces one capture and spends both budgets. Empty/offscreen-only
  * batches do not consume the presented-frame burst. Indices never restart. */
 static inline unsigned rsx_capture_schedule_next(rsx_capture_schedule* s,
@@ -66,10 +50,6 @@ static inline unsigned rsx_capture_schedule_next(rsx_capture_schedule* s,
     if (!has_draws) return 0;
     /* A due screen sample stays due across offscreen capacity drains. */
     if (s->screen_only && !presenting) return 0;
-    if (s->presented_mode) {
-        if (!presenting) return 0;
-        frame = ++s->presented_frames;
-    }
     unsigned reason = 0;
     if (s->done < s->count && frame >= (uint64_t)s->start + (uint64_t)s->done * s->stride)
         reason |= RSX_CAPTURE_SCHEDULED;

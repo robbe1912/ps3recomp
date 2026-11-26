@@ -24,6 +24,14 @@ extern "C" {
 /* Number of instructions in the program at `ucode` (each 16 bytes), up to and
  * including the one with the D3.end bit, bounded by max_bytes. 0 if none. */
 u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
+/* Executable extent (instructions) of the program at `ucode`, bounded by
+ * max_bytes: the first-end slice widened to cover every branch/call target
+ * reachable from the entry, so a subroutine parked behind the main body's
+ * D3.end is included and unrelated resident programs after it are not.
+ * start_slot is the VP store slot the program begins at (branch targets are
+ * absolute slots; made relative the way rsx_vp_set_branch_base does).
+ * 0 if the bound holds no instructions. */
+u32 rsx_vp_program_extent_instrs(const u8* ucode, u32 max_bytes, u32 start_slot);
 
 typedef struct rsx_vp_input_analysis {
     u32 input_mask;

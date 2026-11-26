@@ -15,6 +15,9 @@
  *                                             : key_result
  *   plaintext  = AES_CBC_decrypt(key_final, iv=npd.digest, ciphertext)
  *
+ * License-bound EDAT (NPDRM license 3, game klicensee via cellFsSdataOpen's
+ * arg) is handled by libs/filesystem/edat.c -- one decryptor for both fs
+ * doors; this header is the self-keyed SDATA form only.
  * Self-contained (compact AES-128), header-only static inline.
  */
 #ifndef SDATA_DECRYPT_H
@@ -23,6 +26,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include "ps3_sdata_keys.h"
 
 /* ---- compact AES-128 (public-domain style) ---------------------------- */
 static const uint8_t SD_sbox[256] = {
@@ -129,8 +133,6 @@ static inline uint64_t sd_be64(const uint8_t* p){ return ((uint64_t)sd_be32(p)<<
  * *out_size bytes, or NULL if not NPD / unsupported (EDAT needing a license).
  * Caller frees. */
 static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_size){
-    static const uint8_t SDAT_KEY[16]  = {0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33};
-    static const uint8_t EDAT_KEY_0[16]= {0xBE,0x95,0x9C,0xA8,0x30,0x8D,0xEF,0xA2,0xE5,0xE1,0x80,0xC6,0x37,0x12,0xA9,0xAE};
     static const uint8_t ZERO_IV[16]   = {0};
     if(n < 0x100 || d[0]!='N' || d[1]!='P' || d[2]!='D') return NULL;
     const uint8_t* digest   = d + 0x40;

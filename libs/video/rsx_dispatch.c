@@ -262,11 +262,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
 {
     u32 w; memcpy(&w, &v, 4);
-    const u32 idx = (M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2;
-    rsx->regs[idx] = w;
-    /* Folded packed constants also have an explicit canonical value, even
-     * when every component is zero. Immediate snapshots need that presence. */
-    rsx->seen[idx]++;
+    rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2] = w;
 }
 
 static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
@@ -325,13 +321,6 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
-
-    /* Completing a floating-point position emits a register-based vertex.
-     * Other attributes update the current values copied with that position.
-     * Keep these writes as ordinary constant state outside BEGIN/END. */
-    if (rsx->in_begin_end && (method == 0x1508 || method == 0x1C0C) &&
-        rsx->sink.immediate_vertex)
-        rsx->sink.immediate_vertex(rsx->sink.user, rsx);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
@@ -470,14 +459,6 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
     out->clip_w = h >> 16;
     out->clip_y = v & 0xFFFF;
     out->clip_h = v >> 16;
-    /* Antialiased surfaces at their sample resolution (rsx_dispatch.h). A
-     * texture that reads an AA surface's memory sees the sample grid: a
-     * 320x180 SQUARE_ROTATED_4 target is a 640x360 image. */
-    out->antialias = (fmt >> 12) & 0xF;
-    out->aa_sx = (out->antialias >= 3 && out->antialias <= 5) ? 2u : 1u;
-    out->aa_sy = (out->antialias == 4 || out->antialias == 5) ? 2u : 1u;
-    out->clip_x *= out->aa_sx; out->clip_w *= out->aa_sx;
-    out->clip_y *= out->aa_sy; out->clip_h *= out->aa_sy;
 
     out->color_offset[0] = rsx_dsp_reg(rsx, M_COLOR0_OFFSET);
     out->color_offset[1] = rsx_dsp_reg(rsx, M_COLOR1_OFFSET);

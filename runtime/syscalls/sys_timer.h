@@ -49,6 +49,9 @@ typedef struct sys_timer_info {
     int      active;
     int      running;
     uint64_t period_usec;
+    uint64_t base_time_us;  /* absolute guest-clock fire time (0 = now) */
+    uint64_t delay_usec;    /* relative delay to first fire, computed at start() */
+    int      one_shot;      /* period == 0: fire once at base_time, then stop */
     int32_t  event_queue_id;   /* connected event queue */
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
@@ -72,7 +75,6 @@ extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 int64_t sys_timer_usleep(ppu_context* ctx);
 int64_t sys_timer_sleep(ppu_context* ctx);
 int64_t sys_time_get_current_time(ppu_context* ctx);
-int64_t sys_time_get_timezone(ppu_context* ctx);
 int64_t sys_time_get_timebase_frequency(ppu_context* ctx);
 int64_t sys_timer_create(ppu_context* ctx);
 int64_t sys_timer_destroy(ppu_context* ctx);
@@ -80,6 +82,7 @@ int64_t sys_timer_start(ppu_context* ctx);
 int64_t sys_timer_stop(ppu_context* ctx);
 int64_t sys_timer_connect_event_queue(ppu_context* ctx);
 int64_t sys_timer_disconnect_event_queue(ppu_context* ctx);
+int64_t sys_timer_get_information(ppu_context* ctx);
 
 /* Registration */
 void sys_timer_init(lv2_syscall_table* tbl);

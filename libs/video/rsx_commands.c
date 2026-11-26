@@ -477,7 +477,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
-            u8 stencil = state->zstencil_clear_value & 0xFF;
+            u8 stencil = (u8)(state->zstencil_clear_value & 0xFF);
             s_backend->clear(s_backend->userdata, data,
                            state->color_clear_value, depth, stencil);
         }
@@ -651,8 +651,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * instead; its duck shader computes (lighting * col0) * texture + spec, so a
      * zero col0 multiplies the texture away and the ducks rendered as a dim grey
      * specular term only -- present in the framebuffer, invisible on screen.
-     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
-     * file; add them if a title needs them. */
+     * SET_VERTEX_DATA2F/2S/4UB/4S below are the other encodings of the same
+     * register file. */
     if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
         u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
@@ -662,6 +662,45 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
           static int _n = 0;
           if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+        return 0;
+    }
+    /* The remaining inline ("current") vertex-attribute encodings, per RPCS3
+     * gcm_enums.h (NV4097_SET_VERTEX_DATA*_M) and psdevwiki RSXFIFOCommands:
+     *   SET_VERTEX_DATA2F_M 0x1880  16 attrs x 2 words (attr stride 8)
+     *   SET_VERTEX_DATA2S_M 0x1900  16 attrs x 1 word (attr stride 4)
+     *   SET_VERTEX_DATA4UB_M 0x1940 16 attrs x 1 word (attr stride 4)
+     *   SET_VERTEX_DATA4S_M 0x1980  16 attrs x 2 words (attr stride 8)
+     * All write the same vertex_data4f register file as floats. 2F/2S leave
+     * z/w untouched (the register keeps its (0,0,0,1) reset semantics for
+     * unwritten lanes, like glVertex2f/glVertex2s). */
+    if (method >= 0x1880u && method < 0x1880u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
+        /* 2F: one raw float per word, two words per attribute. */
+        u32 idx = (method - 0x1880u) >> 3;
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][((method - 0x1880u) >> 2) & 1u] = f;
+        return 0;
+    }
+    if (method >= 0x1900u && method < 0x1900u + RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        /* 2S: one word = two s16 -> float, NOT normalized (glVertex2s). */
+        u32 idx = (method - 0x1900u) >> 2;
+        state->vertex_data4f[idx][0] = (float)(short)(data & 0xFFFFu);
+        state->vertex_data4f[idx][1] = (float)(short)(data >> 16);
+        return 0;
+    }
+    if (method >= 0x1940u && method < 0x1940u + RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        /* 4UB: one word = four u8, normalized to [0,1] (glColor4ub). */
+        u32 idx = (method - 0x1940u) >> 2;
+        for (u32 c = 0; c < 4; c++)
+            state->vertex_data4f[idx][c] =
+                (float)((data >> (c * 8)) & 0xFFu) / 255.0f;
+        return 0;
+    }
+    if (method >= 0x1980u && method < 0x1980u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
+        /* 4S: two words of two s16 each -> float, NOT normalized. */
+        u32 idx  = (method - 0x1980u) >> 3;
+        u32 half = ((method - 0x1980u) >> 2) & 2u;   /* word 0: x,y; word 1: z,w */
+        state->vertex_data4f[idx][half]     = (float)(short)(data & 0xFFFFu);
+        state->vertex_data4f[idx][half + 1] = (float)(short)(data >> 16);
         return 0;
     }
 

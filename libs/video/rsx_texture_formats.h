@@ -48,8 +48,12 @@ static inline u32 rsx_texture_get_format(u32 format_word)
     return (format_word >> 8) & 0xFF;
 }
 
-/* Check if format is swizzled (bit 5 of format_word) */
-static inline int rsx_texture_is_swizzled(u32 format_word)
+/* Check if format is LINEAR (LN). Per SDK/RPCS3 gcm_enums.h the flag bits are
+ * CELL_GCM_TEXTURE_SZ = 0x00 (Morton-swizzled) and CELL_GCM_TEXTURE_LN = 0x20
+ * (linear rows) -- the bit SET means linear. rsx_texture_layout.c already
+ * decodes with this polarity (swizzled = !(fmt & 0x20) for POT sizes); this
+ * helper had it backwards and would mis-classify every query. */
+static inline int rsx_texture_is_linear(u32 format_word)
 {
     return (format_word & 0x20) != 0;
 }

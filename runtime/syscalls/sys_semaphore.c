@@ -3,11 +3,16 @@
  */
 
 #include "sys_semaphore.h"
+#include "ppu_wait_profile.h"
 #include "../ps3_log.h"
+#include "../spu/spu_context.h"   /* spu_lane_trace: the [WAIT] line */
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
+/* RD_PROBE_THREADSTATES: blocked-on tagging (sys_ppu_thread.c) */
+extern void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+extern void ppu_thread_wait_end(ppu_context* ctx);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -328,7 +333,9 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    PPU_WAIT_PROFILE_BEGIN(ctx, "semaphore_wait", LV2_ARG_U32(ctx, 0));
     int64_t r = sys_semaphore_wait_impl(ctx);
+    ppu_wait_profile_end();
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (n++ < 12)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
@@ -352,7 +359,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu cia=0x%08X lr=0x%08X)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
                 (unsigned)ctx->cia, (unsigned)ctx->lr);
-      else if (!getenv("SEMTID") && ps3_log_verbose())
+      else if (!getenv("SEMTID") && spu_lane_trace())
         fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
     /* PS3_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
@@ -379,6 +386,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    ppu_thread_wait_begin(ctx, "semaphore_wait", sem_id, timeout_us);
 #ifdef _WIN32
     /* value is the only count. The kernel semaphore is only a wake channel;
      * every wake re-checks value under the lock. */
@@ -439,6 +447,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     s->value--;
     pthread_mutex_unlock(&s->mtx);
 #endif
+    ppu_thread_wait_end(ctx);
 
     return CELL_OK;
 }

@@ -18,10 +18,11 @@ Usage:
   python tools/extract_jobmods.py --usrdir <dev_hdd0>/game/<TITLEID>/USRDIR                                   --out   <port>/spu/jobmods
 """
 import argparse, glob, hashlib, os, struct, sys, zlib
+from private_keys import load_key
 from Crypto.Cipher import AES
 
-SDAT_KEY   = bytes([0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33])
-EDAT_KEY_0 = bytes([0xBE,0x95,0x9C,0xA8,0x30,0x8D,0xEF,0xA2,0xE5,0xE1,0x80,0xC6,0x37,0x12,0xA9,0xAE])
+
+
 ZERO_IV    = b"\x00" * 16
 
 def sdata_decrypt(d: bytes):
@@ -39,6 +40,8 @@ def sdata_decrypt(d: bytes):
     if (flags & 0x01) or (flags & 0x20):  # compressed / 0x20-metadata variants unused by LBP
         return None
     enc_key = (flags & 0x08) != 0
+    SDAT_KEY = load_key("SDAT_KEY")
+    EDAT_KEY_0 = load_key("EDAT_KEY_0")
     crypt_key = bytes(dh ^ sk for dh, sk in zip(dev_hash, SDAT_KEY))
     total_blocks = (file_size + block_size - 1) // block_size
     out = bytearray()

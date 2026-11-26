@@ -1,24 +1,21 @@
 /*
  * ps3recomp - cellAvconfExt HLE implementation
  *
- * Reports standard LPCM stereo 48kHz as available audio output.
- * Games query this to decide audio format before opening cellAudio ports.
+ * Reports one HDMI primary audio output with LPCM 2 ch / 5.1 ch / 7.1 ch at
+ * 48 kHz. Games query this to decide the audio format before opening
+ * cellAudio ports.
+ *
+ * All output structs are written field-by-field with the vm_write8/16/32
+ * accessors (address-translated, big-endian). A host struct store through
+ * GUEST_PTR writes u16/u32 fields little-endian into guest RAM, which is how
+ * this module once reported "frequency 0" and MPEG2 coding types for LPCM
+ * modes (resume_asset_native.log lines 94-140).
  */
 
 #include "cellAvconfExt.h"
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write8/16/32: translate + swap */
 
-/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
- * bare deref here writes to whatever host address shares that number. These
- * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
- * memset()s through one -- an access violation the moment a title reaches audio
- * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
- * are all-u8, so translation alone is correct for them; the float needs a
- * byte-swapped store. */
-extern u8* vm_base;
-#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
-#include <string.h>
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -68,42 +65,68 @@ s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u3
     return 0;
 }
 
+/* cellAudioOutGetDeviceInfo(audioOut, deviceIndex, info)
+ *
+ * Guest CellAudioOutDeviceInfo (136 bytes):
+ *   +0 u8 portType, +1 u8 availableModeCount, +2 u8 state,
+ *   +3 u8 reserved[3], +6 u16 latency, +8 SoundMode[16] (8 bytes each:
+ *   u8 type, u8 channel, u8 fs, u8 reserved, u32 layout).
+ * The old code wrote a 70-byte host struct through GUEST_PTR, so the title
+ * read its modes 8-byte-strided from our 4-byte-strided bytes: every mode
+ * came back "MPEG2" (our fs byte 0x04 == CELL_AUDIO_OUT_CODING_TYPE_MPEG2)
+ * with an empty frequency list. */
 s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
                                CellAudioOutDeviceInfo* info)
 {
     (void)audioOut;
-    (void)deviceIndex;
 
     printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n",
            audioOut, deviceIndex);
 
     if (!info)
         return CELL_EINVAL;
-    info = GUEST_PTR(info, CellAudioOutDeviceInfo*);
 
-    memset(info, 0, sizeof(CellAudioOutDeviceInfo));
+    uint32_t ea = (uint32_t)(uintptr_t)info;
+    if (deviceIndex >= 1u)   /* cellAudioOutGetNumberOfDevice reports 1 */
+        return CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE;
+
+    /* Zero the whole 136-byte firmware struct (34 words). */
+    for (uint32_t a = 0; a < (uint32_t)sizeof(CellAudioOutDeviceInfo); a += 4)
+        vm_write32(ea + a, 0);
 
     /* Report the mode set a real PS3 reports. Golden trace (RPCS3.log, real YDKJ boot):
      *   "found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch."
      *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
      * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
      * self-inconsistent, and middleware (FMOD) validates these against each other. */
-    info->portType = 0; /* HDMI */
-    info->state = 2;    /* connected */
-    info->availableModeCount = 3;
-    info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
-    info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
-    info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
-    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
-    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
-    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
-    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
-    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
-    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    static const struct { u8 type, channel, fs; u32 layout; } MODES[3] = {
+        { CELL_AUDIO_OUT_CODING_TYPE_LPCM, CELL_AUDIO_OUT_CHNUM_2,
+          CELL_AUDIO_OUT_FS_48KHZ, CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH },
+        { CELL_AUDIO_OUT_CODING_TYPE_LPCM, CELL_AUDIO_OUT_CHNUM_6,
+          CELL_AUDIO_OUT_FS_48KHZ, CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr },
+        { CELL_AUDIO_OUT_CODING_TYPE_LPCM, CELL_AUDIO_OUT_CHNUM_8,
+          CELL_AUDIO_OUT_FS_48KHZ, CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy },
+    };
+
+    vm_write8(ea + 0, CELL_AUDIO_OUT_PORT_HDMI);
+    vm_write8(ea + 1, 3);                                    /* mode count  */
+    vm_write8(ea + 2, CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE);
+    vm_write16(ea + 6, 13);                                  /* HDMI latency */
+    for (u32 i = 0; i < 3; i++) {
+        uint32_t m = ea + 8 + i * (uint32_t)sizeof(CellAudioOutSoundMode);
+        vm_write8(m + 0, MODES[i].type);
+        vm_write8(m + 1, MODES[i].channel);
+        vm_write8(m + 2, MODES[i].fs);
+        vm_write32(m + 4, MODES[i].layout);
+    }
 
     return CELL_OK;
 }
 
+/* cellAudioOutGetConfiguration(audioOut, config, option, optionSize)
+ *
+ * Guest CellAudioOutConfiguration (16 bytes): u8 channel, u8 encoder,
+ * u8 reserved[10], u32 downMixer. */
 s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize)
@@ -116,11 +139,13 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 
     if (!config)
         return CELL_EINVAL;
-    config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
-    memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
-    config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    uint32_t ea = (uint32_t)(uintptr_t)config;
+    for (uint32_t a = 0; a < (uint32_t)sizeof(CellAudioOutConfiguration); a += 4)
+        vm_write32(ea + a, 0);
+    vm_write8(ea + 0, CELL_AUDIO_OUT_CHNUM_2);              /* channel     */
+    vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* encoder     */
+    vm_write32(ea + 12, CELL_AUDIO_OUT_DOWNMIXER_NONE);
 
     return CELL_OK;
 }
@@ -131,27 +156,31 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
  * the whole title. The device is always present and enabled here: there is no
  * "no audio device" case a recompiled port can be in.
  *
- * CellAudioOutState { u8 state; u8 encoder; u8 reserved[2]; u32 downMixer;
- *                     CellAudioOutSoundMode soundMode; } -- written big-endian
- * a byte at a time, which needs no struct definition to get right. */
-s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
+ * Guest CellAudioOutState (20 bytes): u8 state, u8 encoder, u8 reserved[6],
+ * u32 downMixer, CellAudioOutSoundMode soundMode at +12.
+ * The old code wrote channel/fs at +9/+10 -- those are reserved bytes; the
+ * title read channels and frequency from +13/+14, both zero
+ * ("Audio: Current Frequency 0.000000Khz ... Current Channels 0"). */
+s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, CellAudioOutState* state)
 {
     (void)deviceIndex;
+
     uint32_t ea = (uint32_t)(uintptr_t)state;
     printf("[cellAvconfExt] AudioOutGetState(audioOut=%u)\n", audioOut);
     if (!ea)
         return CELL_EINVAL;
 
-    vm_write8(ea + 0, 0);                                   /* ENABLED        */
+    /* Zero the whole 20-byte firmware struct, then fill the fields. The
+     * current configuration is stereo LPCM 48 kHz (see GetConfiguration). */
+    for (uint32_t a = 0; a < (uint32_t)sizeof(CellAudioOutState); a += 4)
+        vm_write32(ea + a, 0);
+    vm_write8(ea + 0, CELL_AUDIO_OUT_OUTPUT_STATE_ENABLED);
     vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
-    vm_write8(ea + 2, 0);
-    vm_write8(ea + 3, 0);
-    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
-    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
-    vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
-    vm_write8(ea + 11, 0);
-    vm_write32(ea + 12, 0);
+    vm_write32(ea + 8, CELL_AUDIO_OUT_DOWNMIXER_NONE);
+    vm_write8(ea + 12, CELL_AUDIO_OUT_CODING_TYPE_LPCM);    /* soundMode   */
+    vm_write8(ea + 13, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 14, CELL_AUDIO_OUT_FS_48KHZ);
+    vm_write32(ea + 16, CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH);
     return CELL_OK;
 }
 

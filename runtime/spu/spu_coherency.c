@@ -68,48 +68,56 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * line outside a hardcoded window would be silently non-coherent, which is the
  * failure this whole file exists to remove.
  * ===========================================================================*/
-#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
-#define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_BYTES];
 
-/* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+/* Zero until the first GETLLAR anywhere. Keeps the PPU store fast path off
+ * the bitmap entirely for a title that runs no SPU code. Exported as
+ * g_spu_coh_armed (see spu_coherency.h): the inline store paths gate on it
+ * with one predicted compare instead of a call into this file. Written once,
+ * under the lock; read unlocked, where a stale zero costs at most one missed
+ * event on the very first reservation of the run. */
+volatile int g_spu_coh_armed;
 
-/* Every live virtual context may retain a reservation between scheduling
- * quanta; physical SPU count is not a bound on this set. All access is under
- * the lock-line lock. Nodes are removed before their context's lifetime ends. */
-typedef struct spu_coh_entry {
+/* The SPU contexts that have reserved a line. Sized to match the MFC engine
+ * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
+#define SPU_COH_MAX_CTX 8
+static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
+typedef struct coh_overflow {
     spu_context* ctx;
-    struct spu_coh_entry* next;
-} spu_coh_entry;
-static spu_coh_entry* s_coh_ctxs;
+    struct coh_overflow* next;
+} coh_overflow;
+static coh_overflow* s_coh_overflow;
 
 unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    g_spu_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+    g_spu_coh_armed = 1;
 
     if (!ctx) return;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) return;
-    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
-    if (!entry) {
-        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* A missed holder loses invalidation events, including ABA. */
+    /* Retained virtual contexts outnumber physical SPUs. Find an existing
+     * owner before reusing a hole; duplicate registration would outlive a
+     * single unregister. All registry access holds the lock-line lock. */
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+        if (s_coh_ctxs[i] == ctx) return;
+    for (coh_overflow* n = s_coh_overflow; n; n = n->next)
+        if (n->ctx == ctx) return;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        if (s_coh_ctxs[i] == NULL) { s_coh_ctxs[i] = ctx; return; }
     }
-    entry->ctx = ctx;
-    entry->next = s_coh_ctxs;
-    s_coh_ctxs = entry;
+    coh_overflow* n = (coh_overflow*)malloc(sizeof(*n));
+    if (!n) {
+        fprintf(stderr, "[spu-coh] cannot register reservation owner %p\n", (void*)ctx);
+        fflush(stderr);
+        abort();
+    }
+    n->ctx = ctx;
+    n->next = s_coh_overflow;
+    s_coh_overflow = n;
 }
 
 /* Drop a context from the reserving set.
@@ -126,16 +134,18 @@ void spu_coh_unregister(spu_context* ctx)
 {
     if (!ctx) return;
     /* Under the lock-line lock, which every walker of s_coh_ctxs holds: a
-     * notifier that loaded this pointer just before removal would
+     * notifier that loaded this pointer just before the NULL store would
      * otherwise go on dereferencing it after the job returned and its stack
      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+    for (coh_overflow** link = &s_coh_overflow; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
-        spu_coh_entry* entry = *link;
-        *link = entry->next;
-        free(entry);
+        coh_overflow* n = *link;
+        *link = n->next;
+        free(n);
         break;
     }
     spu_lockline_unlock();
@@ -150,28 +160,33 @@ void spu_coh_unregister(spu_context* ctx)
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link;) {
-        spu_coh_entry* entry = *link;
-        uintptr_t c = (uintptr_t)entry->ctx;
-        if (c >= lo && c < hi) {
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
+        if (s_coh_ctxs[i] && c >= lo && c < hi) {
             static int _n = 0;
             if (_n++ < 16)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
-                        (void*)c, entry->ctx->image_id);
-            *link = entry->next;
-            free(entry);
-        } else {
-            link = &entry->next;
+                        (void*)c, s_coh_ctxs[i]->image_id);
+            s_coh_ctxs[i] = NULL;
         }
+    }
+    for (coh_overflow** link = &s_coh_overflow; *link;) {
+        coh_overflow* n = *link;
+        uintptr_t c = (uintptr_t)n->ctx;
+        if (c < lo || c >= hi) { link = &n->next; continue; }
+        fprintf(stderr, "[spu-coh] leaked overflow ctx %p (img=%d) dropped at thread exit\n",
+                (void*)c, n->ctx->image_id);
+        *link = n->next;
+        free(n);
     }
     spu_lockline_unlock();
 }
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
+    if (!g_spu_coh_armed) return 0;
     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return spu_coh_bitmap_test(addr);
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
@@ -184,12 +199,11 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
-void spu_coh_notify_write_except(uint32_t ea, const void* self)
+static void coh_notify_overflow(uint32_t line, const void* self)
 {
-    uint32_t line = ea & ~127u;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
-        if (!c || (const void*)c == self) continue;
+    for (coh_overflow* n = s_coh_overflow; n; n = n->next) {
+        spu_context* c = n->ctx;
+        if ((const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
             c->resv_valid = 0;
@@ -199,11 +213,27 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+void spu_coh_notify_write_except(uint32_t ea, const void* self)
+{
+    uint32_t line = ea & ~127u;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        spu_context* c = s_coh_ctxs[i];
+        if (!c || (const void*)c == self) continue;
+        if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+            c->event_status |= SPU_EVENT_LR;
+            c->resv_valid = 0;
+            g_spu_lr_raise++;
+            spu_ch_wake(c);
+        }
+    }
+    coh_notify_overflow(line, self);
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
@@ -224,6 +254,8 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+    /* Same notification semantics for every retained virtual context. */
+    coh_notify_overflow(line, NULL);
 }
 
 #ifdef __cplusplus

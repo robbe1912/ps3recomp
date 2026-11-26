@@ -111,6 +111,4 @@ s32 cellGemEnableCameraPitchAngleCorrection(s32 enable);
 }
 #endif
 
-s32 cellGemGetMemorySize(s32 max_connect);
-
 #endif /* PS3RECOMP_CELL_GEM_H */

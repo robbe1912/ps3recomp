@@ -56,7 +56,7 @@ static void texture_retention_trim(void)
         texture_slot_release(&s_d3d.vp_tex[victim]); ++s_d3d.vp_tex_evictions;
     }
 }
-/* Sole unpin boundary: callers first complete checked address_retire(). */
+/* Sole unpin boundary: callers first complete checked GPU retirement. */
 static void texture_retention_begin_batch(void)
 {
     for (unsigned i = 0; i < s_d3d.vp_tex_capacity; ++i) s_d3d.vp_tex[i].used = 0;

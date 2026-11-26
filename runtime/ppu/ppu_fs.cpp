@@ -18,11 +18,11 @@
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+#include "ps3emu/loadtime_trace.h"   /* #11 load-stage timing (observer) */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -37,35 +37,6 @@ extern "C" void ydkj_host_bt(const char* tag);
 #endif
 #ifndef O_BINARY
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
-#endif
-
-/* 64-bit file offsets and sizes. Windows is LLP64: `long` is 32 bits, so
- * fseek(long)/ftell and `struct stat` (st_size is a 32-bit _off_t on MinGW, and
- * stat() is stat64i32) cannot express a file past 2 GiB. Disc archives are
- * routinely bigger: Lseek truncated the offset, Fstat's size came from ftell's
- * overflow result and Stat's from the 32-bit wrapper, and what those return
- * differs between CRTs: MinGW-w64's own stat() wrapper (msvcrt builds) fails
- * with EOVERFLOW, UCRT's _stat64i32 (llvm-mingw) returns the size truncated, so
- * the same title took different paths depending on the toolchain. POSIX LP64
- * is unaffected. */
-#ifdef _WIN32
-#  define FS_SEEK64(f, o, w) _fseeki64((f), (int64_t)(o), (w))
-#  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
-typedef struct _stat64 fs_stat64_t;
-/* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
-static int FS_STAT64(const char* p, fs_stat64_t* s)
-{
-    char t[1100]; size_t n = strlen(p);
-    if (n >= sizeof t) return _stat64(p, s);
-    memcpy(t, p, n + 1);
-    while (n > 1 && (t[n - 1] == '/' || t[n - 1] == '\\') && t[n - 2] != ':') t[--n] = 0;
-    return _stat64(t, s);
-}
-#else
-#  define FS_SEEK64(f, o, w) fseeko((f), (off_t)(o), (w))
-#  define FS_TELL64(f)       ((int64_t)ftello(f))
-#  define FS_STAT64(p, s)    stat((p), (s))
-typedef struct stat fs_stat64_t;
 #endif
 
 extern "C" uint8_t* vm_base;
@@ -84,7 +55,6 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
-#define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -115,6 +85,10 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
  * translators. (extern "C" is ill-formed at block scope.) */
 extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+/* Shared /dev_flash resolver (defined in runtime/syscalls/sys_fs.c): probes
+ * $PS3_DEV_FLASH, the VFS root's RPCS3 layout and the fixed installs. */
+extern "C" const char* ps3_dev_flash_root(void);
+
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
@@ -140,11 +114,18 @@ static void host_path(char* out, size_t cap, const char* guest)
      * load MP3 codec (are you using the correct flash?)" and then crashes.
      * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
     if (strncmp(guest, "/dev_flash/", 11) == 0) {
-        const char* fw = getenv("PS3_DEV_FLASH");
-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
-        snprintf(out, cap, "%s/%s", fw, guest + 11);
-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-        return;
+        const char* fw = ps3_dev_flash_root();
+        if (fw) {
+            snprintf(out, cap, "%s/%s", fw, guest + 11);
+            for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+            return;
+        }
+        /* No firmware tree anywhere: keep the old fall-through to the game
+         * root rather than a dead path, but say so once. */
+        { static int warned = 0;
+          if (!warned) { warned = 1;
+              fprintf(stderr, "[MOD][fs] /dev_flash has no firmware tree; "
+                              "firmware lookups will miss\n"); } }
     }
 
     static const char* mounts[] = {
@@ -197,6 +178,8 @@ static int fd_alloc_dir(DIR* d)
     return -1;
 }
 
+static int host_mkdir_p(const char* path);   /* defined below; used by cellFsOpen's O_CREAT path */
+
 /* ---- handlers ---- */
 static void cellFsOpen(ppu_context* ctx)
 {
@@ -205,12 +188,32 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+    /* FS_ZERO_FILE=<substring>: see sys_fs.c -- MS1's intro narration is
+     * SPU-MP3 decoded and the interpreter never produces audio, leaving the
+     * intro stuck on the narration wait. An empty stream ends it. The title
+     * reaches cellFsOpen through this layer, not sys_fs, so mirror the hook. */
+    { static int s_zf = -1; static char s_zpat[128];
+      if (s_zf < 0) { const char* e = getenv("FS_ZERO_FILE");
+                      s_zf = (e && *e); if (s_zf) { strncpy(s_zpat, e, sizeof s_zpat - 1); s_zpat[sizeof s_zpat - 1] = '\0'; } }
+      if (s_zf && strstr(gpath, s_zpat)) {
+          fprintf(stderr, "[fs] FS_ZERO_FILE: '%s' opens empty (null device)\n", gpath);
+#ifdef _WIN32
+          snprintf(hpath, sizeof hpath, "NUL");
+#else
+          snprintf(hpath, sizeof hpath, "/dev/null");
+#endif
+      } }
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
     { char dec_path[1200];
+      unsigned long long ed0 = loadtime_on() ? loadtime_us() : 0;
       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
+      if (use != hpath) {
+          snprintf(hpath, sizeof hpath, "%s", use);
+          if (loadtime_on()) { char d[1100];
+              snprintf(d, sizeof d, "dur_us=%llu", loadtime_us() - ed0);
+              loadtime_event_path("fs_edat_decrypt", d,gpath); } } }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
@@ -237,9 +240,27 @@ static void cellFsOpen(ppu_context* ctx)
             return;
         }
     }
+    /* PS3 create semantics expect missing parent directories to appear: a
+     * title writing straight into /dev_hdd0/home/00000001/savedata/<dir>/FILE
+     * or /dev_hdd0/game/<id>/USRDIR/... does not mkdir first -- firmware's
+     * save/data layer owns that tree. open() won't create parents, so grow
+     * them here; only on the O_CREAT path, never for a read (which must keep
+     * failing ENOENT). */
+    if (flags & CELL_FS_O_CREAT) {
+        char dir_part[1100];
+        snprintf(dir_part, sizeof dir_part, "%s", hpath);
+        char* slash  = strrchr(dir_part, '/');
+        char* bslash = strrchr(dir_part, '\\');
+        char* cut = (bslash > slash) ? bslash : slash;
+        if (cut && cut != dir_part) { *cut = '\0'; host_mkdir_p(dir_part); }
+    }
+
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        if (loadtime_on()) { char d[1100];
+            snprintf(d, sizeof d, "rc=ENOENT");
+            loadtime_event_path("fs_open_fail", d,gpath); }
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
@@ -255,6 +276,9 @@ static void cellFsOpen(ppu_context* ctx)
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    if (loadtime_on()) { char d[1100];
+        snprintf(d, sizeof d, "fd=%d", fd);
+        loadtime_event_path("fs_open", d,gpath); }
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
@@ -289,17 +313,34 @@ static void cellFsOpen(ppu_context* ctx)
  * read -> zero job modules loaded -> every SPU physics job dispatched into an
  * empty code buffer -> the loading freeze.
  *
- * Our run env's PS3_HDD0_ROOT (RPCS3 dev_hdd0) already holds patch.sdat in
- * DECRYPTED form (magic "FSHb", not "NPD"), so we just open it read-only --
- * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
- * would need the SDATA block cipher; not required here.) The license `arg`
- * (gpr[6]) and its size (gpr[7]) are ignored. */
+ * The license `arg` (gpr[6], size in gpr[7]) is firmware's channel for the
+ * title's 16-byte klicensee, and MotorStorm Pacific Rift opens its pack EDATs
+ * (license type 3: the klicensee IS the file key) exactly this way. It is read
+ * raw from guest memory -- byte order is the AES key order, no swap -- and
+ * handed to edat_resolve_klic, which PROVES it via validate_dev_klic (CMAC ^
+ * NP_OMAC_KEY_2 over the NPD header) before use and otherwise falls back to
+ * the env/.rifkey chain. */
 static void cellFsSdataOpen(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+
+    /* Guest klicensee from arg/size (firmware's cellFsSdataOpen license arg).
+     * Accept only a plausible in-VM pointer with size >= 0x10; 16 raw bytes,
+     * no byte-swap. */
+    uint8_t klic[16];
+    const uint8_t* guest_klic = nullptr;
+    {
+        uint32_t arg_ea = (uint32_t)ctx->gpr[6];
+        uint64_t arg_sz = ctx->gpr[7];
+        if (arg_ea && arg_sz >= 16 &&
+            (!ppu_vm_size || (uint64_t)arg_ea + 16 <= ppu_vm_size)) {
+            memcpy(klic, vm_base + arg_ea, 16);
+            guest_klic = klic;
+        }
+    }
 
     /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
      * into a cache file and that is opened in its place. This used to be a
@@ -309,8 +350,14 @@ static void cellFsSdataOpen(ppu_context* ctx)
      * without a handle" here while the very same file opened fine through
      * cellFsOpen. One decryptor, reached from both doors. */
     { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
+      unsigned long long ed0 = loadtime_on() ? loadtime_us() : 0;
+      const char* use = edat_resolve_klic(hpath, dec_path, sizeof dec_path,
+                                          guest_klic, guest_klic ? "arg" : nullptr);
+      if (use != hpath) {
+          snprintf(hpath, sizeof hpath, "%s", use);
+          if (loadtime_on()) { char d[1100];
+              snprintf(d, sizeof d, "dur_us=%llu", loadtime_us() - ed0);
+              loadtime_event_path("fs_edat_decrypt", d,gpath); } } }
 
     int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
     if (hfd < 0) {
@@ -334,11 +381,18 @@ static void cellFsSdataOpen(ppu_context* ctx)
         size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
         fclose(f);
         size_t dec_sz = 0;
+        unsigned long long sd0 = loadtime_on() ? loadtime_us() : 0;
         uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
         free(enc);
+        if (loadtime_on()) { char d[1100];
+            snprintf(d, sizeof d, "in=%zu out=%zu dur_us=%llu",
+                      rd, dec_sz, loadtime_us() - sd0);
+            loadtime_event_path("fs_sdata_decrypt", d,gpath); }
         if (!dec) {
-            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
-                    "EDAT/needs license); returning success without a handle\n", gpath);
+            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (no valid "
+                    "klicense: guest arg %s, env/.rifkey exhausted); returning "
+                    "success without a handle\n", gpath,
+                    guest_klic ? "failed validate_dev_klic" : "not supplied");
             ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
         }
         char dmagic[4] = {0};
@@ -377,6 +431,9 @@ static void cellFsClose(ppu_context* ctx)
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
         fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
     }
+    if (loadtime_on()) { char d[64];
+        snprintf(d, sizeof d, "fd=%d", fd);
+        loadtime_event("fs_close", d); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -411,9 +468,14 @@ static void cellFsRead(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(g_files[fd]);
+    unsigned long long rd0 = loadtime_on() ? loadtime_us() : 0;
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (loadtime_on()) { char d[256];
+        snprintf(d, sizeof d, "fd=%d want=%llu got=%zu pos=%ld dur_us=%llu",
+                 fd, (unsigned long long)raw_nbytes, n, fpos_before, loadtime_us() - rd0);
+        loadtime_event("fs_read", d); }
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -552,6 +614,16 @@ static void cellFsGetBlockSize(ppu_context* ctx)
     fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
 }
 
+/* 64-bit file primitives: retail archives exceed 2 GiB (MS1 cache_ps3.dat
+ * is 3.48 GB); the 32-bit fseek/ftell/long-stat MSVC defaults overflow and
+ * report ENOENT/garbage for exactly those files. */
+#if defined(_WIN32)
+static int fs_seek64(FILE* f, long long off, int whence) { return _fseeki64(f, (__int64)off, whence); }
+static long long fs_tell64(FILE* f) { return (long long)_ftelli64(f); }
+#else
+static int fs_seek64(FILE* f, long long off, int whence) { return fseeko(f, (off_t)off, whence); }
+static long long fs_tell64(FILE* f) { return (long long)ftello(f); }
+#endif
 static void cellFsLseek(ppu_context* ctx)
 {
     int fd        = (int)(uint32_t)ctx->gpr[3];
@@ -562,8 +634,8 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    FS_SEEK64(g_files[fd], off, worigin);
-    int64_t p = FS_TELL64(g_files[fd]);
+    fs_seek64(g_files[fd], (long long)off, worigin);
+    long long p = fs_tell64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -594,8 +666,16 @@ static void cellFsStat(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
-    fs_stat64_t st;
-    if (FS_STAT64(hpath, &st) != 0) {
+    /* 64-bit stat: retail archives exceed 2 GiB (MS1 cache_ps3.dat = 3.48 GB);
+     * the 32-bit stat() default overflows and fails for exactly those files. */
+    #if defined(_WIN32)
+    struct _stat64 st;
+    int st_ok = (_stat64(hpath, &st) == 0);
+    #else
+    struct stat st;
+    int st_ok = (stat(hpath, &st) == 0);
+    #endif
+    if (!st_ok) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
@@ -604,6 +684,9 @@ static void cellFsStat(ppu_context* ctx)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
+    if (loadtime_on()) { char d[1100];
+        snprintf(d, sizeof d, "size=%lld", (long long)st.st_size);
+        loadtime_event_path("fs_stat", d,gpath); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -614,10 +697,10 @@ static void cellFsFstat(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    int64_t cur = FS_TELL64(g_files[fd]);
-    FS_SEEK64(g_files[fd], 0, SEEK_END);
-    int64_t sz = FS_TELL64(g_files[fd]);
-    FS_SEEK64(g_files[fd], cur, SEEK_SET);
+    long long cur = fs_tell64(g_files[fd]);
+    fs_seek64(g_files[fd], 0, SEEK_END);
+    long long sz = fs_tell64(g_files[fd]);
+    fs_seek64(g_files[fd], cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -628,7 +711,7 @@ static void cellFsFstat(ppu_context* ctx)
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
       if (cap) { long long c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, sz, c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
     if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
@@ -671,59 +754,6 @@ static void cellFsReaddir(ppu_context* ctx)
     vm_base[dirent + 2 + nl] = 0;
     if (nread_ptr) vm_write64(nread_ptr, 0x102);
     ctx->gpr[3] = CELL_OK;
-}
-
-/* CellFsDirectoryEntry is a 52-byte stat followed by a 258-byte dirent,
- * rounded to four-byte alignment: 312 bytes. entries_size is bytes, while
- * data_count is a big-endian u32 count of complete entries. The stream is
- * shared with cellFsReaddir and cellFsClosedir. */
-static void cellFsGetDirectoryEntries(ppu_context* ctx)
-{
-    const uint32_t fd = (uint32_t)ctx->gpr[3];
-    const uint32_t entries = (uint32_t)ctx->gpr[4];
-    const uint32_t bytes = (uint32_t)ctx->gpr[5];
-    const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
-    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
-    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
-        uint64_t(count_ptr) + 4 > limit) {
-        ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
-        return;
-    }
-    if (fd < 3 || fd >= FS_MAX || !g_dirs[fd]) {
-        ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
-        return;
-    }
-    uint32_t count = 0;
-    ctx->gpr[3] = CELL_OK;
-    for (; count < bytes / 312; ++count) {
-        errno = 0;
-        struct dirent* entry = readdir(g_dirs[fd]);
-        if (!entry) {
-            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
-            break;
-        }
-        char path[1300];
-        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
-        struct stat st;
-        if (stat(path, &st) != 0) {
-            ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
-            break;
-        }
-        uint32_t out = entries + count * 312;
-        memset(vm_base + out, 0, 312);
-        bool directory = (st.st_mode & S_IFDIR) != 0;
-        write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
-                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size));
-        vm_write64(out + 0x0C, uint64_t(st.st_atime));
-        vm_write64(out + 0x14, uint64_t(st.st_mtime));
-        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
-        size_t length = strlen(entry->d_name);
-        if (length > 255) length = 255;
-        vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
-        vm_base[out + 53] = uint8_t(length);
-        memcpy(vm_base + out + 54, entry->d_name, length);
-    }
-    vm_write32(count_ptr, count);
 }
 
 static void cellFsClosedir(ppu_context* ctx)
@@ -779,29 +809,6 @@ static void cellFsFsync(ppu_context* ctx)
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
-
-/* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
- * the call took the unresolved-NID path: CELL_OK with both out-params left as
- * unwritten, so a title sizing a cache read whatever was there. Report a
- * 4 KiB block and 32 GiB free: enough for any cache, and the same on every host. */
-static void cellFsGetFreeSize(ppu_context* ctx)
-{
-    uint32_t bs = (uint32_t)ctx->gpr[4], fb = (uint32_t)ctx->gpr[5];
-    if (bs) vm_write32(bs, 4096);
-    if (fb) vm_write64(fb, (32ULL << 30) / 4096);
-    ctx->gpr[3] = CELL_OK;
-}
-static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
-static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
-/* SDATA opened from an already-open fd is not implemented: fail visibly rather
- * than return CELL_OK with *sdata_fd never written. */
-static void cellFsSdataOpenByFd(ppu_context* ctx)
-{
-    static int n;
-    if (n++ < 4) fprintf(stderr, "[fs] cellFsSdataOpenByFd(fd=%d) not implemented -> CELL_ENOSYS\n",
-                         (int)(uint32_t)ctx->gpr[3]);
-    ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOSYS;
-}
 
 /* ---- cellFs AIO -----------------------------------------------------------
  *
@@ -894,17 +901,12 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
     /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does

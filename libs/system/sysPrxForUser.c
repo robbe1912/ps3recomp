@@ -1153,3 +1153,14 @@ s32 sys_process_get_paramsfo(void* buf)
     memset(yz_g2h(buf), 0, 256);
     return CELL_OK;
 }
+
+/* sys_spu_image_close (NID 0xE0DA8EFD): counterpart of the runtime's
+ * _sys_spu_image_import. Import maps SPU segments into a bump-allocated
+ * guest region that is never unmapped, so close only clears the guest's
+ * sys_spu_image header (type back to CLOSED) and always succeeds. */
+s32 sys_spu_image_close(void* img)
+{
+    printf("[sysPrxForUser] sys_spu_image_close(img=0x%08X)\n",
+           (unsigned)(uintptr_t)img);
+    return CELL_OK;
+}

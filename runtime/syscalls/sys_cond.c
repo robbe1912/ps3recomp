@@ -6,10 +6,15 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "ppu_wait_profile.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
+/* RD_PROBE_THREADSTATES: blocked-on tagging (sys_ppu_thread.c) */
+extern void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+extern void ppu_thread_wait_end(ppu_context* ctx);
 
 struct sys_cond_waiter {
     struct sys_cond_waiter* next;
@@ -38,6 +43,48 @@ static void cond_wake(sys_cond_info* c) { pthread_cond_broadcast(&c->cv); }
 static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
 static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
 #endif
+/* Bounded failure probe for instant-return sys_cond_wait calls.
+ * MotorStorm fn 0x26C798 (VideoStream post/input pump) retries its inner
+ * post-wait loop with no sleep: each failed cond_wait costs one full
+ * syscall dispatch, so a never-parking waiter spins at ~3M dispatches/s.
+ * Name the failing branch in one boot: 16 detail lines, then at most one
+ * summary line per 5 minutes. */
+static struct {
+    long esrch_cond, esrch_mutex, eperm;
+    long detail;
+    unsigned long long last_summary_ms;
+} s_cw_fail;
+
+static unsigned long long cw_now_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    return (unsigned long long)time(NULL) * 1000ull;
+#endif
+}
+
+static void cond_wait_fail(long* counter, const char* name, uint32_t cond_id,
+                           uint32_t mutex_id, sys_mutex_info* m, ppu_context* ctx)
+{
+    ++*counter;
+    if (s_cw_fail.detail < 16) {
+        s_cw_fail.detail++;
+        fprintf(stderr, "[CWFAIL] %s cond=%u mutex=%u mutex_active=%d "
+                        "mutex_owner=%llu lock_count=%d caller_tid=%llu\n",
+                name, cond_id, mutex_id,
+                m ? (int)m->active : -1,
+                m ? (unsigned long long)m->owner_tid : 0ull,
+                m ? (int)m->lock_count : -1,
+                ctx ? (unsigned long long)ctx->thread_id : 0ull);
+    }
+    unsigned long long now = cw_now_ms();
+    if (now - s_cw_fail.last_summary_ms >= 300000ull) {
+        s_cw_fail.last_summary_ms = now;
+        fprintf(stderr, "[CWFAIL] summary esrch_cond=%ld esrch_mutex=%ld eperm=%ld\n",
+                s_cw_fail.esrch_cond, s_cw_fail.esrch_mutex, s_cw_fail.eperm);
+    }
+}
 
 /* Lock ordering is table -> condition. No caller holds the condition lock
  * while acquiring a guest mutex. Native locks survive slot recycling. */
@@ -118,9 +165,30 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     return result;
 }
 
-int64_t sys_cond_wait(ppu_context* ctx)
+static int64_t sys_cond_wait_impl(ppu_context* ctx)
 {
+    /* Firmware ABI (2 args): sys_cond_wait(cond_id r3, timeout_usec r4);
+     * r4=0 means wait forever. There is no mutex argument -- the cond's
+     * mutex is the one bound at cond_create. Reading the timeout from r5
+     * (a 3-arg premise) turned every guest "wait forever" (r4=0, r5 stale)
+     * into a finite timeout: ETIMEDOUT wake loops. Proven by lifted caller
+     * func_00B9F990 (MotorStorm BCES00006 dequeuer): r3=[obj+0xC] cond,
+     * r4=0, r5 never written. */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
+    /* CWENTRY=1: cap-16 entry trace for tid=1 -- cond id, raw r4/r5, and the
+     * effective timeout. Discriminates stale-r5 artifacts from real waits. */
+    { static int s_on = -1;
+      if (s_on < 0) s_on = getenv("CWENTRY") ? 1 : 0;
+      if (s_on && ctx->thread_id == 1) {
+          static int _n = 0;
+          if (_n++ < 16)
+              fprintf(stderr, "[CWENTRY] tid=1 cond=%u r4=%llu r5=%llu timeout=%llu%s\n",
+                      LV2_ARG_U32(ctx, 0),
+                      (unsigned long long)LV2_ARG_U64(ctx, 1),
+                      (unsigned long long)LV2_ARG_U64(ctx, 2),
+                      (unsigned long long)timeout,
+                      timeout ? "" : " (forever)");
+      } }
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");
     if (peek) {
@@ -140,10 +208,20 @@ int64_t sys_cond_wait(ppu_context* ctx)
 #endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
-    if (!c) return (int32_t)CELL_ESRCH;
+    if (!c) {
+        cond_wait_fail(&s_cw_fail.esrch_cond, "esrch_cond",
+                       LV2_ARG_U32(ctx, 0), 0, NULL, ctx);
+        return (int32_t)CELL_ESRCH;
+    }
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
-    if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
+    if (!m->active) {
+        cond_wait_fail(&s_cw_fail.esrch_mutex, "esrch_mutex",
+                       LV2_ARG_U32(ctx, 0), c->mutex_id, m, ctx);
+        cond_unlock(c); return (int32_t)CELL_ESRCH;
+    }
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+        cond_wait_fail(&s_cw_fail.eperm, "eperm",
+                       LV2_ARG_U32(ctx, 0), c->mutex_id, m, ctx);
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
     struct sys_cond_waiter waiter = {NULL, 0};
@@ -156,6 +234,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_unlock(m);
 
     int32_t result = CELL_OK;
+    ppu_thread_wait_begin(ctx, "cond_wait", LV2_ARG_U32(ctx, 0), timeout);
 #ifdef _WIN32
     ULONGLONG start = GetTickCount64();
     uint64_t duration = (timeout + 999) / 1000;
@@ -191,6 +270,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #endif
+    ppu_thread_wait_end(ctx);
     struct sys_cond_waiter** link = &c->waiters;
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
@@ -198,6 +278,26 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    /* CWENTRY pairing: the exit side of the entry trace (same env, own cap).
+     * Order pairs the two lines on a single-threaded caller; ETIMEDOUT on a
+     * call whose entry line said "(forever)" is the stale-arg smoking gun. */
+    { static int s_on = -1;
+      if (s_on < 0) s_on = getenv("CWENTRY") ? 1 : 0;
+      if (s_on && ctx->thread_id == 1) {
+          static int _n = 0;
+          if (_n++ < 16)
+              fprintf(stderr, "[CWENTRY] tid=1 cond=%u ret=%lld\n",
+                      LV2_ARG_U32(ctx, 0), (long long)result);
+      } }
+    return result;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_cond_wait(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "cond_wait", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_cond_wait_impl(ctx);
+    ppu_wait_profile_end();
     return result;
 }
 

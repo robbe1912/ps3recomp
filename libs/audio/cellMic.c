@@ -118,3 +118,15 @@ s32 cellMicGetDeviceGUID(s32 devNum, u64* guid)
     vm_write64((u32)(uintptr_t)guid, 0);
     return CELL_OK;
 }
+
+/* cellMicSetNotifyEventQueue (NID 0x7903400E): the game hands an event
+ * queue key/epd for attach/detach notifications. No microphone exists to
+ * generate events, so record nothing and succeed like a device with no
+ * state changes would. */
+s32 cellMicSetNotifyEventQueue(u64 key)
+{
+    (void)key;
+    printf("[cellMic] SetNotifyEventQueue(key=0x%016llX)\n",
+           (unsigned long long)key);
+    return CELL_OK;
+}

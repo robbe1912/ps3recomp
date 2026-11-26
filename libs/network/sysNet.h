@@ -24,21 +24,17 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * PS3 network error codes
  * -----------------------------------------------------------------------*/
-/* sys_net_errno values: plain BSD numbers (35 = EWOULDBLOCK), left in the
- * cell _sys_net_errno_loc points at. A failing call also returns them in-band
- * as 0x80010200 | errno (0x80010223 for EWOULDBLOCK), which titles compare
- * against directly. */
+/* sys_net_errno values. libnet is a BSD stack: a failing call returns -1 and
+ * leaves a plain BSD errno in the cell _sys_net_errno_loc points at -- not a
+ * 0x8041xxxx CELL code. LBP's recvfrom drain loop waits for exactly 35. */
 #define SYS_NET_EBADF               9
 #define SYS_NET_ENOMEM              12
-#define SYS_NET_EFAULT              14
 #define SYS_NET_EINVAL              22
-#define SYS_NET_EPIPE               32
 #define SYS_NET_EWOULDBLOCK         35
 #define SYS_NET_EINPROGRESS         36
 #define SYS_NET_EALREADY            37
 #define SYS_NET_ENOTSOCK            38
 #define SYS_NET_EMSGSIZE            40
-#define SYS_NET_EAFNOSUPPORT        47
 #define SYS_NET_EADDRINUSE          48
 #define SYS_NET_EADDRNOTAVAIL       49
 #define SYS_NET_ENETUNREACH         51
@@ -171,9 +167,6 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
 /* Address helpers and DNS. inet_addr returns the address the way the guest
  * reads it from a register (a.b.c.d -> 0xAABBCCDD); the pointer-returning
  * calls return guest addresses of module-owned scratch. */
-/* IPv4 presentation -> four network-order bytes: 1 valid, 0 invalid text,
- * -1 with guest errno on an unsupported family or null pointer. */
-int32_t  sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst);
 int32_t  sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
 uint32_t sys_net_bnet_inet_addr(const char* cp);
 uint32_t sys_net_bnet_inet_ntoa(uint32_t addr);

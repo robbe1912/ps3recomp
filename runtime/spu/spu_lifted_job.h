@@ -104,7 +104,6 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     /* `ctx` is about to go out of scope: take it out of the reserving set
      * first, or the coherency walk dereferences this stack frame after it is
      * gone. See spu_coh_unregister. */
-    spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
     return (int32_t)ctx.stop_code;
 }
@@ -139,10 +138,17 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
  *                 `rdch SPU_RdInMbox` returns it.
  *   park_on_empty park (halt) instead of spinning when the inbox is empty, so
  *                 the run ENDS at the idle point and the host thread is free.
- *   spu_id        without it, a WrOutMbox the worker issues cannot be matched
- *                 back to an lv2 SPU thread, so the completion event is dropped
- *                 and the PPU waits in sys_event_queue_receive forever. The
- *                 interpreter path already sets this; the lifted path did not.
+ *   spu_id        PHANTOM IDS: fingerprint-dispatched SPURS tasks (the taskset
+ *                 task-arg lane in spu_workload.c) get theirs from
+ *                 spu_thread_register_phantom() in lv2_register.c -- the SAME
+ *                 sequential lv2 table space as real threads (base 0x2000,
+ *                 single allocator, collision-free by construction), published
+ *                 for the run's lifetime and unpublished on return; entries are
+ *                 never guest-visible and never recycled. Without any id, a
+ *                 WrOutMbox the worker issues cannot be matched back to an lv2
+ *                 SPU thread, so the completion event is dropped and the PPU
+ *                 waits in sys_event_queue_receive forever. The interpreter
+ *                 path already sets this; the lifted path did not.
  */
 typedef struct spu_run_opts {
     uint32_t inmbox_val;
@@ -335,7 +341,6 @@ static inline int32_t spu_run_lifted_job_abi_result(spu_lifted_entry_fn entry,
      * in the reserver set it is walked by the next PPU store to that line.
      * GH3's Havok task returning is what first hit it. */
     if (task_exit_out) *task_exit_out = ctx.task_exit_requested;
-    spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;

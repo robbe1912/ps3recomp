@@ -1,7 +1,7 @@
 /* ps3recomp: sample guest XY16F words stored through an RGBA8 render target.
  * The guest A,R,G,B bytes are host texel lanes W,X,Y,Z. Decode each half
  * before filtering; filtering packed bytes first changes the represented value.
- * This adapter serves two one-mip sampler policies selected from guest state.
+ * This adapter serves the backend's existing one-mip static sampler states.
  */
 #ifndef PS3RECOMP_RSX_TEXTURE_ALIAS_H
 #define PS3RECOMP_RSX_TEXTURE_ALIAS_H
@@ -13,25 +13,6 @@
 static int rsx_texture_alias_xy16(unsigned texture_format, int rgba8_surface)
 {
     return rgba8_surface && (texture_format & 0x9fu) == 0x9fu;
-}
-
-/* The existing adapter implements these two one-mip policies. Choose from
- * recorded state, never from the texture-unit number. Unsupported combinations
- * remain explicit errors pending the complete sampler implementation. */
-static int rsx_texture_alias_guest_policy(unsigned mask, const unsigned address[16],
-    const unsigned filter[16], unsigned* point_clamp_mask)
-{
-    if (!address || !filter || !point_clamp_mask) return 0;
-    unsigned points = 0;
-    for (unsigned u = 0; u < 16; ++u) {
-        if (!(mask & (1u << u))) continue;
-        unsigned uv = address[u] & 0x0f0fu;
-        unsigned min = (filter[u] >> 16) & 15u, mag = (filter[u] >> 24) & 15u;
-        if (uv == 0x0303u && min == 1 && mag == 1) points |= 1u << u;
-        else if (uv != 0x0101u || min != 2 || mag != 2) return 0;
-    }
-    *point_clamp_mask = points;
-    return 1;
 }
 
 static unsigned long long rsx_texture_alias_key(unsigned mask,
@@ -72,7 +53,7 @@ static int rsx_texture_alias_apply(char* hlsl, size_t capacity, unsigned mask,
     const unsigned remap[16], unsigned cube_mask, unsigned point_clamp_mask)
 {
     if (!mask) return 0;
-    if (!hlsl || !remap || (mask & cube_mask)) return -1;
+    if (!hlsl || !remap || (mask & (cube_mask | (cube_mask >> 16)))) return -1;   /* cube or 3D unit */
     char* helpers = (char*)calloc(1, 65536);
     if (!helpers) return -1;
     size_t used = 0;
@@ -93,9 +74,11 @@ static int rsx_texture_alias_apply(char* hlsl, size_t capacity, unsigned mask,
         if (strstr(hlsl, "rsx_tex[16]")) snprintf(tex, sizeof tex, "rsx_tex[%u]", u);
         else snprintf(tex, sizeof tex, "rsx_tex%u", u);
         const char* methods[] = {"Sample", "SampleLevel", "SampleBias"};
-        for (unsigned m = 0; m < 3; ++m) {
-            snprintf(before, sizeof before, "%s.%s(rsx_samp[%u],", tex, methods[m], u);
-            snprintf(after, sizeof after, "rsx_alias_%u%s(", u, m ? "_lod" : "");
+        for (unsigned m = 0; m < 6; ++m) {
+            /* m >= 3: individual sampler names (programs with native depth units). */
+            snprintf(before, sizeof before, m < 3 ? "%s.%s(rsx_samp[%u]," : "%s.%s(rsx_samp%u,",
+                     tex, methods[m % 3], u);
+            snprintf(after, sizeof after, "rsx_alias_%u%s(", u, m % 3 ? "_lod" : "");
             int n = rsx_alias_replace(hlsl, capacity, before, after);
             if (n < 0) { free(helpers); return -1; }
             count += n;

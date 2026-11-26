@@ -3,12 +3,17 @@
  */
 
 #include "sys_event.h"
+#include "ppu_wait_profile.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
+#include "ps3emu/loadtime_trace.h"   /* #11 load-stage timing (observer) */
 #include <stdlib.h>               /* getenv */
+/* RD_PROBE_THREADSTATES: blocked-on tagging (sys_ppu_thread.c) */
+extern void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+extern void ppu_thread_wait_end(ppu_context* ctx);
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -286,7 +291,7 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
-int64_t sys_event_queue_receive(ppu_context* ctx)
+static int64_t sys_event_queue_receive_untraced(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -370,12 +375,13 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         if (!s_fired) {
             s_fired = 1;
             extern uint8_t* vm_base;
-            extern int spu_workload_dispatch_async(const uint8_t*, uint32_t, uint32_t);
+            extern int spu_workload_dispatch_async(const uint8_t*, uint32_t, uint32_t,
+                                                   const uint32_t*);
             const uint8_t* elf = vm_base + 0x004F5F80u;
             size_t sz = spu_elf_image_size(elf, 2u * 1024 * 1024);
             fprintf(stderr, "[ydkj] block on q=%u -> dispatch real SPU task runtime "
                     "(img@0x4F5F80 sz=%zu ctx=0x%08X)\n", queue_id, sz, g_ydkj_spurs_ctx_ea);
-            if (sz) spu_workload_dispatch_async(elf, (uint32_t)sz, g_ydkj_spurs_ctx_ea);
+            if (sz) spu_workload_dispatch_async(elf, (uint32_t)sz, g_ydkj_spurs_ctx_ea, NULL);
         }
     }
 
@@ -468,6 +474,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         spu_dispatch_frame_by_queue(queue_id, 0);
     }
 
+    ppu_thread_wait_begin(ctx, "event_queue_receive", queue_id, timeout_us);
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
@@ -557,6 +564,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     pthread_mutex_unlock(&q->lock);
 #endif
+    ppu_thread_wait_end(ctx);
 
     /* lv2 sys_event_queue_receive returns the event in REGISTERS r4..r7
      * (r3=rc, r4=source, r5=data1, r6=data2, r7=data3) -- this is the ABI the
@@ -606,6 +614,32 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     return CELL_OK;
 }
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
+{
+    if (!loadtime_on()) return sys_event_queue_receive_untraced(ctx);
+    const unsigned long long start = loadtime_us();
+    const unsigned long long requested = LV2_ARG_U64(ctx, 2);
+    char detail[224];
+    snprintf(detail,sizeof detail,"start_us=%llu timeout=%llu guest_tid=%llu",start,requested,(unsigned long long)ctx->thread_id);
+    loadtime_event("wait_event_begin",detail);
+    const int64_t result = sys_event_queue_receive_untraced(ctx);
+    if (loadtime_on()) {
+        const unsigned long long end = loadtime_us();
+        snprintf(detail,sizeof detail,"start_us=%llu end_us=%llu dur_us=%llu result=%lld timeout=%llu guest_tid=%llu",start,end,end-start,(long long)result,requested,(unsigned long long)ctx->thread_id);
+        loadtime_event("wait_event_end",detail);
+    }
+    return result;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "event_queue_receive", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_event_queue_receive_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
+}
+
 
 int64_t sys_event_queue_tryreceive(ppu_context* ctx)
 {
@@ -694,6 +728,19 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    /* [MOD] Producer visibility: the first 8 pushes per queue name who wakes
+     * a receiver (port, timer thread, SPU bridge, inject) -- the question
+     * every "receive loop spins / blocks forever" diagnosis starts with.
+     * Static per-queue counters, no lock: a duplicated early line costs
+     * nothing and the payload is immutable. */
+    { static unsigned char n_push[SYS_EVENT_QUEUE_MAX + 1];
+      const unsigned pqi = (unsigned)(q - g_sys_event_queues) + 1u;
+      if (pqi <= SYS_EVENT_QUEUE_MAX && n_push[pqi] < 8) {
+          n_push[pqi]++;
+          fprintf(stderr, "[MOD][evt] push q=%u src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (n=%u)\n",
+                  pqi, (unsigned long long)evt->source, (unsigned long long)evt->data1,
+                  (unsigned long long)evt->data2, (unsigned long long)evt->data3, n_push[pqi]);
+      } }
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
      * how many events are sitting in it unread.
      *
@@ -1117,7 +1164,7 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * r6 = pointer to receive result pattern (u64*)
  * r7 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
-int64_t sys_event_flag_wait(ppu_context* ctx)
+static int64_t sys_event_flag_wait_impl(ppu_context* ctx)
 {
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
@@ -1206,11 +1253,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
       } }
 
+    ppu_thread_wait_begin(ctx, "event_flag_wait", flag_id, bitpat);
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->cancelled) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
     } else if (timeout_us < 1000) {
@@ -1220,7 +1268,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
          * dropped never misses a committed pattern change -- it just re-reads
          * the latest value on the next lock acquisition. */
         int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->cancelled) {
             if (lv2_deadline_passed(deadline)) {
                 /* Write current pattern even on timeout */
                 if (result_addr != 0) {
@@ -1236,7 +1284,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->cancelled) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     /* Write current pattern even on timeout */
@@ -1249,6 +1297,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                 }
             }
         }
+    }
+
+    if (f->cancelled) {
+        LeaveCriticalSection(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -1270,7 +1323,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     pthread_mutex_lock(&f->lock);
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->cancelled) {
             pthread_cond_wait(&f->cv, &f->lock);
         }
     } else {
@@ -1282,7 +1335,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active && !f->cancelled) {
             int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
             if (rc == ETIMEDOUT) {
                 if (result_addr != 0) {
@@ -1293,6 +1346,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
+    }
+
+    if (f->cancelled) {
+        pthread_mutex_unlock(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -1310,8 +1368,18 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 
     pthread_mutex_unlock(&f->lock);
 #endif
+    ppu_thread_wait_end(ctx);
 
     return CELL_OK;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_event_flag_wait(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "event_flag_wait", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_event_flag_wait_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
 }
 
 int64_t sys_event_flag_trywait(ppu_context* ctx)
@@ -1448,6 +1516,46 @@ int64_t sys_event_flag_clear(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * sys_event_flag_cancel
+ *
+ * r3 = flag_id
+ *
+ * PS3 semantics: wake every waiter; the waiters return CELL_ECANCELED.
+ * -----------------------------------------------------------------------*/
+int64_t sys_event_flag_cancel(ppu_context* ctx)
+{
+    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
+
+    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
+    if (!f->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[MOD][evt] flag_cancel(flag=%u) pattern=0x%llX\n",
+                flag_id, (unsigned long long)f->pattern); }
+
+#ifdef _WIN32
+    EnterCriticalSection(&f->lock);
+    f->cancelled = 1;
+    WakeAllConditionVariable(&f->cv);
+    LeaveCriticalSection(&f->lock);
+#else
+    pthread_mutex_lock(&f->lock);
+    f->cancelled = 1;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->lock);
+#endif
+
+    /* UNKNOWN: real lv2 returns the number of waiters canceled; we do not
+     * track per-flag waiter counts, so report 0. Evidence: no flag_cancel
+     * entries at all in m3_first_frames.log -- nothing calls it yet. */
+    return CELL_OK;
+}
+
 int64_t sys_event_flag_get(ppu_context* ctx)
 {
     uint32_t flag_id  = LV2_ARG_U32(ctx, 0);
@@ -1517,4 +1625,5 @@ void sys_event_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_SET,      sys_event_flag_set);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_CLEAR,    sys_event_flag_clear);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_GET,      sys_event_flag_get);
+    lv2_syscall_register(tbl, SYS_EVENT_FLAG_CANCEL, sys_event_flag_cancel);
 }

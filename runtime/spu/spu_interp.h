@@ -35,11 +35,27 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
 /* As spu_interp_run, but also hands back at stop_lsa (0 = no such point): the
  * return point of the drain the caller goes back to (spu_smc_microstep). */
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
-/* Optional exact guest-instruction ceiling; zero is unbounded. On exhaustion,
- * return the current PC with RUNNING status and this thread's executed count.
- * A replacement that cannot fit wholly in the remainder stays interpreted. */
+/* Additional exact guest-instruction ceiling, 0=off. The existing global
+ * attempted-step ceiling and interrupt policy still apply unchanged. */
 uint32_t spu_interp_run_until_budget(spu_context* ctx, uint32_t start_lsa,
                                     uint32_t stop_lsa, uint64_t budget);
+/* Host-armed step ceiling for differential harnesses: when nonzero,
+ * spu_interp_run/until returns at the ceiling with g_spu_interp_budget_hit
+ * set (host treats that as a timeout). Default 0 = off, no change. */
+extern uint64_t g_spu_interp_budget;
+extern int g_spu_interp_budget_hit;
+
+/* Recoverable bail for a policy-mode lane stranded mid-excision (zero-word
+ * stop in virgin LS, runtime-generated stub target): restore the TAKE-time
+ * register file and resume at srr0 instead of halting. service!=0 finishes
+ * the stall-and-notify service host-side first. Returns 0 when no recoverable
+ * target exists (caller keeps the old halt semantics). spu_channels.c. */
+int spu_pm_recoverable_bail(spu_context* ctx, uint32_t site, int service);
+
+/* Preserve an outer profiler sample across a nested execution driver.
+ * The driver captures a mark before setjmp and unwinds to it after longjmp. */
+uint32_t spu_interp_stats_mark(void);
+void spu_interp_stats_unwind(uint32_t mark);
 
 /* Reports belong to the host thread that ran the interpreter. In particular,
  * publishing each instruction's PC must not contend with other SPU workers.

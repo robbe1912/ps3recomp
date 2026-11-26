@@ -1,5 +1,6 @@
 /* thread_name.h -- name host threads for CPU-time attribution.
  *
+ * The menu build runs ~20 host threads and burns 4+ cores of guest compute.
  * Per-thread CPU samples attribute fine, but only to anonymous tids -- which
  * subsystem owns which core stays a guess until each thread says its role.
  * SetThreadDescription (Win10+) lands the name in ETW, Process Explorer,

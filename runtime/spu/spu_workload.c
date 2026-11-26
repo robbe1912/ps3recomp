@@ -8,6 +8,7 @@
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
+#include "ps3emu/loadtime_trace.h"   /* #11 load-stage timing (observer) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,21 +55,25 @@ typedef struct {
     uint64_t            fp;
     spu_lifted_entry_fn fn;
     int                 image_id;
+    uint32_t            lift_base;   /* LS base the image was linked at (0 =
+                                      * module-relative lift) */
     const char*         name;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
 
-void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                               int image_id, const char* name)
+void spu_workload_register_img_at(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                  int image_id, uint32_t lift_base,
+                                  const char* name)
 {
     if (!fn) return;
     for (unsigned i = 0; i < s_registry_count; i++) {
         if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
-            s_registry[i].fn       = fn;
-            s_registry[i].image_id = image_id;
-            s_registry[i].name     = name;
+            s_registry[i].fn        = fn;
+            s_registry[i].image_id  = image_id;
+            s_registry[i].lift_base = lift_base;
+            s_registry[i].name      = name;
             return;
         }
     }
@@ -77,11 +82,26 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                 SPU_WORKLOAD_MAX, name ? name : "?");
         return;
     }
-    s_registry[s_registry_count].fp       = fingerprint;
-    s_registry[s_registry_count].fn       = fn;
-    s_registry[s_registry_count].image_id = image_id;
-    s_registry[s_registry_count].name     = name;
+    s_registry[s_registry_count].fp        = fingerprint;
+    s_registry[s_registry_count].fn        = fn;
+    s_registry[s_registry_count].image_id  = image_id;
+    s_registry[s_registry_count].lift_base = lift_base;
+    s_registry[s_registry_count].name      = name;
     s_registry_count++;
+}
+
+uint32_t spu_workload_img_base(uint64_t fingerprint)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint)
+            return s_registry[i].lift_base;
+    return 0;
+}
+
+void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                               int image_id, const char* name)
+{
+    spu_workload_register_img_at(fingerprint, fn, image_id, 0, name);
 }
 
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
@@ -110,6 +130,100 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
 }
 
 unsigned spu_workload_count(void) { return s_registry_count; }
+
+/* ---- staged-codec content probes --------------------------------------- */
+
+#ifndef SPU_STAGE_PROBE_MAX
+#define SPU_STAGE_PROBE_MAX 16
+#endif
+
+typedef struct {
+    uint64_t    fp;         /* FNV-1a-64 over the primary PT_LOAD file bytes */
+    int         image_id;   /* lifted image whose function table resolves it */
+    uint32_t    lift_base;  /* base the lift was linked at (module-relative: 0) */
+    uint32_t    entry;      /* module offset of the entry (branch = base+entry) */
+    uint32_t    seg_vaddr;  /* module offset the hashed segment loads at */
+    uint32_t    seg_size;   /* hashed segment size (p_filesz) */
+    const char* name;
+    /* Self-modifying staged codecs (MS1 flashATRAC writes a pointer table
+     * into its own text during the first entry run) invalidate their own
+     * fingerprint. Once this probe has HIT at its lift base, later branches
+     * with the same implied base dispatch without re-hashing. A re-staged
+     * image rewrites pristine bytes, so a fresh hash still matches. */
+    uint8_t     hit_once;
+} spu_stage_probe;
+
+static spu_stage_probe s_probes[SPU_STAGE_PROBE_MAX];
+static unsigned        s_probe_count = 0;
+
+void spu_workload_register_stage_probe(uint64_t fingerprint, int image_id,
+                                       uint32_t lift_base, uint32_t entry,
+                                       uint32_t seg_vaddr, uint32_t seg_size,
+                                       const char* name)
+{
+    if (!fingerprint || !seg_size) return;
+    /* Idempotent on (fp, lift_base): the SAME codec registers ONE probe per
+     * staging base (module-relative lift_base 0 + one per link-base lift);
+     * deduping on fp alone would collapse them into the last registrant. */
+    for (unsigned i = 0; i < s_probe_count; i++) {
+        if (s_probes[i].fp == fingerprint && s_probes[i].lift_base == lift_base) {
+            s_probes[i].image_id  = image_id;
+            s_probes[i].entry     = entry;
+            s_probes[i].seg_vaddr = seg_vaddr;
+            s_probes[i].seg_size  = seg_size;
+            s_probes[i].name      = name;
+            return;
+        }
+    }
+    if (s_probe_count >= SPU_STAGE_PROBE_MAX) {
+        fprintf(stderr, "[spu_workload] stage-probe table full (%u); dropping '%s'\n",
+                SPU_STAGE_PROBE_MAX, name ? name : "?");
+        return;
+    }
+    s_probes[s_probe_count].fp        = fingerprint;
+    s_probes[s_probe_count].image_id  = image_id;
+    s_probes[s_probe_count].lift_base = lift_base;
+    s_probes[s_probe_count].entry     = entry;
+    s_probes[s_probe_count].seg_vaddr = seg_vaddr;
+    s_probes[s_probe_count].seg_size  = seg_size;
+    s_probes[s_probe_count].name      = name;
+    s_probes[s_probe_count].hit_once  = 0;
+    s_probe_count++;
+}
+
+int spu_workload_stage_probe(const uint8_t* ls, uint32_t pc,
+                             uint32_t* base_out, int* image_id_out,
+                             uint32_t* lift_base_out, uint32_t* span_out)
+{
+    if (!ls) return 0;
+    /* Two passes: a link-base lift (lift_base != 0) compiled AT the implied
+     * staging base dispatches with rel = 0; prefer it over any earlier
+     * content-matching probe (per-base codec lifts share one fingerprint, and
+     * the module-relative fallback probe is registered first). Pass 2 keeps
+     * the original first-match behavior for probes whose lift is not linked
+     * at the staged base (module-relative: lift_base 0 -> interpreter). */
+    for (int pass = 0; pass < 2; pass++) {
+    for (unsigned i = 0; i < s_probe_count; i++) {
+        const spu_stage_probe* p = &s_probes[i];
+        if (pc < p->entry) continue;
+        uint32_t base = pc - p->entry;             /* implied module base */
+        if ((uint64_t)base + p->seg_vaddr + p->seg_size > SPU_LS_SIZE)
+            continue;                              /* window off the end */
+        if (pass == 0 && base != p->lift_base) continue;
+        int hit = p->hit_once && pass == 0 && base == p->lift_base;
+        if (hit || spu_workload_fingerprint(ls + base + p->seg_vaddr,
+                                     p->seg_size) == p->fp) {
+            ((spu_stage_probe*)p)->hit_once = 1;
+            if (base_out)      *base_out      = base;
+            if (image_id_out)  *image_id_out  = p->image_id;
+            if (lift_base_out) *lift_base_out = p->lift_base;
+            if (span_out)      *span_out      = p->seg_vaddr + p->seg_size;
+            return 1;
+        }
+    }
+    }
+    return 0;
+}
 
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
 
@@ -231,11 +345,17 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
         return 0;
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
-        (unsigned long long)fp, entry, args_ea, image_id);
+    if (spu_lane_trace())
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
+            (unsigned long long)fp, entry, args_ea, image_id);
 
-    spu_run_lifted_job_img(fn, ls, args_ea, image_id);
+    { unsigned long long d0 = loadtime_on() ? loadtime_us() : 0;
+      spu_run_lifted_job_img(fn, ls, args_ea, image_id);
+      if (loadtime_on()) { char d[128];
+          snprintf(d, sizeof d, "fp=%016llX image=%d dur_us=%llu",
+                   (unsigned long long)fp, image_id, loadtime_us() - d0);
+          loadtime_event("spu_dispatch", d); } }
 
     free(ls);
     return 1;
@@ -256,9 +376,10 @@ typedef struct {
     int                 image_id;
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
-    uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+    uint32_t            taskset_ea;   /* immutable task owner for this dispatch */
     uint32_t            taskid;
     spu_task_owner      owner;
+    uint32_t            phantom_tid; /* lv2-table identity for the task-arg lane (0 = none) */
 } spu_async_job;
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -359,9 +480,24 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
     return slot;
 }
 
-/* Complete the captured execution token. EXIT retires the incarnation;
- * ordinary return keeps guest readiness and enabled state for redispatch.
- * Publication, scheduling and retirement share the lifecycle lock. */
+/* Minimal taskset scheduling for tasks the PPU never created.
+ *
+ * SPU code can create tasks itself, or mark existing ones ready, and rely on
+ * the taskset policy module to schedule them. Tasks created from the PPU are
+ * dispatched by our cellSpursCreateTask, but nothing looked at the taskset
+ * afterwards, so SPU-scheduled work never ran. Guitar Hero III's Havok task
+ * hands the rest of each physics step to other tasks and EXITs, and the step
+ * then waits forever.
+ *
+ * Runs when a task of the taskset returns (our runner returns on the EXIT
+ * syscall; waiting tasks park instead). The returning task's ready, pending
+ * and enabled bits are cleared, as the real policy does on exit, and every
+ * other enabled task that is pending or ready and not already running here is
+ * started from its ELF.
+ *
+ * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
+ * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
+ * the ELF EA at +0x14 and the context save EA at +0x1C. */
 static uint8_t* ts_running(uint32_t ea) { return spu_task_running_locked(ea); }
 static void ts_lock(void) { spu_task_lifecycle_lock(); }
 static void ts_unlock(void) { spu_task_lifecycle_unlock(); }
@@ -409,25 +545,248 @@ static void spu_taskset_task_exited(const spu_task_owner* owner,
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
-        /* TaskInfo stores ELF metadata in the low three bits. Keep those
-         * guest bytes intact and use only the address for loading. */
-        elf &= ~7u;
+        /* TI_ARGS (+0x00): the game's own 128-bit CellSpursTaskArgument. When
+         * CreateTask passed no context save area (ctx==0 -- MotorStorm's race
+         * load does this: 'CreateTask(... arg=4BED0180 ... ctx=0x00000000)'),
+         * the kernel-side ABI still hands the task its argument; precedent
+         * [rwh] img=1 showed r3 == argument word0. Dispatching with args_ea=0
+         * there ran a no-op job 28k times. Derive r3 from the argument. */
+        uint32_t argw[4];
+        int use_arg = spu_taskset_arg_fallback(ti, argw);
+        const uint32_t* task_arg = use_arg ? argw : NULL;
         if (!elf) continue;
         size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
         if (!sz) continue;
+        ts[0x10 + t / 8] &= (uint8_t)~m;                 /* dispatch consumes ready */
         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
         spu_task_owner next_owner;
         if (!spu_task_claim_locked(taskset_ea, ts, t, &next_owner)) continue;
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
-        if (!spu_workload_dispatch_owned(vm_base + elf, (uint32_t)sz, ctx, NULL, &next_owner))
+        if (use_arg) { static int _fa = 0;
+            if (_fa++ < 16) fprintf(stderr, "[taskset] task %u: no context, r3 "
+                            "from CellSpursTaskArgument w0=0x%08X\n", t, argw[0]); }
+        if (!spu_workload_dispatch_owned(vm_base + elf, (uint32_t)sz, ctx, task_arg, &next_owner)) {
+            /* Dispatch refused (spawn failure / fingerprint MISS): undo the
+             * running mark and re-latch ready, else the bit wedges every
+             * later signal through signal_arm's "live" return. */
             spu_task_cancel_locked(&next_owner, ts);
+            fprintf(stderr, "[taskset] dispatch FAILED task=%u taskset=0x%08X "
+                    "-- unmarked running, re-armed ready\n", t, taskset_ea);
+        }
     }
     ts_unlock();
 }
 
+/* RPCS3 _cellSpursSendSignal pending_ready path: a signal for a task that is
+ * NOT running latches the signalled bit AND arms the task ready again so the
+ * PM re-dispatches it from entry (cellSpurs.cpp ~@4202). Our runtime only
+ * re-dispatched on task-exit events, so a signal arriving after the entry
+ * returned (no live thread, no exit event coming) was latched but never acted
+ * on -- the waiter parked forever. This is the PPU-side arm: set ready for an
+ * enabled, not-running task, then run the same dispatch scan the exit path
+ * uses (the scan re-checks enabled+not-running under ts_lock, so a task that
+ * is live or since-dispatched is skipped -- no duplicate dispatch). */
+/* Round-6 branch-truth logging: ONE line per distinct (taskset, task) every
+ * 64 signals, naming WHICH early-return branch signal_arm took plus the
+ * live bit state. The wedge signature (signals keep coming, nothing
+ * dispatches, zombie/dfailed/pm-slow all silent) is exactly one of these
+ * branches; naming it ends the guessing. */
+struct arm_diag_ent { uint32_t ea, id; unsigned n; };
+static struct arm_diag_ent s_ad[8];
+/* Parked-waiter liveness: wait_signal bumps `beat` every time it wakes and
+ * consumes a signal. A parked-skip whose beat never advances across 256+
+ * signals (>1 s at the fastest cadence; WakeAll makes a live waiter consume
+ * in milliseconds) means the registry entry leaked when its runner died and
+ * every later signal silently skipped the dispatch. */
+struct pd_ent { uint32_t ea, id; unsigned n, beat, beats0, heals; };
+static struct pd_ent s_pd[4];
+static void spu_taskset_park_beat(uint32_t ea, uint32_t id)
+{
+    for (int i = 0; i < 4; i++)
+        if (s_pd[i].ea == ea && s_pd[i].id == id) { s_pd[i].beat++; return; }
+}
+static void arm_diag(uint32_t ea, uint32_t id, const char* br, int locked)
+{
+    struct arm_diag_ent* e = NULL;
+    for (int i = 0; i < 8; i++) {
+        if (s_ad[i].ea == ea && s_ad[i].id == id) { e = &s_ad[i]; break; }
+        if (!e && !s_ad[i].ea && !s_ad[i].n) e = &s_ad[i];
+    }
+    if (!e) return;
+    if (!e->n || e->ea != ea) { e->ea = ea; e->id = id; e->n = 0; }
+    e->n++;
+    if ((e->n % 64) != 1) return;
+    extern uint8_t* vm_base;
+    extern int spu_taskset_parked_query(uint32_t, uint32_t);
+    extern uint32_t spu_taskset_parked_waitobj(uint32_t, uint32_t);
+    uint8_t* ts = vm_base ? vm_base + ea : NULL;
+    uint8_t m = (uint8_t)(0x80u >> (id & 7));
+    if (!locked) ts_lock();
+    uint8_t* run = ts_running(ea);
+    int live = run && (run[id/8] & m);
+    int have_table = run != NULL;
+    if (!locked) ts_unlock();
+    fprintf(stderr, "[taskset] arm task=%u ts=0x%08X #%u branch=%s en=%c "
+            "rdy=%c pen=%c run=%c tbl=%s park=%d wo=0x%X\n",
+            id, ea, e->n, br,
+            (ts && (ts[0x30 + id / 8] & m)) ? '1' : '0',
+            (ts && (ts[0x10 + id / 8] & m)) ? '1' : '0',
+            (ts && (ts[0x20 + id / 8] & m)) ? '1' : '0',
+            live ? '1' : '0',
+            have_table ? "ok" : "FULL/NULL",
+            spu_taskset_parked_query(ea, id),
+            spu_taskset_parked_waitobj(ea, id));
+    fflush(stderr);
+}
+void spu_taskset_signal_arm(uint32_t taskset_ea, uint32_t taskId)
+{
+    extern uint8_t* vm_base;
+    if (!taskset_ea || taskId >= 128) return;
+    uint8_t* ts = vm_base + taskset_ea;
+    ts_lock();
+    uint8_t* run = ts_running(taskset_ea);
+    uint8_t m = (uint8_t)(0x80u >> (taskId & 7));
+    int initially_live = run && (run[taskId/8] & m);
+    int initially_enabled = ts[0x30 + taskId/8] & m;
+    ts_unlock();
+    if (!initially_enabled) {           /* not enabled: nothing to arm */
+        static int _ne = 0;
+        if (_ne++ < 8) fprintf(stderr, "[taskset] signal task=%u taskset=0x%08X "
+                "NOT ENABLED -- dropped\n", taskId, taskset_ea);
+        arm_diag(taskset_ea, taskId, "not-enabled", 0);
+        return;
+    }
+    if (initially_live) {
+        /* Run bit set: normally the task is live and its own WAIT_SIGNAL
+         * consumes the signal. But a dispatch that failed to spawn (or a
+         * runner that died) leaves the bit set with NO consumer -- every
+         * later signal returned here silently and NOTHING ever dispatched
+         * again (the attract wedge: signal #5625, then zero dispatches).
+         * Zombie watchdog: after many consecutive signals with the bit set
+         * and the task not parked in WAIT_SIGNAL, heal (bounded, per task)
+         * by clearing the bit so the scan below re-arms and dispatches. */
+        extern int spu_taskset_parked_query(uint32_t, uint32_t);
+        if (!spu_taskset_parked_query(taskset_ea, taskId)) {
+            struct zw_ent { uint32_t ea, id; unsigned n, heals; };
+            static struct zw_ent s_zw[4];
+            struct zw_ent* zw = NULL;
+            for (int i = 0; i < 4; i++) {
+                if (s_zw[i].ea == taskset_ea && s_zw[i].id == taskId) { zw = &s_zw[i]; break; }
+                if (!zw && !s_zw[i].ea) zw = &s_zw[i];
+            }
+            if (zw) {
+                if (zw->ea != taskset_ea || zw->id != taskId)
+                    { zw->ea = taskset_ea; zw->id = taskId; zw->n = 0; zw->heals = 0; }
+                zw->n++;
+                if (zw->n == 1 && zw->heals < 3)
+                    { fprintf(stderr, "[taskset] signal task=%u taskset=0x%08X run-bit "
+                              "set, NOT parked (zombie suspect)\n", taskId, taskset_ea);
+                      fflush(stderr); }
+                /* ~2.7s of signals at the menu's ~94/s rate: a task computing
+                 * that long without parking is rare; a dead runner never
+                 * parks. Bounded at 3 heals per task so a live compute task
+                 * cannot be re-dispatched unboundedly. */
+                if (zw->n >= 256 && zw->heals < 3) {
+                    zw->heals++; zw->n = 0;
+                    fprintf(stderr, "[taskset] ZOMBIE run-bit task=%u taskset=0x%08X "
+                            "-- clearing, arming ready (heal %u)\n",
+                            taskId, taskset_ea, zw->heals); fflush(stderr);
+                    ts_lock();
+                    if (run[taskId / 8] & m) run[taskId / 8] &= (uint8_t)~m;
+                    ts[0x10 + taskId / 8] |= m;
+                    ts_unlock();
+                } else return;
+            } else return;
+        } else {
+            /* Parked: its WAIT_SIGNAL consumes the signal (WakeAll makes that
+             * immediate). Consume bumps the beat via spu_taskset_park_beat; a
+             * beat that never advances across 256 signals means the parked
+             * entry has no live consumer -- the runner died between
+             * parked_add and parked_del and every later signal was skipped
+             * here in silence. Heal: drop the stale entry, clear the run bit,
+             * arm ready, and fall through to the dispatch scan (re-dispatch
+             * from entry is safe for a parked task -- park state is
+             * re-enterable by design). Bounded at 3 heals per task. */
+            struct pd_ent* pd = NULL;
+            for (int i = 0; i < 4; i++) {
+                if (s_pd[i].ea == taskset_ea && s_pd[i].id == taskId) { pd = &s_pd[i]; break; }
+                if (!pd && !s_pd[i].ea) pd = &s_pd[i];
+            }
+            if (!pd) return;
+            if (pd->ea != taskset_ea || pd->id != taskId)
+                { pd->ea = taskset_ea; pd->id = taskId; pd->n = 0; pd->beat = 0; pd->beats0 = 0; pd->heals = 0; }
+            if (pd->beat != pd->beats0) { pd->beats0 = pd->beat; pd->n = 0; }
+            pd->n++;
+            arm_diag(taskset_ea, taskId, "parked-skip", 0);
+            if (!(pd->n >= 256 && pd->heals < 3)) return;
+            pd->heals++; pd->n = 0;
+            extern void spu_taskset_parked_del(uint32_t, uint32_t);
+            spu_taskset_parked_del(taskset_ea, taskId);
+            fprintf(stderr, "[taskset] PARKED-DEAD task=%u taskset=0x%08X "
+                    "-- 256+ signals, waiter never consumed; stale park "
+                    "dropped, clearing run-bit, arming ready (heal %u)\n",
+                    taskId, taskset_ea, pd->heals);
+            fflush(stderr);
+            ts_lock();
+            if (run[taskId / 8] & m) run[taskId / 8] &= (uint8_t)~m;
+            ts[0x10 + taskId / 8] |= m;
+            ts_unlock();
+            /* fall through: the scan below re-dispatches from entry */
+        }
+    }
+    ts_lock();
+    if (run && (run[taskId / 8] & m)) { ts_unlock(); return; }
+    ts[0x10 + taskId / 8] |= m;                 /* pending_ready -> ready */
+    { static int _n = 0; if (_n++ < 24)
+        fprintf(stderr, "[taskset] signal armed ready task=%u taskset=0x%08X\n",
+                taskId, taskset_ea); fflush(stderr); }
+    arm_diag(taskset_ea, taskId, "armed-ready", 1);
+    if (!run) arm_diag(taskset_ea, taskId, "run-NULL (run table full of busy)", 1);
+    for (uint32_t t = 0; t < 128 && run; t++) {
+        uint8_t m2 = (uint8_t)(0x80u >> (t & 7));
+        if (!(ts[0x30 + t / 8] & m2) || (run[t / 8] & m2)) continue;
+        if (!((ts[0x10 + t / 8] | ts[0x20 + t / 8]) & m2)) continue;
+        const uint8_t* ti = ts + 0x80 + 0x30 * t;
+        uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
+                       ((uint32_t)ti[0x16] << 8) | ti[0x17];
+        uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
+                       ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
+        uint32_t argw[4];
+        int use_arg = spu_taskset_arg_fallback(ti, argw);
+        const uint32_t* task_arg = use_arg ? argw : NULL;
+        if (!elf) { if (t == taskId) arm_diag(taskset_ea, taskId, "scan-skip elf=0 (TI.elf zeroed)", 1); continue; }
+        size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
+        if (!sz) { if (t == taskId) arm_diag(taskset_ea, taskId, "scan-skip sz=0 (bad ELF image)", 1); continue; }
+        ts[0x10 + t / 8] &= (uint8_t)~m2;
+        ts[0x20 + t / 8] &= (uint8_t)~m2;
+        spu_task_owner next_owner;
+        if (!spu_task_claim_locked(taskset_ea, ts, t, &next_owner)) continue;
+        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                        "(signal armed)\n", t, taskset_ea, elf);
+        if (use_arg) { static int _fb = 0;
+            if (_fb++ < 16) fprintf(stderr, "[taskset] task %u: no context, r3 "
+                            "from CellSpursTaskArgument w0=0x%08X\n", t, argw[0]); }
+        if (!spu_workload_dispatch_owned(vm_base + elf, (uint32_t)sz, ctx, task_arg, &next_owner)) {
+            /* Dispatch refused (spawn failure / fingerprint MISS): undo the
+             * running mark and re-latch ready, else the bit wedges every
+             * later signal through the "live" return above. */
+            spu_task_cancel_locked(&next_owner, ts);
+            fprintf(stderr, "[taskset] dispatch FAILED task=%u taskset=0x%08X "
+                    "-- unmarked running, re-armed ready\n", t, taskset_ea);
+        }
+    }
+    ts_unlock();
+}
+
+/* Round 22: per-image async-lane tallies (dispatch site below, RETURNED
+ * site in spu_async_run) -- shared file scope, declared before both. */
+static unsigned s_async_disp[64], s_async_ret[64];
+
 static void spu_async_run(spu_async_job* j)
 {
+    unsigned long long ar0 = loadtime_on() ? loadtime_us() : 0;
+
     if (j->taskset_ea) {
         extern uint8_t* vm_base;
         ts_lock(); int current = spu_task_start_locked(&j->owner, vm_base + j->taskset_ea); ts_unlock();
@@ -437,9 +796,20 @@ static void spu_async_run(spu_async_job* j)
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
     int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
-    if (spu_persist_ls_enabled() && j->taskset_ea) {
+    /* HW SPURS saves a task's LS into its contextSaveStorage at exit and
+     * RESTORES it on the next dispatch (that is what contextSaveStorage means;
+     * TI_CONTEXT carries the pointer). A fresh-ELF re-dispatch loses all task
+     * work state -- the mstream hub: dispatch #1 filled its work-state quad
+     * (LS 0x338A0) through the init chain, dispatch #2 ran from a blank image,
+     * the work-check gate (F5A8) never passed, and the task polled WAIT_SIGNAL
+     * deaf forever. So the taskset lane keeps LS across dispatches by default
+     * (equivalent to the kernel save/restore); LBP_NO_TASKSET_LS opts out. */
+    { static int s_pl = -1;
+      if (s_pl < 0) s_pl = getenv("LBP_NO_TASKSET_LS") ? 0 : 1;
+      if (s_pl && j->taskset_ea) {
         ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
         if (!ts_slot) { cancel_job(j); free(j); return; }
+      }
     }
     uint8_t* ls;
     if (ts_slot) {
@@ -450,8 +820,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        if (ls) spu_task_reset_ls(&ts_slot->generation, j->owner.generation,
-                                 ls, SPU_LS_SIZE, &ts_slot->loaded);
+        if (ls) spu_task_reset_ls(&ts_slot->generation, j->owner.generation, ls, SPU_LS_SIZE, &ts_slot->loaded);
         { static int _n = 0; if (_n++ < 24)
             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
                     j->taskset_ea, j->taskid, j->image_id,
@@ -467,10 +836,19 @@ static void spu_async_run(spu_async_job* j)
                    ? 1
                    : (did_load = 1, spu_elf_load_to_ls(j->image, j->image_size, ls, &entry));
         if (ts_slot && did_load && loaded) ts_slot->loaded = 1;
-        if (!loaded) cancel_job(j);
-        if (!loaded)
+        if (!loaded) {
             fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
-                    j->image_id), fflush(stderr);
+                    j->image_id); fflush(stderr);
+            /* Entry never ran -> no exit event will ever clear the run bit:
+             * clear it (and re-latch ready) or the taskset wedges silently. */
+            if (j->taskset_ea) {
+                extern uint8_t* vm_base;
+                cancel_job(j);
+                fprintf(stderr, "[taskset] task=%u taskset=0x%08X load failed "
+                        "-- unmarked running, re-armed ready\n",
+                        j->taskid, j->taskset_ea);
+            }
+        }
         if (loaded) {
             /* YDKJ_CRI_POLICY (cri build experiment): the cri SPU task
              * (image 22) calls the SPURS task-API via a jump table at LS 0x2700
@@ -633,9 +1011,12 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    if (spu_lane_trace()) {
+                        fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                                "taskset=0x%08X task=%u\n", j->image_id,
+                                j->taskset_ea, j->taskid);
+                        fflush(stderr);
+                    }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -721,9 +1102,27 @@ static void spu_async_run(spu_async_job* j)
                 #undef RDBE32
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+            /* Phantom identity (task-arg lane): publish the live ctx under an
+             * lv2-table id so (a) an OutMbox/OutIntrMbox the job issues routes
+             * through g_spu_out_mbox_hook -> spu_find_thread instead of being
+             * dropped, and (b) sys_spu_thread_write_spu_mb can poke this
+             * worker's InMbox where it stands. Identity only -- no mailbox
+             * reply is synthesized. Unpublish on return so a stale PPU poke
+             * cannot land on a dead host stack. */
+            spu_run_opts phantom_opts;
+            memset(&phantom_opts, 0, sizeof phantom_opts);
+            phantom_opts.spu_id = j->phantom_tid;
+            unsigned long long r0 = loadtime_on() ? loadtime_us() : 0;
             uint32_t explicit_exit = 0;
             int32_t rc = spu_run_lifted_job_abi_result(j->fn, ls, j->args_ea, j->image_id,
-                                                1, j->have_r3 ? j->r3 : 0, 0, &explicit_exit);
+                                                1, j->have_r3 ? j->r3 : 0,
+                                                j->phantom_tid ? &phantom_opts : 0, &explicit_exit);
+            if (loadtime_on()) { char d[160];
+                snprintf(d, sizeof d, "image=%d taskset=0x%08X task=%u rc=%d dur_us=%llu",
+                         j->image_id, j->taskset_ea, j->taskid, rc, loadtime_us() - r0);
+                loadtime_event("spu_task_run", d); }
+            if (j->phantom_tid) { extern void spu_thread_publish_ctx(uint32_t, void*);
+                spu_thread_publish_ctx(j->phantom_tid, NULL); }
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
              * the kernel re-enters it when work is signaled. Our HLE runs it once,
              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
@@ -774,8 +1173,26 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            if (spu_lane_trace())
+                fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                        "(entry returned)\n", j->image_id, rc);
+            { if (j->image_id > 0 && j->image_id < 64)
+                  s_async_ret[j->image_id]++; }
+            /* Exit-path discriminator: if the taskset still holds THIS task's
+             * latched CSTS_SIGNALLED bit (sig bitset at ts+0x40, MSB-first,
+             * 0x80u>>(t&7) -- same arithmetic as the restarter) when the entry
+             * returns, the guest fell out of its loop with an unconsumed
+             * signal: a shutdown-shaped WAIT_SIGNAL return is the suspect. */
+            if (j->taskset_ea && j->taskid < 128) {
+                extern uint8_t* vm_base;
+                if (vm_base) {
+                    const uint8_t* sig = vm_base + j->taskset_ea + 0x40u;
+                    if (sig[j->taskid / 8] & (uint8_t)(0x80u >> (j->taskid & 7)))
+                        fprintf(stderr, "[taskset] entry returned with signal bit "
+                                "latched task=%u taskset=0x%08X\n",
+                                j->taskid, j->taskset_ea);
+                }
+            }
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(&j->owner, j->image_id, ls, explicit_exit);
         }
@@ -791,10 +1208,18 @@ static void spu_async_run(spu_async_job* j)
         pthread_mutex_unlock(&ts_slot->lock);
 #endif
     }
+    if (loadtime_on()) { char d[160];
+        snprintf(d, sizeof d, "image=%d taskset=0x%08X task=%u dur_us=%llu",
+                 j->image_id, j->taskset_ea, j->taskid, loadtime_us() - ar0);
+        loadtime_event("spu_async", d); }
     free(j);
 }
 
 #ifdef _WIN32
+#if defined(__GNUC__) && !defined(_MSC_VER)
+/* llvm-mingw's winbase.h does not declare this Vista+ API; MSVC's does. */
+WINBASEAPI VOID WINAPI GetCurrentThreadStackLimits(PULONG_PTR, PULONG_PTR);
+#endif
 static DWORD WINAPI spu_async_thread(LPVOID p) {
     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
@@ -804,8 +1229,7 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
-      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
     return 0;
 }
 #else
@@ -930,6 +1354,28 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
         if (s_parked[i] == key) { s_parked[i] = 0; return; }
 }
 
+/* Is a task of `taskset_ea` currently parked in WAIT_SIGNAL? A run bit with
+ * no parked waiter and no exit event is either a task executing guest code
+ * or a zombie whose runner is gone; signal_arm's watchdog uses this to tell
+ * them apart. */
+int spu_taskset_parked_query(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == key) return 1;
+    return 0;
+}
+
+/* Round-6: the wait object a parked task named in WAIT_SIGNAL (0 = none).
+ * signal_arm's branch-truth log prints it so a stale park is identifiable. */
+uint32_t spu_taskset_parked_waitobj(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == key) return s_parked_obj[i];
+    return 0;
+}
+
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
  *
  * Writing the bits at Set time loses a race: the guest reads them from
@@ -1023,9 +1469,16 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (_n++ < 24)
-        fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
-                taskId, taskset_ea); fflush(stderr); }
+    /* Periodic after the burst: an early hard cap made a whole analysis wave
+     * read "signals stopped" off a censored log (F-av-01 in the knowledge
+     * base). 1875 signals ~ 10 s at the 187.5 Hz audio cadence. */
+    { static unsigned _n = 0; if (_n++ < 24 || (_n % 1875) == 0)
+        fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X) #%u\n",
+                taskId, taskset_ea, _n); fflush(stderr); }
+    /* HW pending_ready: if this task is enabled but NOT running (entry already
+     * returned -- no exit event will come), arm it ready and re-dispatch from
+     * entry. Signals to a live task are consumed by its WAIT_SIGNAL instead. */
+    spu_taskset_signal_arm(taskset_ea, taskId);
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
     { static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
       if (s_on) {
@@ -1050,38 +1503,40 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
       } }
 }
 
-/* A successful PUTLLC/PUTLLUC committed the 128-byte guest line `line`.
- *
- * A task signalling another task does it on the SPU, as libspurs does: a
- * GETLLAR/PUTLLC loop that sets the target's bit in the taskset's signalled
- * bitset. That updates the guest bit the waiter checks but never touches
- * s_sig_cv, so the parked task only saw it when its 1 s timed wait ran out.
- * Twisted Metal's post-FX pipeline chains its six tasks this way several
- * times a frame and took 4 s or more per frame. Wake the waiters whenever a
- * line holding a parked taskset's signalled bitset is committed; a commit
- * that did not signal them only costs a spurious wake, which the wait loop
- * re-checks. */
-void spu_taskset_line_committed(uint32_t line)
-{
-    for (int i = 0; i < SPU_PARKED_MAX; i++) {
-        const uint64_t k = s_parked[i];
-        if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
-#ifdef _WIN32
-        AcquireSRWLockExclusive(&s_sig_lock);
-        WakeAllConditionVariable(&s_sig_cv);
-        ReleaseSRWLockExclusive(&s_sig_lock);
-#else
-        pthread_mutex_lock(&s_sig_lock);
-        pthread_cond_broadcast(&s_sig_cv);
-        pthread_mutex_unlock(&s_sig_lock);
-#endif
-        return;
-    }
-}
-
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
  * until one is delivered. Returns 0 (the syscall's success rc). */
+/* Round-7 task-side read window. bg_259 proved the parked waiter WAKES and
+ * consumes (beat advances, pen=0), runs its quantum, finds its progress gate
+ * still unset in guest memory, and parks again -- the silent wedge loop. The
+ * resume path arms the round-5 guest-read ring (spu_channels.c) and this
+ * dumps it at WAIT_SIGNAL re-entry: the repeated EA=VALUE names the guest
+ * condition no producer ever clears. The ring is global, so a concurrent PM
+ * quantum can overwrite entries -- diagnostic bleed, accepted. */
+static volatile int s_task_ring_on;
+static volatile uint32_t s_task_ring_ts, s_task_ring_tid;
+int spu_taskset_ring_repark(uint32_t ts, uint32_t tid)
+{
+    extern void spu_gread_disarm(void);
+    extern void spu_gread_dump(const char*, uint32_t, uint32_t);
+    if (!s_task_ring_on) return 0;
+    s_task_ring_on = 0;
+    spu_gread_disarm();
+    if (ts != s_task_ring_ts || tid != s_task_ring_tid) return 0;
+    struct rp_ent { uint32_t ea, id; unsigned n; };
+    static struct rp_ent s_rp[4];
+    struct rp_ent* e = NULL;
+    for (int i = 0; i < 4; i++) {
+        if (s_rp[i].ea == ts && s_rp[i].id == tid) { e = &s_rp[i]; break; }
+        if (!e && !s_rp[i].ea) e = &s_rp[i];
+    }
+    if (!e || e->n >= 8) return 0;
+    if (!e->n) { e->ea = ts; e->id = tid; }
+    e->n++;
+    fprintf(stderr, "[taskset] re-park task=%u ts=0x%08X (#%u)\n", tid, ts, e->n);
+    spu_gread_dump("[taskset] re-park", tid, 0);
+    return 1;
+}
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
@@ -1091,10 +1546,20 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
-                _n, taskId, taskset_ea,
-                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
+      /* SPU_DEBUG_PRINTS=1 (default 0 / unset): this fires on every task
+       * wait-enter; the wait/error diagnostics below are unaffected. TLS:
+       * runs on the task's host thread. */
+      static _Thread_local int s_dbg = -1;
+      if (s_dbg < 0) { const char* e = getenv("SPU_DEBUG_PRINTS");
+                       s_dbg = e && atoi(e) != 0; }
+      if (s_dbg) {
+          static _Thread_local int _n = 0;
+          if (_n++ < 200 || (_n % 500) == 0)
+              fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u "
+                      "taskset=0x%08X ran=%llums\n", _n, taskId, taskset_ea,
+                      s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull);
+      }
+    }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
      * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
@@ -1166,6 +1631,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (!drained) { ts_lock(); spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId); ts_unlock(); }
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+    spu_taskset_park_beat(taskset_ea, taskId);   /* liveness beat for the parked-skip heal */
+    /* Round-7: resume -- the consumed signal returns this task into its SPU
+     * quantum. Open the guest-read window; the WAIT_SIGNAL intercept dumps it
+     * when the task comes back to park. */
+    { extern void spu_gread_arm(void);
+      spu_gread_arm();
+      s_task_ring_ts = taskset_ea; s_task_ring_tid = taskId; s_task_ring_on = 1; }
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
@@ -1187,6 +1659,20 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    { if (image_id > 0 && image_id < 64) {
+          /* bg_278 round 22: per-image dispatch/return tallies. img 210
+           * must dispatch through THIS lane (the resident-code DISPATCH
+           * probe sees it never); the image whose returns stop at the
+           * wedge boundary is the lost-completion victim. */
+          unsigned n = ++s_async_disp[image_id];
+          if (n <= 8 || (n % 128) == 0) {
+              fprintf(stderr, "[async-lane] dispatch img=%d #%u (ret/disp: ",
+                      image_id, n);
+              for (int k = 1; k < 64; k++)
+                  if (s_async_disp[k])
+                      fprintf(stderr, "%d:%u/%u ", k, s_async_ret[k], s_async_disp[k]);
+              fprintf(stderr, ")\n"); fflush(stderr);
+          } } }
     if (!fn) {
         /* SPU_DUMP_MISS also applies here. The sync path has written the
          * unrecognised image out for a while and the async path did not, so a
@@ -1221,13 +1707,20 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
     /* Ownership comes from this call, independently of other dispatchers. */
     j->taskset_ea = taskset_ea; j->taskid = taskid;
     j->owner = owner ? *owner : (spu_task_owner){0};
-    /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
-     * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
-     * async SPU thread reading it later would race the PPU stack. word1 is
-     * overridden to args_ea (eaContext) in spu_run_lifted_job_abi. */
+    /* Capture the SPURS task register image NOW (PPU thread, synchronous).
+     * Two sources, priority order:
+     *   1. task_arg = the game's own 128-bit CellSpursTaskArgument (TI_ARGS).
+     *      This is what the SPURS kernel loads into r3 on HW, for the FIRST
+     *      dispatch and every re-dispatch alike. Supplied by the taskset
+     *      scans (task exit / signal-armed re-dispatch).
+     *   2. the game's descriptor at eaContext+0x10 = {0x40-marker handle,
+     *      workload EAs} -- the form CreateTask's own dispatch path still
+     *      uses (task_arg==NULL there). The async SPU thread reading it
+     *      later would race the PPU stack. word1 of the override is only
+     *      substituted with args_ea when the game's word1 is zero. */
     j->have_r3 = 0;
     if (task_arg) {
-        memcpy(j->r3, task_arg, sizeof j->r3);
+        for (int k = 0; k < 4; k++) j->r3[k] = task_arg[k];
         j->have_r3 = 1;
     } else if (args_ea) {
         extern uint8_t* vm_base;
@@ -1237,10 +1730,17 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
                        ((uint32_t)c[k*4+2]<<8)|c[k*4+3];
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
+    /* Task-arg lane gets an lv2-table identity (see spu_async_run). Allocated
+     * on the PPU thread so the entry exists before the job's first mailbox
+     * word. Exhaustion returns 0 -> old identity-less behavior. */
+    j->phantom_tid = 0;
+    if (task_arg) { extern uint32_t spu_thread_register_phantom(void);
+        j->phantom_tid = spu_thread_register_phantom(); }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    if (spu_lane_trace())
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+            (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (_d++ < 1) {
             /* Dump a larger window of the task context buffer + scan for any word
@@ -1267,6 +1767,7 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
+#include "../platform/thread_name.h"   /* ps3_thread_setname: CPU-time attribution */
 #ifdef _WIN32
     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
      * chains are deep host call chains with fat lifted frames -- a 1MB stack
@@ -1275,6 +1776,7 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }
+    ps3_thread_setname((uintptr_t)th, "spu_async");
     CloseHandle(th);   /* detached */
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
@@ -1300,9 +1802,9 @@ int spu_workload_dispatch_owned(const uint8_t* image, uint32_t image_size,
 }
 
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea)
+                                uint32_t args_ea, const uint32_t* task_arg)
 {
-    return spu_workload_dispatch_task(image, image_size, args_ea, NULL, 0, 0);
+    return spu_workload_dispatch_task(image, image_size, args_ea, task_arg, 0, 0);
 }
 
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,

@@ -14,10 +14,12 @@
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "../video/rsx_capture_event.h"
 #include <string.h>
 #include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "ps3emu/loadtime_trace.h"   /* #11 load-stage timing (observer) */
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -127,9 +129,14 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
  * disable it entirely.
  *
- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
+ * Key map (documented contract for keyboard bring-up):
+ *   Arrows  = d-pad (and mirrored onto the left stick)
+ *   W/A/S/D = left stick  up/left/down/right   I/J/K/L = right stick
+ *   Space / Enter / Z = CROSS      X = CIRCLE   C = SQUARE   V = TRIANGLE
+ *   Q / E = L1 / R1    1 / 2 = L2 / R2          Tab = SELECT
+ *   Esc = START  (NOTE: the D3D12/null window procs also treat Esc as quit --
+ *   video-owned files; if the window dies on Esc, use Enter/Space where the
+ *   title accepts CROSS, or move the window's quit key) */
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
@@ -153,6 +160,7 @@ static void pad_poll_keyboard(void)
         hs->buttons = 0;
         hs->analog_lx = hs->analog_ly = 128;
         hs->analog_rx = hs->analog_ry = 128;
+        hs->trigger_l2 = hs->trigger_r2 = 0;
         hs->connected = 1;
         return;
     }
@@ -161,10 +169,11 @@ static void pad_poll_keyboard(void)
         { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
         { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
         { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+        { 'C',       CELL_PAD_CTRL_SQUARE },  { 'V',      CELL_PAD_CTRL_TRIANGLE },
+        { 'Q',       CELL_PAD_CTRL_L1 },      { 'E',      CELL_PAD_CTRL_R1 },
         { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
+        { VK_SPACE,  CELL_PAD_CTRL_CROSS },   { VK_RETURN, CELL_PAD_CTRL_CROSS },
+        { VK_ESCAPE, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
     };
 
     u16 btns = 0;
@@ -173,11 +182,31 @@ static void pad_poll_keyboard(void)
 
     hs->buttons   = btns;
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
+
+    /* Left stick: arrows mirror the d-pad; WASD drives the stick on its own so
+     * a title that never reads the digital bits (MotorStorm reads the stick)
+     * is steerable. WASD wins when both are held -- it is the finer control. */
+    u8 lx = 128, ly = 128;
+    if (btns & CELL_PAD_CTRL_LEFT)  lx = 0;
+    if (btns & CELL_PAD_CTRL_RIGHT) lx = 255;
+    if (btns & CELL_PAD_CTRL_UP)    ly = 0;
+    if (btns & CELL_PAD_CTRL_DOWN)  ly = 255;
+    if (GetAsyncKeyState('A') & 0x8000) lx = 0;
+    if (GetAsyncKeyState('D') & 0x8000) lx = 255;
+    if (GetAsyncKeyState('W') & 0x8000) ly = 0;
+    if (GetAsyncKeyState('S') & 0x8000) ly = 255;
+    hs->analog_lx = lx;
+    hs->analog_ly = ly;
+
+    /* Right stick: I=up, K=down, J=left, L=right (PS3 Y axis: 0 = up). */
+    u8 rx = 128, ry = 128;
+    if (GetAsyncKeyState('J') & 0x8000) rx = 0;
+    if (GetAsyncKeyState('L') & 0x8000) rx = 255;
+    if (GetAsyncKeyState('I') & 0x8000) ry = 0;
+    if (GetAsyncKeyState('K') & 0x8000) ry = 255;
+    hs->analog_rx = rx;
+    hs->analog_ry = ry;
+
     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
 
@@ -504,9 +533,6 @@ void cellPad_poll(void)
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
-    static unsigned held_mask = 0;
-    static int held_n = 0;
-    int pad_file_applied = 0;
     { static int _once = 0;
       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
     if (!s_pad_initialized)
@@ -674,6 +700,7 @@ skip_inject: ;
      *                            # long hold; the default is 40)
      */
     { static int s_pf = -1; static char pf_path[512];
+      static unsigned held_mask = 0; static int held_n = 0;
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
@@ -687,15 +714,38 @@ skip_inject: ;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
                       if (m) { held_mask = m; held_n = n > 0 ? n : 40;
-                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                               rsx_capture_pad_notify(m);
+                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout);
+                               if (loadtime_on()) { char d[64];
+                                   snprintf(d, sizeof d, "mask=0x%04X polls=%d", m, held_n);
+                                   loadtime_event("pad_press", d); } }
                   }
                   fclose(f);
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held_n > 0) { pad_file_applied = 1;
+          if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+      } }
+
+    /* WWS_KICK=<hex-addr> -- diagnostic wedge for MS1's dead SPU job engine.
+     * All five Wws_Job SPURS workloads share one policy-module image whose
+     * interpreter run halts on NULL MFC-list transfers, so nothing ever
+     * advances the per-channel sample counters in the workload data area and
+     * the game's audio path deadlocks in a "wait until ring level >= n" loop
+     * (EBOOT 0x00CF7358). The pad poll runs continuously, so piggyback: every
+     * 16th poll, pin the six u16 levels at addr+0x14.. to the cap at addr+0x12
+     * -- the game reads "audio is flowing", releases its waits, and boot
+     * progression can be observed even though SPU jobs produce nothing. */
+    { static int s_wk = -1; static unsigned wk_addr = 0; static unsigned wk_n = 0;
+      if (s_wk < 0) { const char* e = getenv("WWS_KICK");
+                      s_wk = (e && *e) ? 1 : 0;
+                      if (s_wk) wk_addr = (unsigned)strtoul(e, 0, 0); }
+      if (s_wk && wk_addr && port_no == 0 && (++wk_n & 15) == 0) {
+          volatile u16* tbl = GUEST_PTR(wk_addr, volatile u16*);
+          u16 cap = tbl[9];                        /* +0x12 */
+          if (cap) { for (int i = 0; i < 6; i++) tbl[10 + i] = cap; } /* +0x14.. */
       } }
 
     /* Analog sticks */
@@ -831,9 +881,6 @@ emit:
             else                        s_data_fresh[port_no] = 0;
         }
     }
-    /* A drain call does not deliver the synthetic button. Count only reports;
-     * keep injection before pressure synthesis so both representations agree. */
-    if (pad_file_applied && data->len > 0) --held_n;
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
@@ -1041,6 +1088,34 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
         s_port_setting[port_no] |= CELL_PAD_SETTING_PRESS_ON;
     else
         s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_PRESS_ON;
+    return CELL_OK;
+}
+
+/* cellPadInfoSensorMode (NID 0x78200559) / cellPadSetSensorMode (NID 0xBE5BE3BA)
+ *
+ * Six-axis sensor reporting: same shape as the press-mode pair above. The
+ * virtual controller already advertises CELL_PAD_CAPABILITY_SENSOR_MODE and
+ * cellPadGetData fills the accelerometer slots when the setting bit is on,
+ * so Info/Set must exist and agree instead of falling to unresolved-NID. */
+s32 cellPadInfoSensorMode(u32 port_no)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;                                  /* supported */
+}
+
+s32 cellPadSetSensorMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (mode)
+        s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
+    else
+        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_SENSOR_ON;
     return CELL_OK;
 }
 

@@ -43,6 +43,22 @@ static int rsx_texture_source_view_init(uint32_t w, uint32_t h,
     return 1;
 }
 
+/* Widen a view's per-face identity to `chain_bytes`, the uploaded mip chain
+ * starting at each face (RSX_TEX_MIPS). A cube's chain must fit inside its
+ * face stride; the whole span must stay inside `available`. */
+static int rsx_texture_source_view_extend(rsx_texture_source_view* view,
+        uint64_t chain_bytes, uint64_t available)
+{
+    if (!view || chain_bytes < view->face_bytes ||
+            (view->faces > 1 && chain_bytes > view->face_stride)) return 0;
+    uint64_t span = view->face_stride * (view->faces - 1) + chain_bytes;
+    if (span > available || span > SIZE_MAX) return 0;
+    view->face_bytes = chain_bytes;
+    view->span_bytes = span;
+    view->hashed_bytes = chain_bytes * view->faces;
+    return 1;
+}
+
 static uint64_t rsx_texture_source_fingerprint(const uint8_t* source,
         const rsx_texture_source_view* view)
 {

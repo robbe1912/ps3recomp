@@ -20,6 +20,7 @@
 
 typedef void (*spu_dispatch_fn)(spu_context*);
 spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
+void (*spu_lifted_lookup(const spu_context* ctx, uint32_t lsa))(spu_context*); /* spu_channels.c */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
 
 void spu_indirect_branch_mt(spu_context* ctx)
@@ -68,7 +69,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
          * code owns its LS range; base-image entries at the same address are
          * stale bytes and must lose. */
         spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        if (!fn) fn = (spu_dispatch_fn)spu_lifted_lookup(ctx, pc);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

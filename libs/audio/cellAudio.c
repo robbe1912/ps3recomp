@@ -52,6 +52,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <windows.h>
   #include <mmdeviceapi.h>
   #include <audioclient.h>
+  #include <audiopolicy.h>
   #include <process.h>
 
   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
@@ -311,24 +312,18 @@ static int audio_backend_init(void)
 
     s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
 
-    /* Host preference: mute only this process's session. Preserve guest PCM,
-     * mix/consumption, capture and device scheduling. Verify before Start. */
+    /* Host test preference only: keep guest PCM, recording and device timing
+     * intact, and mute only this process's Windows audio session. */
     const char* mute_pref = getenv("AUDIO_MUTE");
-    if (mute_pref && *mute_pref && strcmp(mute_pref,"0") != 0) {
+    if (mute_pref && *mute_pref && strcmp(mute_pref, "0") != 0) {
         ISimpleAudioVolume* volume = NULL;
-        BOOL muted = FALSE;
         hr = s_wasapi_client->lpVtbl->GetService(s_wasapi_client,
-            &ps3r_IID_ISimpleAudioVolume,(void**)&volume);
+            &ps3r_IID_ISimpleAudioVolume, (void**)&volume);
         if (SUCCEEDED(hr)) {
-            hr = volume->lpVtbl->SetMute(volume,TRUE,NULL);
-            if (SUCCEEDED(hr)) hr = volume->lpVtbl->GetMute(volume,&muted);
+            hr = volume->lpVtbl->SetMute(volume, TRUE, NULL);
             volume->lpVtbl->Release(volume);
         }
-        if (FAILED(hr) || !muted) {
-            fprintf(stderr,"[cellAudio] requested AUDIO_MUTE failed: 0x%08lX muted=%d\n",hr,(int)muted);
-            exit(EXIT_FAILURE);
-        }
-        printf("[cellAudio] AUDIO_MUTE session verified: muted=1\n");
+        printf("[cellAudio] AUDIO_MUTE session result: 0x%08lX\n", hr);
     }
 
     hr = s_wasapi_client->lpVtbl->GetService(
@@ -618,6 +613,23 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 
         /* Notify event queues */
         audio_notify_event_queues();
+
+        /* WWS_KICK=<hex-addr>: MS1 diagnostic wedge (see cellPad.c). The guest
+         * thread that polls the pad is the one deadlocked on the WWS ring
+         * level wait, so a pad-poll hook can never fire; this host thread is
+         * the one thing that keeps running. Each block (5.33 ms), pin the six
+         * u16 sample counters of the Wws_Job audio workload's data area to
+         * the cap so the guest's "wait until level >= n" loop releases. */
+        { static int s_wk = -1; static unsigned wk_addr = 0;
+          if (s_wk < 0) { const char* e = getenv("WWS_KICK");
+                          s_wk = (e && *e) ? 1 : 0;
+                          if (s_wk) wk_addr = (unsigned)strtoul(e, 0, 0); }
+          if (s_wk && wk_addr) {
+              volatile unsigned short* tbl =
+                  (volatile unsigned short*)(vm_base + wk_addr);
+              unsigned short cap = tbl[9];              /* +0x12 */
+              if (cap) { for (int i = 0; i < 6; i++) tbl[10 + i] = cap; } /* +0x14.. */
+          } }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -651,9 +663,11 @@ static int audio_start_mix_thread(void)
 {
     s_mix_thread_running = 1;
 
+#include "../../runtime/platform/thread_name.h"   /* ps3_thread_setname */
 #ifdef _WIN32
     s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
                                            NULL, 0, NULL);
+    ps3_thread_setname((uintptr_t)s_mix_thread, "audio_mix");
     if (!s_mix_thread) {
         s_mix_thread_running = 0;
         return -1;
@@ -1136,5 +1150,20 @@ s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
 {
     (void)iPersonalStream;
     printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
+    return CELL_OK;
+}
+
+/* cellAudioSetPortLevel (NID 0x56DFE179): per-port attenuation, 0.0-1.0.
+ * The PPC ABI delivers the float in a GPR, so take it raw and bit-cast --
+ * a C float parameter would read the host XMM register instead.
+ * No mixing path consumes it yet; accept and drop like the real stack
+ * would for a level equal to the port default. */
+s32 cellAudioSetPortLevel(u32 portNum, u32 levelBits)
+{
+    float level;
+    memcpy(&level, &levelBits, sizeof(level));
+    if (!s_audio_initialized || portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    printf("[cellAudio] SetPortLevel(port=%u, level=%.3f)\n", portNum, (double)level);
     return CELL_OK;
 }

@@ -328,8 +328,10 @@ static void raw_spu_start(raw_spu* s)
               l[pc],l[pc+1],l[pc+2],l[pc+3], nz); }
     fflush(stderr);
 
+#include "../platform/thread_name.h"   /* ps3_thread_setname: CPU-time attribution */
 #ifdef _WIN32
     s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
+    ps3_thread_setname((uintptr_t)s->thread, "spu_raw");
     if (!s->thread) InterlockedExchange(&s->started, 0);
 #endif
 }

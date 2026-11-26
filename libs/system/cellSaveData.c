@@ -2,11 +2,13 @@
  * ps3recomp - cellSaveData HLE implementation
  *
  * Game save data management with callback-driven flow.
- * Save data is stored under: {root}/gamedata/dev_hdd0/home/00000001/savedata/{dirName}/
+ * Save data is stored under <save_root()>/{dirName}/ -- resolved from the
+ * runtime VFS (see save_root() below); guest paths of the form
+ * /dev_hdd0/home/00000001/savedata/{dirName}/ land on the same directory
+ * through ppu_fs, so saves are round-trip visible to the title via cellFs.
  */
 
 #include "cellSaveData.h"
-#include "ps3_psf.h"
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
@@ -52,6 +54,45 @@
  * -----------------------------------------------------------------------*/
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+static int  s_save_root_resolved = 0;
+
+extern const char* ppu_vfs_root;   /* set by the boot harness before guest code runs */
+
+/* Where saves live on the HOST, resolved once on first use.
+ *
+ * ppu_fs.cpp serves guest /dev_hdd0/home/00000001/savedata/<dir> from
+ * <ppu_vfs_root>/home/00000001/savedata/<dir> (the /dev_hdd0 mount prefix is
+ * stripped -- the same rule cellGame.c's content_root() documents). Savedata
+ * used to be written into a CWD-relative ./gamedata/... tree instead, so a
+ * title that saved via cellSaveDataAutoSave and then cellFsStat'd its own save
+ * file read a different directory than the save went into and reported the
+ * save as missing. Mirrors content_root(): resolve, normalise separators,
+ * log once.
+ *
+ * Order: $PS3_SAVEDATA_ROOT pins it outright; $PS3_HDD0_ROOT (the same
+ * override ppu_fs honours for the /dev_hdd0 mount) -> <hdd0>/home/00000001/
+ * savedata; else the VFS root -> <root>/home/00000001/savedata; else the
+ * legacy CWD-relative fallback for hosts with no VFS configured at all. */
+static const char* save_root(void)
+{
+    if (!s_save_root_resolved) {
+        s_save_root_resolved = 1;
+        const char* pin = getenv("PS3_SAVEDATA_ROOT");
+        const char* hdd0 = getenv("PS3_HDD0_ROOT");
+        if (pin && *pin)
+            snprintf(s_save_root, sizeof s_save_root, "%s", pin);
+        else if (hdd0 && *hdd0)
+            snprintf(s_save_root, sizeof s_save_root, "%s/home/00000001/savedata", hdd0);
+        else if (ppu_vfs_root && *ppu_vfs_root && strcmp(ppu_vfs_root, ".") != 0)
+            /* NB: <root>/home/..., not <root>/dev_hdd0/home/... -- ppu_fs
+             * STRIPS the mount prefix when it resolves guest paths. */
+            snprintf(s_save_root, sizeof s_save_root, "%s/home/00000001/savedata", ppu_vfs_root);
+        for (char* q = s_save_root; *q; q++) if (*q == 0x5C) *q = 0x2F;
+        printf("[cellSaveData] save root (host /dev_hdd0/home/00000001/savedata): %s\n",
+               s_save_root);
+    }
+    return s_save_root;
+}
 
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
@@ -73,7 +114,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
-    snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+    snprintf(buf, buf_size, "%s/%s", save_root(), dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
         if (*p == '/') *p = '\\';
@@ -437,12 +478,12 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
-    ensure_dirs(s_save_root);
+    ensure_dirs(save_root());
 
 #ifdef _WIN32
     {
         char search[1024];
-        snprintf(search, sizeof(search), "%s\\*", s_save_root);
+        snprintf(search, sizeof(search), "%s\\*", save_root());
         for (char* p = search; *p; p++) {
             if (*p == '/') *p = '\\';
         }
@@ -471,7 +512,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
     }
 #else
     {
-        DIR* dp = opendir(s_save_root);
+        DIR* dp = opendir(save_root());
         if (!dp)
             return 0;
 
@@ -481,7 +522,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             /* Check it's a directory */
             char full[1024];
-            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);
+            snprintf(full, sizeof(full), "%s/%s", save_root(), de->d_name);
             if (!dir_exists(full))
                 continue;
             if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
@@ -498,6 +539,57 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 #endif
 
     return count;
+}
+
+/* Recursive host-side delete for one save directory (files + subdirs; nothing
+ * inside a save dir is a symlink, so no cycle guard is needed -- the only
+ * writers are this module and the title through cellFs, neither creates links).
+ * Returns 0 only if every entry and the directory itself went away.
+ * Shared by cellSaveDataDelete / cellSaveDataDelete2. */
+static int remove_tree(const char* path)
+{
+#ifdef _WIN32
+    char pattern[1100];
+    snprintf(pattern, sizeof pattern, "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return -1;
+    int rc = 0;
+    do {
+        if (fd.cFileName[0] == '.' &&
+            (!fd.cFileName[1] || (fd.cFileName[1] == '.' && !fd.cFileName[2])))
+            continue;                                   /* "." and ".." */
+        char child[1100];
+        snprintf(child, sizeof child, "%s\\%s", path, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (remove_tree(child) != 0) rc = -1;
+        } else if (!DeleteFileA(child)) {
+            rc = -1;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return (rc == 0 && RemoveDirectoryA(path)) ? 0 : -1;
+#else
+    DIR* dp = opendir(path);
+    if (!dp) return -1;
+    int rc = 0;
+    struct dirent* de;
+    while ((de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.' &&
+            (!de->d_name[1] || (de->d_name[1] == '.' && !de->d_name[2])))
+            continue;                                   /* "." and ".." */
+        char child[1100];
+        snprintf(child, sizeof child, "%s/%s", path, de->d_name);
+        if (dir_exists(child)) {
+            if (remove_tree(child) != 0) rc = -1;
+        } else if (unlink(child) != 0) {
+            rc = -1;
+        }
+    }
+    closedir(dp);
+    return (rc == 0 && rmdir(path) == 0) ? 0 : -1;
+#endif
 }
 
 /* System metadata belongs to the service, not the guest file list. */
@@ -736,8 +828,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 }
 
-/* Write PARAM.SFO as a real binary PSF (layout in ps3_psf.h). The old simplified text file was not a
- * PSF, so RPCS3 and a PS3 rejected the save. */
+/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
 static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
@@ -750,31 +841,20 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     }
 #endif
 
-    /* SAVEDATA_DIRECTORY is the last path component of the save directory */
-    const char* dir = save_path;
-    for (const char* q = save_path; *q; q++)
-        if ((*q == '/' || *q == '\\') && q[1]) dir = q + 1;
-
-    /* the guest strings are fixed-size arrays that may lack a terminator: copy with one */
-    char title[CELL_SAVEDATA_SYSP_TITLE_SIZE], sub[CELL_SAVEDATA_SYSP_SUBTITLE_SIZE];
-    char detail[CELL_SAVEDATA_SYSP_DETAIL_SIZE], lp[CELL_SAVEDATA_SYSP_LPARAM_SIZE];
-    snprintf(title, sizeof title, "%.*s", (int)sizeof title - 1, param->title);
-    snprintf(sub, sizeof sub, "%.*s", (int)sizeof sub - 1, param->subTitle);
-    snprintf(detail, sizeof detail, "%.*s", (int)sizeof detail - 1, param->detail);
-    snprintf(lp, sizeof lp, "%.*s", (int)sizeof lp - 1, param->listParam);
-
-    uint8_t buf[4096];
-    size_t n = ps3_psf_build(buf, sizeof buf, dir, title, sub, detail, param->attribute, lp);
-    if (!n) return;
-
     FILE* fp = fopen(sfo_path, "wb");
     if (!fp) return;
-    fwrite(buf, 1, n, fp);
+
+    /* Write a simplified text-based PARAM.SFO for easy debugging.
+       Games don't read this directly - our stat callback fills it from here. */
+    fprintf(fp, "TITLE=%s\n", param->title);
+    fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
+    fprintf(fp, "DETAIL=%s\n", param->detail);
+    fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
+    fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
     fclose(fp);
 }
 
-/* Read PARAM.SFO: a binary PSF, or the old simplified text file that earlier builds wrote (existing saves keep
- * loading; the next save rewrites them as PSF). */
+/* Read simplified PARAM.SFO */
 static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
@@ -791,25 +871,12 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     FILE* fp = fopen(sfo_path, "rb");
     if (!fp) return;
 
-    uint8_t buf[8192];
-    size_t got = fread(buf, 1, sizeof buf, fp);
-    fclose(fp);
-    if (got >= 4 && buf[0] == 0 && buf[1] == 'P' && buf[2] == 'S' && buf[3] == 'F') {
-        uint32_t attr = 0;
-        if (ps3_psf_parse(buf, got, param->title, sizeof param->title, param->subTitle, sizeof param->subTitle,
-                          param->detail, sizeof param->detail, &attr, param->listParam, sizeof param->listParam))
-            param->attribute = attr;
-        return;
-    }
-
-    /* old text format */
-    char text[sizeof buf + 1];
-    memcpy(text, buf, got); text[got] = 0;
-    for (char* line = text; *line; ) {
-        char* nl = line; while (*nl && *nl != '\n') nl++;
-        char saved = *nl; *nl = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Remove trailing newline */
         size_t len = strlen(line);
-        while (len > 0 && line[len-1] == '\r') line[--len] = '\0';
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
 
         if (strncmp(line, "TITLE=", 6) == 0)
             strncpy(param->title, line + 6, CELL_SAVEDATA_SYSP_TITLE_SIZE - 1);
@@ -821,9 +888,8 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
             param->attribute = (u32)atoi(line + 10);
         else if (strncmp(line, "LIST_PARAM=", 11) == 0)
             strncpy(param->listParam, line + 11, CELL_SAVEDATA_SYSP_LPARAM_SIZE - 1);
-        if (!saved) break;
-        line = nl + 1;
     }
+    fclose(fp);
 }
 
 /* Core save/load implementation shared by List/Fixed/Auto variants */
@@ -1155,7 +1221,7 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
         }
         printf("[cellSaveData] savedata_fixed: cbresult=%d listed=%u/%u prefix='%s' root='%s'\n",
                result, listed, count,
-               prefix ? (const char*)(vm_base + prefix) : "", s_save_root);
+               prefix ? (const char*)(vm_base + prefix) : "", save_root());
         SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, w);
     }
     if (!funcStat)
@@ -1284,13 +1350,13 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
 
-s32 cellSaveDataDelete2(u32 container)
+s32 cellSaveDataDelete2(u32 version, const char* dirName, u32 container)
 {
-    printf("[cellSaveData] Delete2(container=%u)\n", container);
-
-    /* Without a directory name we can't delete anything meaningful.
-       This variant typically shows a UI for deletion - just succeed. */
-    return CELL_OK;
+    /* Same operation as the old cellSaveDataDelete with the version arg the
+     * 3.00+ API carries (r3=version, r4=dirName, r5=container). The previous
+     * one-parameter declaration read r3 as `container` -- i.e. the version
+     * number -- and the directory name in r4 was never even looked at. */
+    return cellSaveDataDelete(version, dirName, container);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1413,11 +1479,33 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
 s32 cellSaveDataDelete(u32 version, const char* dirName,
                         u32 container)
 {
-    (void)version;
+    (void)version; (void)container;
     dirName = savedata_host_str(dirName);
     printf("[cellSaveData] Delete(dir='%s', container=%u)\n",
            dirName ? dirName : "<null>", container);
-    return CELL_OK;
+    if (!dirName || !dirName[0])
+        return CELL_SAVEDATA_ERROR_PARAM;
+
+    /* Same guard as the funcFixed dirName check: no separators, no "." / "..",
+     * nothing over the SDK dirname length. remove_tree() is a recursive
+     * delete -- handing it "root/.." would take out the whole save root (or
+     * worse), so reject anything that isn't a plain slot name. */
+    size_t dlen = strnlen(dirName, CELL_SAVEDATA_DIRNAME_SIZE);
+    if (!dlen || dlen == CELL_SAVEDATA_DIRNAME_SIZE || strchr(dirName, '/') ||
+        strchr(dirName, '\\') || strcmp(dirName, ".") == 0 || strcmp(dirName, "..") == 0)
+        return CELL_SAVEDATA_ERROR_PARAM;
+
+    char path[1024];
+    build_save_path(path, sizeof path, dirName);
+    if (!dir_exists(path)) {
+        /* Deleting an absent slot is success for the title's bookkeeping;
+         * log it so a phantom delete still shows in the boot log. */
+        printf("[cellSaveData] Delete: '%s' does not exist (nothing to do)\n", path);
+        return CELL_OK;
+    }
+    int rc = remove_tree(path);
+    printf("[cellSaveData] Delete: removed '%s' -> %s\n", path, rc == 0 ? "ok" : "FAILED");
+    return rc == 0 ? CELL_OK : CELL_SAVEDATA_ERROR_FAILURE;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1509,33 +1597,6 @@ static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
                               container, (void*)(uintptr_t)userdata);
 }
 
-/* UserAutoSave takes the same nine arguments as UserAutoLoad. Through the
- * generic eight-argument binding the ninth (userdata) is lost, so the title's
- * stat and file callbacks see cbResult->userdata == 0. */
-static void hle_cellSaveDataUserAutoSave(ppu_context* ctx)
-{
-    u32   version   = (u32)ctx->gpr[3];
-    u32   userId    = (u32)ctx->gpr[4];
-    const char* dir = (const char*)(uintptr_t)(u32)ctx->gpr[5];
-    u32   errDialog = (u32)ctx->gpr[6];
-    void* setBuf    = (void*)(uintptr_t)(u32)ctx->gpr[7];
-    void* funcStat  = (void*)(uintptr_t)(u32)ctx->gpr[8];
-    void* funcFile  = (void*)(uintptr_t)(u32)ctx->gpr[9];
-    u32   container = (u32)ctx->gpr[10];
-    uint32_t userdata = savedata_arg9(ctx);
-
-    printf("[cellSaveData] UserAutoSave(user=%u, userdata=0x%08X)\n", userId, userdata);
-    /* cellSaveDataAutoSave, not AutoSave2: AutoSave2 maps dirName to a host
-     * pointer and passes it on to AutoSave, which maps it again; a host
-     * address below 4 GiB would then be read as a guest one. */
-    ctx->gpr[3] = (uint64_t)(int64_t)(s32)
-        cellSaveDataAutoSave(version, dir, errDialog,
-                             (CellSaveDataSetBuf*)setBuf,
-                             (CellSaveDataStatCallback)funcStat,
-                             (CellSaveDataFileCallback)funcFile,
-                             container, (void*)(uintptr_t)userdata);
-}
-
 /* ListAutoLoad's ninth argument is in the guest parameter save area. */
 void ps3_savedata_list_auto_load(ppu_context* ctx)
 {
@@ -1555,8 +1616,6 @@ void cellSaveData_register_ctx_handlers(void)
      * before the generic table. */
     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
                          hle_cellSaveDataUserAutoLoad);
-    ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",
-                         hle_cellSaveDataUserAutoSave);
 }
 
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,

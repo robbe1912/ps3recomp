@@ -21,16 +21,6 @@ static SceNpBasicPresenceHandler s_presence_handler = NULL;
 static void* s_handler_arg = NULL;
 static SceNpBasicPresence s_own_presence;
 
-/* sceNpBasic is usable once sceNpInit has run: in the SDK a title calls
- * sceNpInit and then sceNpBasic*, and many never call sceNpBasicInit. Checking
- * only Basic's own flag answered NOT_INITIALIZED to every presence, message
- * and handler call of such a title. sceNpBasicInit still works for callers
- * that use it. sceNp.h and this file's header cannot share a translation
- * unit, so the accessor is declared here (defined in sceNp.c; the name
- * stays outside the cell/sys/sce prefixes gen_hle_nids.py exports). */
-int np_is_initialized(void);
-static int basic_ready(void) { return s_initialized || np_is_initialized(); }
-
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -89,7 +79,7 @@ s32 sceNpBasicRegisterHandler(SceNpBasicEventHandler handler,
 {
     printf("[sceNpBasic] RegisterHandler()\n");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     s_event_handler = handler;
@@ -102,7 +92,7 @@ s32 sceNpBasicUnregisterHandler(void)
 {
     printf("[sceNpBasic] UnregisterHandler()\n");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     s_event_handler = NULL;
@@ -111,11 +101,11 @@ s32 sceNpBasicUnregisterHandler(void)
     return CELL_OK;
 }
 
-/* The list counts answer without sceNpBasicInit: titles built on libsceNp2
- * never call it (NP init brings Basic up), and Simpsons Arcade asks whether a
- * joining player is on its block list -- an error there reads as "unknown". */
 s32 sceNpBasicGetFriendListEntryCount(u32* count)
 {
+    if (!s_initialized)
+        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
+
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
@@ -128,7 +118,7 @@ s32 sceNpBasicGetFriendListEntry(u32 index, SceNpBasicFriendListEntry* entry)
     (void)index;
     (void)entry;
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
@@ -140,7 +130,7 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
     (void)onlineId;
     (void)presence;
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
@@ -151,7 +141,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
     presence = GUEST_PTR(presence, const SceNpBasicPresence*);
     printf("[sceNpBasic] SetPresence()\n");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (!presence)
@@ -171,7 +161,7 @@ s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
     printf("[sceNpBasic] SendMessage(to=%.16s)\n",
            to ? to->data : "(null)");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -189,7 +179,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
            to ? to->data : "(null)",
            subject ? subject : "(null)");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -205,7 +195,7 @@ s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
     printf("[sceNpBasic] SendInGameInvitation(to=%.16s)\n",
            to ? to->data : "(null)");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
@@ -217,7 +207,7 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
     (void)data;
     (void)dataMaxSize;
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (dataSize)
@@ -228,6 +218,9 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
 
 s32 sceNpBasicGetBlockListEntryCount(u32* count)
 {
+    if (!s_initialized)
+        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
+
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
@@ -241,32 +234,9 @@ s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
     printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
            onlineId ? onlineId->data : "(null)");
 
-    if (!basic_ready())
+    if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     /* No-op in offline mode */
-    return CELL_OK;
-}
-
-/* Players met online, and the context-sensitive (XMB) handler: nothing is
- * recorded, the history is empty, the handler is accepted and never fires. */
-s32 sceNpBasicGetPlayersHistoryEntryCount(u32 options, u32* count)
-{
-    (void)options;
-    if (!count) return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
-    vm_write32((u32)(uintptr_t)count, 0);
-    return CELL_OK;
-}
-
-s32 sceNpBasicAddPlayersHistoryAsync(const void* npids, u32 count, const void* description, u32* reqId)
-{
-    (void)npids; (void)count; (void)description;
-    if (reqId) vm_write32((u32)(uintptr_t)reqId, 1);
-    return CELL_OK;
-}
-
-s32 sceNpBasicRegisterContextSensitiveHandler(const void* context, void* handler, void* arg)
-{
-    (void)context; (void)handler; (void)arg;
     return CELL_OK;
 }

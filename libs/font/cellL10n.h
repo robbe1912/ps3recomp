@@ -82,8 +82,9 @@ s32 UTF32toUTF16(const u32* utf32, u32 utf32_len,
 /* UCS-2 (BMP only) */
 s32 UTF8toUCS2(const u8* utf8, u32 utf8_len,
                u16* ucs2, u32* ucs2_len);
-s32 UCS2toUTF8(const u16* ucs2, u32 ucs2_len,
-               u8* utf8, u32* utf8_len);
+s32 UCS2toUTF8(u16 ucs2, u8* utf8);           /* single code unit -> UTF-8 */
+s32 UCS2stoUTF8s(const u16* src, u32* src_len,
+                 u8* dst, u32* dst_len);      /* counted UCS-2 batch -> UTF-8 */
 
 /* ---------------------------------------------------------------------------
  * String conversion (null-terminated)
@@ -92,6 +93,8 @@ s32 UTF8stoUTF16s(const u8* utf8, u32* utf8_len,
                   u16* utf16, u32* utf16_len);
 s32 UTF16stoUTF8s(const u16* utf16, u32* utf16_len,
                   u8* utf8, u32* utf8_len);
+s32 UTF8stoUCS2s(const u8* src, u32* src_len,
+                 u16* dst, u32* dst_len);     /* counted UTF-8 batch -> UCS-2 */
 
 /* ---------------------------------------------------------------------------
  * Utility

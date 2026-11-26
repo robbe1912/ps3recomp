@@ -117,16 +117,14 @@ typedef s32 CellFsDir;
  * Path configuration
  * -----------------------------------------------------------------------*/
 
-/* Set the base for relative host mappings (default: "."). Absolute mappings
- * are independent of this base. */
+/* Set the root directory for all path translations (default: ".") */
 void cellfs_set_root_path(const char* root);
 
-/* Add or override a PS3 prefix -> host path mapping. Explicit registrations
- * override defaults, including the default /dev_bdvd mapping from PS3_VFS_ROOT. */
+/* Add or override a PS3 prefix -> host path mapping */
 void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path);
 
 /* Translate a PS3 virtual path (e.g. "/dev_hdd0/game/...") to a host path.
- * Returns 0 on success, -1 if unmapped, invalid, or too long for the output. */
+ * Returns 0 on success, -1 if no mapping found. */
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size);
 
 /* ---------------------------------------------------------------------------

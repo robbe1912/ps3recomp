@@ -300,24 +300,44 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * sys_memory_container_get_size
  *
- * r3 = container_id
- * r4 = pointer to output struct: { u32 total, u32 used }
+ * REAL ABI (matches the game's register setup and rpcs3's
+ * sys_memory_container_get_size(vm::ptr<sys_memory_info_t> mem_info, u32 cid)):
+ *   r3 = pointer to output struct { u32 total_user_memory, u32 available_user_memory }
+ *   r4 = container_id
+ * The second word is AVAILABLE, not used -- MotorStorm: Pacific Rift's
+ * thread_auto_load_save reads info[1] and fatals ("Memory container failure")
+ * unless it exceeds 4 MB.
+ *
+ * MS1 never calls container_create through any lv2-visible path; it passes its
+ * own WWS pool handle (an mmapper address, e.g. 0x40300000) as the cid.
+ * Like rpcs3's lv2_memory_container::search(SYS_MEMORY_CONTAINER_ID_INVALID)
+ * falling back to the default container, an unknown non-zero cid resolves to
+ * the default (system-wide) view instead of ESRCH-ing the whole boot.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
-    uint32_t container_id = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
+    uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
 
-    if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
+    uint32_t total = 0x0EC00000u, used = 0;   /* default container: ~236 MB user memory */
+    if (container_id >= 1 && container_id <= SYS_MEMORY_CONTAINER_MAX &&
+        g_sys_mem_containers[container_id - 1].active) {
+        total = g_sys_mem_containers[container_id - 1].total_size;
+        used  = g_sys_mem_containers[container_id - 1].used_size;
+    } else if (container_id != 0 && container_id != 0xFFFFFFFFu) {
+        static int s_warned = 0;
+        if (!s_warned) {
+            s_warned = 1;
+            fprintf(stderr, "[sys_memory] container_get_size: unknown cid 0x%08X -> "
+                            "default container\n", container_id);
+        }
+    } else {
         return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
     if (out_addr != 0) {
-        write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
+        write_be32(out_addr + 0, total);
+        write_be32(out_addr + 4, total - used);
     }
 
     return CELL_OK;
@@ -364,6 +384,10 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
     }
+    /* Register for the LV1 SPU alias window (spu_ea_alias.c): SPURS reaches
+     * this memory from SPU side as base|0x05000000. */
+    { extern void sysmem_alias_record(uint32_t, uint32_t);
+      sysmem_alias_record(alloc_addr, size); }
 
     return CELL_OK;
 }
@@ -418,75 +442,6 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_memory (lv2 341)
- *
- * r3 = pointer to receive the allocated address (u32*)
- * r4 = size
- *
- * The ABI here was read off the caller rather than a header. GT5P's PDI device
- * worker calls this the moment it starts -- func_00941808 loads r3 with a
- * pointer and r4 with 0x300000, issues the syscall, retries on any non-zero
- * result, and on success immediately does `lwz r29, 0(r29)`, reading back
- * through the pointer it passed in r3.
- *
- * Answering CELL_OK without writing anything is the worst of both worlds: the
- * worker believes it has three megabytes, reads a null buffer back, and exits
- * on the spot -- which leaves the packed-filesystem device with no worker at
- * all and stalls asset loading. Answering an error is worse still, because the
- * caller retries forever.
- *
- * The flat VM has no distinction between reserving and mapping, so this hands
- * back committed guest memory directly and sys_mmapper_allocate_memory_from_
- * container below accepts it as already mapped.
- * -----------------------------------------------------------------------*/
-int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
-{
-    uint32_t addr_out = LV2_ARG_PTR(ctx, 0);
-    uint32_t size     = LV2_ARG_U32(ctx, 1);
-
-    if (size == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
-
-    size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
-
-    bump_lock();
-    if (g_sys_mem_bump_ptr == 0)
-        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, VM_PAGE_SIZE);
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-    uint32_t addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
-    bump_unlock();
-
-    vm_commit(addr, size);
-
-    if (addr_out != 0)
-        write_be32(addr_out, addr);
-
-    { static int n = 0; if (n++ < 4)
-        fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
-                size, addr); }
-
-    return CELL_OK;
-}
-
-/* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_memory_from_container (lv2 342)
- *
- * The same allocation charged to a container. GT5P calls it straight after 341
- * with the address 341 handed back, so with a flat VM there is nothing further
- * to do -- the memory is already committed and addressable.
- * -----------------------------------------------------------------------*/
-int64_t sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
-{
-    (void)ctx;
-    return CELL_OK;
-}
-
-/* ---------------------------------------------------------------------------
  * sys_mmapper_map_shared_memory
  *
  * r3 = address (where to map)
@@ -529,7 +484,6 @@ void sys_memory_init(lv2_syscall_table* tbl)
     s_total_allocated  = 0;
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
-    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_PAGE_ATTRIBUTE,   sys_memory_get_page_attribute);
@@ -540,6 +494,5 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
-    lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
-    lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
+    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
 }

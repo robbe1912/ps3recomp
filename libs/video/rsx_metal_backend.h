@@ -36,13 +36,6 @@ int  rsx_metal_backend_pump_messages(void);
  * RSX clear method, then hand it to the compositor. */
 void rsx_metal_backend_present(void);
 
-/* Optional diagnostics: PS3RECOMP_METAL_FPS=1 adds display FPS and frame times
- * to the native window title and stderr once per second. Call this exactly once
- * per guest FLIP submission, excluding boot redraws. It never drives rendering.
- * Without calls the separate guest submission rate stays zero. Headless mode
- * does not claim any display presentations and leaves the tracker disabled. */
-void rsx_metal_backend_note_guest_frame(void);
-
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the

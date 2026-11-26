@@ -139,7 +139,6 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
-#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 
@@ -149,8 +148,8 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_MEMORY_ALLOCATE_FROM_CONTAINER 350
 #define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h) */
 #define SYS_MEMORY_GET_USER_MEMORY_SIZE 352
-#define SYS_MEMORY_CONTAINER_CREATE     324
-#define SYS_MEMORY_CONTAINER_DESTROY    325
+#define SYS_MEMORY_CONTAINER_CREATE     341   /* retail 0x155; 324/325 are the DBG-firmware aliases (verified vs rpcs3/rpcs3/Emu/Cell/lv2/lv2.cpp: retail 316-323 are UNS, create/destroy/get_size sit at 341/342/343). MotorStorm PR's thread_auto_load_save called create at 341, hit the return-0 stub, read an unwritten stack word as the container id and fatal'd "Memory container failure" when get_size(343) ESRCH'd it. */
+#define SYS_MEMORY_CONTAINER_DESTROY    342   /* retail 0x156 */
 #define SYS_MEMORY_CONTAINER_GET_SIZE   343
 
 #define SYS_MMAPPER_ALLOCATE_ADDRESS     330

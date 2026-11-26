@@ -38,8 +38,8 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #include "ps3emu/spu_fallback.h"
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
+#include "../spu/spu_interp.h"
 #include "../spu/spu_context.h"       /* the architectural context that runs it */
-#include "../spu/spu_interp.h"        /* thread-owned interpreter reports */
 #include "../spu/spu_workload.h"   /* the content-fingerprint registry */
 #include "sys_event.h"
 
@@ -435,46 +435,14 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
  * touching the out-param, so the caller (an LBP 1.30 boot job) read heap
  * garbage. Fill it — zeros, matching RPCS3's default unconfigured console_psid —
  * and return CELL_OK. */
-/* Online, every player needs their own: titles use it to tell consoles apart.
- * Simpsons Arcade hashes it into the key each player announces when joining a
- * match, and with every console at zero the host took the joining player for
- * itself and never gave them a slot. PS3_OPEN_PSID=<32 hex digits> sets it;
- * otherwise the player's name derives one (np_psnr_identity: --username,
- * PS3_NP_ONLINE_ID, or the OS login when online); otherwise it stays zero, so
- * offline saves keyed on it are untouched. */
-extern const char* np_psnr_identity(void);   /* libs/network/np_psnr.c */
-static void open_psid(uint32_t w[4])
-{
-    const char* e = getenv("PS3_OPEN_PSID");
-    const char* id = np_psnr_identity();
-    w[0] = w[1] = w[2] = w[3] = 0;
-    if (e && strlen(e) >= 32) {
-        for (int i = 0; i < 4; i++) {
-            char part[9];
-            memcpy(part, e + i * 8, 8);
-            part[8] = 0;
-            w[i] = (uint32_t)strtoul(part, NULL, 16);
-        }
-    } else if (id && *id) {
-        uint32_t h = 2166136261u;   /* FNV-1a, re-seeded per word */
-        for (int i = 0; i < 4; i++) {
-            for (const char* p = id; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
-            w[i] = h;
-            h ^= 0x9E3779B9u;
-        }
-    }
-}
-
 static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
 {
     uint32_t ptr = (uint32_t)ctx->gpr[3];
     if (ptr) {
-        uint32_t w[4];
-        open_psid(w);
-        vm_write_be32(ptr + 0,  w[0]);   /* high[63:32] */
-        vm_write_be32(ptr + 4,  w[1]);   /* high[31:0]  */
-        vm_write_be32(ptr + 8,  w[2]);   /* low[63:32]  */
-        vm_write_be32(ptr + 12, w[3]);   /* low[31:0]   */
+        vm_write_be32(ptr + 0,  0);   /* high[63:32] */
+        vm_write_be32(ptr + 4,  0);   /* high[31:0]  */
+        vm_write_be32(ptr + 8,  0);   /* low[63:32]  */
+        vm_write_be32(ptr + 12, 0);   /* low[31:0]   */
     }
     ctx->gpr[3] = 0;   /* CELL_OK */
     return 0;
@@ -1015,6 +983,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
                 t->running = 1;
+#include "../platform/thread_name.h"   /* ps3_thread_setname: CPU-time attribution */
 #ifdef _WIN32
                 if (!t->finish_event)
                     t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -1023,6 +992,8 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                               spu_exec_thread_proc, t,
                                               STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+                { char _tn[32]; snprintf(_tn, sizeof _tn, "spu_exec:%X", t->tid);
+                  ps3_thread_setname((uintptr_t)t->host_thread, _tn); }
 #else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
@@ -1144,6 +1115,8 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                       spu_fallback_thread_proc, t,
                                       STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        { char _tn[32]; snprintf(_tn, sizeof _tn, "spu_fb:%X", t->tid);
+          ps3_thread_setname((uintptr_t)t->host_thread, _tn); }
 #else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
@@ -1608,9 +1581,16 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (n++ < 16)
-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
+        if (code < 128) {
+            /* [MOD] SPURS event-flag port binding: an event flag that attached
+             * this port via cellSpursEventFlagAttachLv2EventQueue takes
+             * delivery even with no lv2 queue behind it. */
+            extern void spurs_ef_port_deliver(uint32_t port, uint32_t value);
+            spurs_ef_port_deliver(code & 63, value);
+            static int n; if (n++ < 16)
+            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u delivered to event flag (img=%d value=0x%08X)\n",
+                    code & 63, spu->image_id, value);
+        }
         return 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
@@ -1899,6 +1879,26 @@ void spu_thread_publish_ctx(uint32_t tid, void* c)
 {
     spu_thread_t* t = spu_find_thread(tid);
     if (t) t->live_ctx = c;
+}
+
+/* Phantom SPU-thread identities for fingerprint-dispatched SPURS tasks.
+ * A taskset task (cellSpursCreateTask lane) owns no lv2 SPU thread in this
+ * runtime -- cellSpurs is HLE and the task runs as a lifted job on a detached
+ * host thread. Without a table entry, every mailbox word the job issues is
+ * dropped: g_spu_out_mbox_hook -> ydkj_spu_out_mbox_deliver resolves the
+ * thread through THIS table (spu_find_thread), and sys_spu_thread_write_spu_mb
+ * needs the published live ctx to reply to a parked worker.
+ *
+ * The ids come from the same sequential space as real threads (base 0x2000,
+ * single allocator -- collision-free by construction) but the entries are
+ * never guest-visible: no guest tid maps to them, no host thread runs under
+ * them, and their event bindings stay empty until a SPURS event-port lane
+ * fills them. Entries are not recycled; MAX_SPU_THREADS exhaustion makes the
+ * allocator return 0 and the caller falls back to identity-less dispatch. */
+uint32_t spu_thread_register_phantom(void)
+{
+    spu_thread_t* t = spu_alloc_thread();
+    return t ? t->tid : 0;
 }
 
 /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
@@ -2566,6 +2566,7 @@ LV2_HLE_BRIDGE(hle_sys_spu_image_open,   sys_spu_image_open_handler)
 
 void lv2_init_syscalls(void)
 {
+    rd_threadstate_probe_start();   /* RD_PROBE_THREADSTATES=1: thread sampler */
     lv2_register_all_syscalls(&g_lv2_syscalls);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_import"),

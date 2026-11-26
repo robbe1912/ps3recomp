@@ -3,11 +3,16 @@
  */
 
 #include "sys_mutex.h"
+#include "ppu_wait_profile.h"
 #include "../platform/darwin_compat.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>  /* getenv/atoi: PPU_MUTEX_SPIN throttle knob (GuestCpuBudget L4) */
+/* RD_PROBE_THREADSTATES: blocked-on tagging (sys_ppu_thread.c) */
+extern void ppu_thread_wait_begin(ppu_context* ctx, const char* kind, uint64_t a, uint64_t b);
+extern void ppu_thread_wait_end(ppu_context* ctx);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -177,7 +182,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
  * r3 = mutex_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
-int64_t sys_mutex_lock(ppu_context* ctx)
+static int64_t sys_mutex_lock_impl(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
@@ -195,6 +200,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
+    ppu_thread_wait_begin(ctx, "mutex_lock", mutex_id, timeout_us);
 #ifdef _WIN32
     if (timeout_us == 0) {
         /* Infinite wait */
@@ -234,10 +240,20 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         }
     }
 #endif
+    ppu_thread_wait_end(ctx);
 
     m->owner_tid = caller_tid;
     m->lock_count++;
     return CELL_OK;
+}
+
+/* Profiled entry: one PPU_WAIT_PROFILE line per call (see ppu_wait_profile.h). */
+int64_t sys_mutex_lock(ppu_context* ctx)
+{
+    PPU_WAIT_PROFILE_BEGIN(ctx, "mutex_lock", LV2_ARG_U32(ctx, 0));
+    int64_t result = sys_mutex_lock_impl(ctx);
+    ppu_wait_profile_end();
+    return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -257,6 +273,12 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     uint64_t caller_tid = ctx->thread_id;
+
+    /* Round-4 spin-throttle REMOVED 2026-10-09: delivered no measurable FPS
+     * change, and the round-4 batch correlated with a nondeterministic
+     * t~20s job-completion wedge (2/3 runs). Restoring the exact round-3
+ * trylock path; SwitchToThread here is reachable again via re-add if a
+ * measured need appears. */
 
     /* Recursive re-entry. MUST still acquire the host primitive: unlock
      * calls LeaveCriticalSection unconditionally per guest unlock, so every

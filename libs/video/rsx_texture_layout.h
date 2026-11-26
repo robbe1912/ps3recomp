@@ -140,6 +140,10 @@ u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
  * Interleaves the low bits of x and y, then appends whichever axis still has
  * bits left when the other is exhausted (non-square images). */
 u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h);
+/* Swizzled 3D volume: the low bits of x, y and z interleave in that order,
+ * one bit of each per level while that dimension still has bits, so a
+ * cubic volume is plain 3D Morton and a flat one degrades to the 2D order. */
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d);
 
 /* ceil(log2(v)); 0 for v <= 1. */
 u32 rsx_log2_ceil(u32 v);
@@ -170,10 +174,15 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);
 
-/* Per-final-RGBA-lane gamma flags from TEXTURE_ADDRESS bits 20..23.
- * Float/depth/non-gamma formats return zero; source signed flags take
- * precedence after the existing crossbar. No texture bytes are converted. */
-u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address);
+/* Base level of an uncompressed 3D volume (SET_TEXTURE_FORMAT dimension 3).
+ * `tl` is rsx_texture_layout() for the same w/h/format. Slice z lands at
+ * dst + z * dst_slice_pitch, rows dst_pitch apart, texels decoded exactly as
+ * rsx_texture_decode does. A swizzled source uses rsx_swizzle_offset_3d over
+ * all three axes; a linear one stores tightly packed slices of h rows.
+ * Returns 0, or -1 for a compressed layout or missing input. */
+int rsx_texture_decode_volume(void* dst, u32 dst_pitch, u32 dst_slice_pitch,
+                              const u8* src, u32 w, u32 h, u32 d,
+                              const rsx_tex_layout* tl, int argb_as_rgba);
 
 /* --- component remap (NV4097 TEXTURE_CONTROL1 crossbar) ------------------
  *

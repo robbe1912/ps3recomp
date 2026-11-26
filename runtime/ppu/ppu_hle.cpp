@@ -16,14 +16,13 @@
  *
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
-#define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ppu_fastmem.h" /* ppu_fm_arm (memory-diagnostic gate) */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
-#include "ppu_pad_trace.h"
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
@@ -180,6 +179,7 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" void ppu_guest_throttle(void);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
@@ -243,6 +243,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+    ppu_guest_throttle();
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
@@ -636,10 +637,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             g_last_hle_name = g_ctx[i].name;
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
-            const uint32_t pad_port=(uint32_t)ctx->gpr[3], pad_address=(uint32_t)ctx->gpr[4];
             g_ctx[i].fn(ctx);
-            extern uint8_t* vm_base;
-            ppu_pad_trace(g_ctx[i].name,ctx->thread_id,(uint32_t)ctx->lr,pad_port,pad_address,ctx->gpr[3],vm_base,ctx->gpr[2],ctx->gpr[30]);
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
             return;
@@ -725,12 +723,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
                     (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
     }
-    const uint32_t pad_trace_port=(uint32_t)ctx->gpr[3], pad_trace_address=(uint32_t)ctx->gpr[4];
     hle_generic fn = (hle_generic)e->handler;
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
-    extern uint8_t* vm_base;
-    ppu_pad_trace(e->name,ctx->thread_id,(uint32_t)ctx->lr,pad_trace_port,pad_trace_address,r,vm_base,ctx->gpr[2],ctx->gpr[30]);
     ctx->gpr[3] = r;   /* PPC return value */
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
@@ -752,6 +747,12 @@ extern "C" void ppu_hle_register_all(void) {}
 extern "C" void ppu_hle_init(void)
 {
     ppu_hle_register_all();
+    /* F-tr-08: decide once, before any guest code runs, whether a memory
+     * diagnostic is armed. If one is, every access routes through the full
+ * out-of-line vm_read/vm_write family (identical to the pre-fastmem
+     * behavior); if none is, the lifted code's accesses stay on the inline
+     * fast paths. Defined in ppu_loader.cpp. */
+    ppu_fm_arm();   /* declared by ppu_fastmem.h via ppu_recomp.h */
 
     /* The generated registration unit is per-game and easy to leave out: the
      * weak stub above means a build without it links and starts, then fails

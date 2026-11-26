@@ -83,7 +83,11 @@ static int spu_alias_in_table(uint32_t ea)
 #define SPU_ALIAS_WINDOW_HI  0x50000000u
 #define SPU_ALIAS_PAGES      ((SPU_ALIAS_WINDOW_HI - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT)
 enum { SPU_ALIAS_PAGE_IDENTITY = 0, SPU_ALIAS_PAGE_ALIAS = 1, SPU_ALIAS_PAGE_MIXED = 2 };
-static _Atomic uint8_t s_alias_page[SPU_ALIAS_PAGES];
+/* Not static: the gate of the PPU accessors reads a byte of a page of the
+ * window (include/ps3emu/ppu_fastmem.h, PPU_FM3). There the type is
+ * volatile unsigned char, and the read is an atomic load. The number of
+ * pages there is PPU_FM_ALIAS_PAGES: keep the two equal. */
+_Atomic uint8_t sysmem_spu_alias_page[SPU_ALIAS_PAGES];
 
 /* How much of [lo, lo + 4 KiB) the recorded ranges cover, with the same
  * 32-bit end arithmetic as spu_alias_in_table: 0 none, 1 partly, 2 all. */
@@ -112,8 +116,19 @@ static int spu_alias_page_cover(uint32_t lo)
     return reach >= page_end ? 2 : 1;
 }
 
+/* The page byte of the PPU lean gate (include/ps3emu/ppu_fastmem.h,
+ * PPU_FM4; runtime/ppu/ppu_loader.cpp). A page there is an EA page: EA >>
+ * SPU_ALIAS_PAGE_SHIFT. The calls do nothing when PPU_FM4 is 0. */
+void ppu_fm_window_begin(uint32_t page);
+void ppu_fm_window_end(uint32_t page, int state);
+
+/* Stores the page answer. `page` is the index of the page in the window.
+ * The two calls keep each access of the page on the exact path
+ * (sysmem_spu_alias_fixup) from before the store to after it. So no PPU
+ * access runs on a page byte of the old answer after the store. */
 static void spu_alias_page_update(uint32_t page)
 {
+    const uint32_t ea_page = (SPU_ALIAS_WINDOW_LO >> SPU_ALIAS_PAGE_SHIFT) + page;
     const uint32_t lo = SPU_ALIAS_WINDOW_LO + (page << SPU_ALIAS_PAGE_SHIFT);
     const int self = spu_alias_page_cover(lo);
     const int prim = spu_alias_page_cover(lo - 0x05000000u);
@@ -121,7 +136,9 @@ static void spu_alias_page_update(uint32_t page)
     if (self == 2 || prim == 0) state = SPU_ALIAS_PAGE_IDENTITY;
     else if (prim == 2 && self == 0) state = SPU_ALIAS_PAGE_ALIAS;
     else state = SPU_ALIAS_PAGE_MIXED;
-    atomic_store_explicit(&s_alias_page[page], state, memory_order_release);
+    ppu_fm_window_begin(ea_page);
+    atomic_store_explicit(&sysmem_spu_alias_page[page], state, memory_order_release);
+    ppu_fm_window_end(ea_page, state);
 }
 
 /* Refresh the pages whose answer [addr, addr + size) can change: the range
@@ -191,7 +208,7 @@ uint32_t sysmem_spu_alias_fixup(uint32_t ea)
     uint32_t prim = ea - 0x05000000u;
     if (ea < SPU_ALIAS_WINDOW_HI) {
         const uint8_t state = atomic_load_explicit(
-            &s_alias_page[(ea - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT],
+            &sysmem_spu_alias_page[(ea - SPU_ALIAS_WINDOW_LO) >> SPU_ALIAS_PAGE_SHIFT],
             memory_order_acquire);
         if (state == SPU_ALIAS_PAGE_IDENTITY) return ea;
         if (state == SPU_ALIAS_PAGE_ALIAS) return prim;

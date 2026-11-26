@@ -122,6 +122,56 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     snprintf(path, cap, "%s", alt);
 }
 
+/* [MOD] Resolve the host firmware tree that /dev_flash maps into, once.
+ * $PS3_DEV_FLASH wins; otherwise probe <PS3_VFS_ROOT>/dev_flash (dump
+ * layout), <root>/../dev_flash and <root>/../../dev_flash (RPCS3 install
+ * layout: dev_flash sits beside games/), then the historical fixed
+ * installs. The old hardcoded D:/ default went stale -- the tree lives at
+ * F:/Emulators/RPCS3/dev_flash now and MS1's boot failed opening
+ * /dev_flash/sys/external/flashATRAC.pic ("Multistream: atrac failed to
+ * load -2147418106"). NULL when nothing exists; callers fall back. */
+const char* ps3_dev_flash_root(void)
+{
+    static char s_flash[1024];
+    static int s_init = 0;
+    if (s_init) return s_flash[0] ? s_flash : NULL;
+    s_init = 1;
+    const char* env = getenv("PS3_DEV_FLASH");
+    if (env && *env) {
+        snprintf(s_flash, sizeof s_flash, "%s", env);
+    } else {
+        char vr[1024]; vr[0] = 0;
+        const char* e = getenv("PS3_VFS_ROOT");
+        if (e && *e) snprintf(vr, sizeof vr, "%s", e);
+        else if (g_sys_fs_root[0] && g_sys_fs_root[0] != '.')
+            snprintf(vr, sizeof vr, "%s", g_sys_fs_root);
+        const char* rel[3] = { "/dev_flash", "/../dev_flash", "/../../dev_flash" };
+        const char* fix[2] = { "F:/Emulators/RPCS3/dev_flash",
+                               "D:/recomp/tools/rpcs3/dev_flash" };
+        for (int i = 0; i < 3 && !s_flash[0]; i++) {
+            if (!vr[0]) break;
+            char cand[1536], probe[1664];
+            snprintf(cand, sizeof cand, "%s%s", vr, rel[i]);
+            snprintf(probe, sizeof probe, "%s/sys/external", cand);
+            struct stat st;
+            if (stat(probe, &st) == 0 && (st.st_mode & S_IFDIR))
+                snprintf(s_flash, sizeof s_flash, "%s", cand);
+        }
+        for (int i = 0; i < 2 && !s_flash[0]; i++) {
+            char probe[1664];
+            snprintf(probe, sizeof probe, "%s/sys/external", fix[i]);
+            struct stat st;
+            if (stat(probe, &st) == 0 && (st.st_mode & S_IFDIR))
+                snprintf(s_flash, sizeof s_flash, "%s", fix[i]);
+        }
+    }
+    fprintf(stderr, s_flash[0] ? "[MOD][fs] /dev_flash -> %s\n"
+                               : "[MOD][fs] /dev_flash: no firmware tree found"
+                                 " (set PS3_DEV_FLASH); firmware lookups will miss\n",
+            s_flash[0] ? s_flash : "");
+    return s_flash[0] ? s_flash : NULL;
+}
+
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
@@ -150,12 +200,13 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
      * refuses to boot without it. Keep both halves of the split filesystem agreed. */
     {
-        static const char* fw = NULL; static int fw_init = 0;
-        if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
-        if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
-            fs_normalize_sep(host_path);
-            return;
+        if (strncmp(ps3_path, "/dev_flash/", 11) == 0) {
+            const char* fw = ps3_dev_flash_root();
+            if (fw) {
+                snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+                fs_normalize_sep(host_path);
+                return;
+            }
         }
     }
 
@@ -307,6 +358,23 @@ int64_t sys_fs_open(ppu_context* ctx)
                 fprintf(stderr, "[TITLEFIX] redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
         }
     } }
+    /* FS_ZERO_FILE=<substring>: any guest path containing the substring opens
+     * the host null device instead, so stat reports size 0 and every read is an
+     * immediate EOF. Diagnostic for MS1: its intro narration (introenglish.mp3)
+     * is SPU-MP3 decoded; the decoder job DMAs to NULL under the interpreter
+     * and the intro waits on narration audio forever. An empty stream should
+     * end the intro without the audio. */
+    { static int s_zf = -1; static char s_zpat[128];
+      if (s_zf < 0) { const char* e = getenv("FS_ZERO_FILE");
+                      s_zf = (e && *e); if (s_zf) { strncpy(s_zpat, e, sizeof s_zpat - 1); s_zpat[sizeof s_zpat - 1] = '\0'; } }
+      if (s_zf && ps3_path && strstr(ps3_path, s_zpat)) {
+          fprintf(stderr, "[fs] FS_ZERO_FILE: '%s' opens empty (null device)\n", ps3_path);
+#ifdef _WIN32
+          snprintf(host_path, sizeof host_path, "NUL");
+#else
+          snprintf(host_path, sizeof host_path, "/dev/null");
+#endif
+      } }
 
     /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen

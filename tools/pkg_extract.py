@@ -13,11 +13,11 @@ pure-Python AES now finishes in seconds. Usage:
     python pkg_extract.py <in.pkg> <out_dir> [--only EBOOT.BIN]
 """
 import hashlib, os, struct, sys
+from private_keys import load_key
 
-PS3_GPKG_KEY = bytes.fromhex("2e7b71d7c9c9a14ea3221f188828b8f8")
+
 # PSP/PS1-Classic packages (pkg_type==2, ext-header key_type 1) use the same
 # CTR construction with a different key.
-PSP_PKG_KEY  = bytes.fromhex("07f2c68290b50d2c33818d709b60e62b")
 
 try:                                    # fast C AES; a project dependency (requirements.txt)
     from Crypto.Cipher import AES as _AES
@@ -96,7 +96,7 @@ def _keystream(used, riv, hdr60, start_block, nblocks) -> bytes:
         base = int.from_bytes(riv, "big")
         ctrs = b"".join(((base + start_block + i) & ((1 << 128) - 1)).to_bytes(16, "big")
                         for i in range(nblocks))
-        return _ecb_encrypt(PS3_GPKG_KEY if used == "finalized" else PSP_PKG_KEY, ctrs)
+        return _ecb_encrypt(load_key("PS3_GPKG_KEY" if used == "finalized" else "PSP_PKG_KEY"), ctrs)
     # Debug/non-finalized: SHA-1 keystream over a 0x40-byte block built from the
     # 16-byte QA digest at header 0x60 as qa[0:8] qa[0:8] qa[8:16] qa[8:16], the
     # rest zero, with the block index in the last 8 bytes. (Matches RPCS3's

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/stat.h>
 
 /* ---------------------------------------------------------------------------
@@ -300,47 +301,8 @@ static void hmac_sha1(const uint8_t* key, size_t keylen,
     sha1_init(&c); sha1_update(&c, opad, 64); sha1_update(&c, inner, 20);   sha1_final(&c, out);
 }
 
-/* The per-block ERK/hash keys an EDAT wraps its own block keys under. Not
- * title-specific and not a license: they are the same two constants for every
- * EDAT on the platform, and useless without the file's own key material. */
-static const uint8_t EDAT_KEY_0[16] = {
-    0xBE,0x95,0x9C,0xA8,0x30,0x8D,0xEF,0xA2,0xE5,0xE1,0x80,0xC6,0x37,0x12,0xA9,0xAE };
-static const uint8_t EDAT_KEY_1[16] = {
-    0x4C,0xA9,0xC1,0x4B,0x01,0xC9,0x53,0x09,0x96,0x9B,0xEC,0x68,0xAA,0x0B,0xC0,0x81 };
-
-static const struct { const char* name; uint8_t key[16]; } KLIC_CANDIDATES[] = {
-    { "NP_PSX_KEY",   { 0x52,0xC0,0xB5,0xCA,0x76,0xD6,0x13,0x4B,
-                        0xB4,0x5F,0xC6,0x6C,0xA6,0x37,0xF2,0xC1 } },  /* PSOne Classics */
-    { "NP_KLIC_FREE", { 0x72,0xF9,0x90,0x78,0x8F,0x9C,0xFF,0x74,
-                        0x57,0x25,0xF0,0x8E,0x4C,0x12,0x83,0x87 } },  /* free content   */
-    { "NP_PSP_KEY_1", { 0x2A,0x6A,0xFB,0xCF,0x43,0xD1,0x57,0x9F,
-                        0x7D,0x73,0x87,0x41,0xA1,0x3B,0xD4,0x2E } },  /* PSP Minis      */
-    { "NP_PSP_KEY_2", { 0x0D,0xB8,0x57,0x32,0x36,0x6C,0xD7,0x34,
-                        0xFC,0x87,0x9E,0x74,0x33,0x43,0xBB,0x4F } },  /* PSP Remasters  */
-};
-
-/* Klicensees the guest passed to sceNpDrmIsAvailable[2] (edat_add_klicensee). */
-#define EDAT_GUEST_KLIC_MAX 16
-static uint8_t s_guest_klic[EDAT_GUEST_KLIC_MAX][16];
-static int     s_guest_klic_n = 0;
-
-void edat_add_klicensee(const uint8_t klic[16])
-{
-    if (!klic) return;
-    for (int i = 0; i < s_guest_klic_n; i++)
-        if (memcmp(s_guest_klic[i], klic, 16) == 0) return;
-    if (s_guest_klic_n >= EDAT_GUEST_KLIC_MAX) {
-        fprintf(stderr, "[edat] klicensee table full -- ignoring a new key\n");
-        return;
-    }
-    memcpy(s_guest_klic[s_guest_klic_n++], klic, 16);
-    fprintf(stderr, "[edat] guest klicensee #%d registered\n", s_guest_klic_n);
-}
-
-static const uint8_t NP_OMAC_KEY_2[16] = {
-    0x6B,0xA5,0x29,0x76,0xEF,0xDA,0x16,0xEF,0x3C,0x33,0x9F,0xB2,0x97,0x1E,0x25,0x6B };
-static const uint8_t SDAT_KEY[16] = {
-    0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33 };
+/* Key material is supplied locally and is never distributed. */
+#include "ps3_edat_keys.h"
 
 #define SDAT_FLAG              0x01000000u
 #define EDAT_COMPRESSED_FLAG   0x00000001u
@@ -441,8 +403,33 @@ static int edat_rif_key(const char* in_path, uint8_t out[16])
     if (n == 16) { fprintf(stderr, "[edat] RIF key from %s\n", side); return 1; }
     return 0;
 }
+/* RPCS3 Crypto/unedat.cpp validate_dev_klic, verbatim semantics. For license
+ * type 3 the NPD dev_hash is CMAC(klic ^ NP_OMAC_KEY_2) over the header's
+ * first 0x60 bytes (version/license/type big-endian in place -- which a raw
+ * on-disk header already is). Any other license does not bind dev_hash to
+ * the klicensee and the check passes vacuously. */
+static int edat_dev_klic_ok(const uint8_t hdr[0xA0], const uint8_t klic[16])
+{
+    if ((be32(hdr + 0x08) & 3) != 3) return 1;
+    uint8_t ck[16], mac[16];
+    for (int i = 0; i < 16; i++) ck[i] = (uint8_t)(klic[i] ^ NP_OMAC_KEY_2[i]);
+    aes128_cmac(ck, hdr, 0x60, mac);
+    return memcmp(mac, hdr + 0x60, 16) == 0;
+}
 
-int edat_decrypt_file(const char* in_path, const char* out_path)
+int edat_validate_dev_klic(const char* host_path, const uint8_t klic[16])
+{
+    FILE* f = fopen(host_path, "rb");
+    if (!f) return -1;
+    uint8_t hdr[0xA0];
+    size_t n = fread(hdr, 1, sizeof hdr, f);
+    fclose(f);
+    if (n != sizeof hdr || memcmp(hdr, "NPD", 3) != 0) return -1;
+    return edat_dev_klic_ok(hdr, klic);
+}
+
+int edat_decrypt_file_klic(const char* in_path, const char* out_path,
+                           const uint8_t klic[16], const char* klic_source)
 {
     static int checked = 0;
     if (!checked) {
@@ -481,6 +468,39 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
     }
     if (block_size == 0 || block_size > (16u << 20)) { fclose(in); return -4; }
 
+    /* title_hash binds the content id to the file NAME (CMAC ^ NP_OMAC_KEY_3
+     * over content_id || basename, extension retried case-folded -- RPCS3
+     * validate_npd_hashes). Key-independent, so it doubles as a free check of
+     * our header parse; verified MATCH against MotorStorm's pack_toc.edat.
+     * Warning only: the block hashes below are the stronger guarantee. */
+    {
+        const char* base = in_path, *s;
+        for (s = in_path; *s; s++) if (*s == '/' || *s == '\\') base = s + 1;
+        size_t bl = strlen(base);
+        if (bl > 0 && bl <= 0x200) {
+            uint8_t buf[0x230], mac[16];
+            memcpy(buf, hdr + 0x10, 0x30);
+            memcpy(buf + 0x30, base, bl);
+            aes128_cmac(NP_OMAC_KEY_3, buf, 0x30 + bl, mac);
+            int ok = memcmp(mac, hdr + 0x50, 16) == 0;
+            if (!ok) {
+                size_t dot = bl;
+                while (dot > 0 && base[dot - 1] != '.') dot--;
+                if (dot > 0) {
+                    for (int up = 0; up < 2 && !ok; up++) {
+                        for (size_t i = dot - 1; i < bl; i++)
+                            buf[0x30 + i] = (uint8_t)(up ? toupper((unsigned char)base[i])
+                                                         : tolower((unsigned char)base[i]));
+                        aes128_cmac(NP_OMAC_KEY_3, buf, 0x30 + bl, mac);
+                        ok = memcmp(mac, hdr + 0x50, 16) == 0;
+                    }
+                }
+            }
+            fprintf(stderr, "[edat] title_hash(%s): %s%s\n", base,
+                    ok ? "MATCH" : "MISMATCH", ok ? "" : " (warning only)");
+        }
+    }
+
     /* The file key.
      *
      *   SDAT             derived from the header alone.
@@ -501,52 +521,58 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
      * block 0's hash below and nothing is written. */
     uint8_t key[16];
     int have_key = 0;
+    const char* key_src = "none";       /* which key decrypted (summary line) */
+    const char* klic_verdict = "n/a";   /* validate_dev_klic result, when a klic was tried */
     if (flags & SDAT_FLAG) {
         for (int i = 0; i < 16; i++) key[i] = (uint8_t)(dev_hash[i] ^ SDAT_KEY[i]);
         fprintf(stderr, "[edat] SDAT: key derived from dev_hash\n");
         have_key = 1;
+        key_src = "sdat(dev_hash)";
     } else {
-        /* dev_hash = AES-CMAC(klic ^ NP_OMAC_KEY_2) over header bytes 0x00..0x5F.
-         * The check is the same for NPD versions 2, 3 and 4 (version 3 only adds
-         * the metadata ECDSA signature, which a reader may skip). Keys from the
-         * guest first: a title's own klicensee is the common case for game data,
-         * the built-in ones only cover the platform-wide free/PSX/PSP keys. */
-        const int n_builtin = (int)(sizeof KLIC_CANDIDATES / sizeof KLIC_CANDIDATES[0]);
         int found = -1;
-        const uint8_t* found_key = NULL;
-        for (int c = 0; c < s_guest_klic_n + n_builtin && found < 0; c++) {
-            const uint8_t* k = (c < s_guest_klic_n) ? s_guest_klic[c]
-                                                    : KLIC_CANDIDATES[c - s_guest_klic_n].key;
+        for (int c = 0; c < (int)(sizeof(KLIC_CANDIDATES) / sizeof(KLIC_CANDIDATES[0])); c++) {
             uint8_t ck[16], mac[16];
-            for (int i = 0; i < 16; i++) ck[i] = (uint8_t)(k[i] ^ NP_OMAC_KEY_2[i]);
+            for (int i = 0; i < 16; i++)
+                ck[i] = (uint8_t)(KLIC_CANDIDATES[c].key[i] ^ NP_OMAC_KEY_2[i]);
             aes128_cmac(ck, hdr, 0x60, mac);
-            if (memcmp(mac, dev_hash, 16) == 0) { found = c; found_key = k; }
+            if (memcmp(mac, dev_hash, 16) == 0) { found = c; break; }
         }
-        if (found >= 0 && (license & 3) == 3) {
-            memcpy(key, found_key, 16);
+        /* The guest klicensee comes first: it is the game's OWN key, and for
+         * license type 3 it is the file key outright (RPCS3 VerifyEDATHeader-
+         * WithKLicense). Never taken on trust -- validate_dev_klic must PASS
+         * and the verdict is logged either way. */
+        if (klic) {
+            int ok = edat_dev_klic_ok(hdr, klic);
+            klic_verdict = ok ? "PASS" : "FAIL";
+            fprintf(stderr, "[edat] validate_dev_klic: %s (klic from %s)\n",
+                    klic_verdict, klic_source ? klic_source : "?");
+            if (ok && (license & 3) == 3) {
+                memcpy(key, klic, 16);
+                have_key = 1;
+                key_src = klic_source ? klic_source : "klic";
+            } else if (!ok) {
+                fprintf(stderr, "[edat] supplied klic does not authenticate "
+                                "dev_hash -- falling back\n");
+            }
+        }
+        if (!have_key && found >= 0 && (license & 3) == 3) {
+            memcpy(key, KLIC_CANDIDATES[found].key, 16);
             have_key = 1;
-            if (found < s_guest_klic_n)
-                fprintf(stderr, "[edat] guest klicensee #%d verified against dev_hash\n", found + 1);
-            else
-                fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
-                        KLIC_CANDIDATES[found - s_guest_klic_n].name);
-        } else if (edat_rif_key(in_path, key)) {
+            key_src = KLIC_CANDIDATES[found].name;
+            fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
+                    KLIC_CANDIDATES[found].name);
+        } else if (!have_key && edat_rif_key(in_path, key)) {
             have_key = 1;
+            key_src = "env/.rifkey";
             fprintf(stderr, "[edat] license type %u: using the supplied RIF key%s\n",
                     license, found >= 0 ? "" : " (dev_hash names an unknown klicensee)");
         }
-        if (!have_key && (license & 3) == 3) {
-            fprintf(stderr,
-                "[edat] license type 3 (free): no known klicensee verifies dev_hash.\n"
-                "[edat]   The title's klicensee comes from its own sceNpDrmIsAvailable[2]\n"
-                "[edat]   call (edat_add_klicensee); open the file after that call.\n");
-            fclose(in); return -6;
-        }
         if (!have_key) {
             fprintf(stderr,
-                "[edat] license type %u needs a RIF key and none was supplied.\n"
-                "[edat]   set PS3_RIF_KEY=<32 hex chars>, or put the 16 raw bytes in\n"
-                "[edat]   %s.rifkey -- it is derived from your own .rap for this\n"
+                "[edat] license type %u needs a klicense and none was supplied.\n"
+                "[edat]   cellFsSdataOpen's arg should carry the game's 16-byte klic;\n"
+                "[edat]   otherwise set PS3_RIF_KEY=<32 hex chars>, or put the 16 raw\n"
+                "[edat]   bytes in %s.rifkey -- it is derived from your own .rap for this\n"
                 "[edat]   content id, which this runtime deliberately cannot do for you.\n",
                 license, in_path);
             fclose(in); return -6;
@@ -561,6 +587,29 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
     const uint32_t meta_size = (flags & (EDAT_COMPRESSED_FLAG | EDAT_FLAG_0x20)) ? 0x20 : 0x10;
     const int      meta_leads = (flags & EDAT_FLAG_0x20) != 0;
     const uint64_t data_base  = 0x100 + (uint64_t)total_blocks * meta_size;
+
+    /* Layout sanity: the container arithmetic must fit inside the real file.
+     * Verified byte-exact against MotorStorm's retail EDATs, which carry
+     * exactly 16 trailing slack bytes; larger slack is tolerated quietly, but
+     * a file SHORTER than its declared blocks means the reads below fail
+     * mid-decrypt -- say so up front instead of truncating quietly. */
+    if (fseek(in, 0, SEEK_END) == 0) {
+        long long disk = ftell(in);
+        if (disk >= 0) {
+            uint64_t last_len  = file_size - (uint64_t)(total_blocks - 1) * block_size;
+            uint64_t data_span = (uint64_t)(total_blocks - 1) * block_size
+                               + ((last_len + 15) & ~(uint64_t)15);
+            uint64_t expect    = 0x100 + (uint64_t)total_blocks * meta_size + data_span;
+            if ((uint64_t)disk < expect)
+                fprintf(stderr, "[edat] LAYOUT SHORT: file holds %lld bytes but the "
+                                "NPD header implies %llu -- decrypt will fail partway\n",
+                        disk, (unsigned long long)expect);
+            else if ((uint64_t)disk > expect + 0x1000)
+                fprintf(stderr, "[edat] layout: %lld trailing slack bytes beyond the "
+                                "%llu-byte container (retail is 16)\n",
+                        disk - (long long)expect, (unsigned long long)expect);
+        }
+    }
 
     /* Crypto/hash mode, exactly as the flags select it.
      *   ENCRYPTED_KEY (0x08): the per-block ERK is itself wrapped under EDAT_KEY.
@@ -584,6 +633,7 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
 
     int rc = 0;
     uint64_t written = 0;
+    uint8_t magic4[4] = {0};
     for (uint32_t b = 0; b < total_blocks; b++) {
         uint64_t meta_off = meta_leads
             ? 0x100 + (uint64_t)b * (meta_size + block_size)
@@ -593,13 +643,21 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
 
         uint8_t meta[0x20];
         if (fseek(in, (long)meta_off, SEEK_SET) != 0 ||
-            fread(meta, 1, meta_size, in) != meta_size) { rc = -9; break; }
+            fread(meta, 1, meta_size, in) != meta_size) {
+            fprintf(stderr, "[edat] block %u/%u: metadata read failed -- file "
+                            "shorter than the NPD layout\n", b, total_blocks - 1);
+            rc = -9; break;
+        }
 
-        /* With FLAG_0x20 the stored hash is the xor of the two halves. */
-        uint8_t block_hash[16];
-        if (meta_size == 0x20)
-            for (int k = 0; k < 16; k++) block_hash[k] = (uint8_t)(meta[k] ^ meta[k + 16]);
-        else
+        /* With FLAG_0x20 the stored hash is the first 0x14 metadata bytes,
+         * the first 0x10 of them xor-folded with the second 0x10 (RPCS3
+         * decrypt_block). The 0x10-record table layout stores just 0x10. */
+        uint8_t block_hash[20] = {0};
+        if (meta_leads) {
+            memcpy(block_hash, meta, 0x14);
+            for (int k = 0; k < 16; k++)
+                block_hash[k] = (uint8_t)(meta[k] ^ meta[k + 16]);
+        } else
             memcpy(block_hash, meta, 16);
 
         uint64_t len = block_size;
@@ -608,7 +666,13 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
         uint64_t padded = (len + 15) & ~(uint64_t)15;
 
         if (fseek(in, (long)data_off, SEEK_SET) != 0 ||
-            fread(enc, 1, (size_t)padded, in) != padded) { rc = -10; break; }
+            fread(enc, 1, (size_t)padded, in) != padded) {
+            fprintf(stderr, "[edat] block %u/%u: data read failed (want %llu bytes "
+                            "@ %llu) -- file shorter than the NPD layout\n",
+                    b, total_blocks - 1, (unsigned long long)padded,
+                    (unsigned long long)data_off);
+            rc = -10; break;
+        }
 
         /* Block key. Version 0/1 seeds from zero and uses a zero CBC IV;
          * version 2+ seeds from dev_hash and uses the NPD digest as the IV.
@@ -641,18 +705,33 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
         }
 
         uint8_t mac[20];
-        if (hash_alg == 2) aes128_cmac(hkey, enc, (size_t)padded, mac);
-        else               hmac_sha1(hkey, (hash_alg == 1) ? 20 : 16,
-                                     enc, (size_t)padded, mac);
-        if (memcmp(mac, block_hash, 16) != 0) {
+        size_t hash_len = 16;
+        if (hash_alg == 2) {
+            aes128_cmac(hkey, enc, (size_t)padded, mac);
+        } else {
+            hmac_sha1(hkey, (hash_alg == 1) ? 20 : 16, enc, (size_t)padded, mac);
+            if (hash_alg == 1) hash_len = 20;   /* 0x14-byte HMAC-SHA1 mode */
+        }
+        if (memcmp(mac, block_hash, hash_len) != 0) {
             fprintf(stderr, "[edat] block %u hash mismatch -- wrong key or corrupt "
                             "file; stopping rather than writing garbage\n", b);
             rc = -11; break;
         }
 
-        aes128_cbc_decrypt(ckey, (version <= 1) ? zero_iv : digest,
-                           enc, dec, (size_t)padded);
-        if (fwrite(dec, 1, (size_t)len, out) != len) { rc = -12; break; }
+        if (flags & EDAT_FLAG_0x02) {
+            /* crypto_mode 0x1 ("no algorithm", RPCS3 decrypt()): the block is
+             * stored plain; only the hash above guards it. */
+            memcpy(dec, enc, (size_t)padded);
+        } else {
+            aes128_cbc_decrypt(ckey, (version <= 1) ? zero_iv : digest,
+                               enc, dec, (size_t)padded);
+        }
+        if (b == 0 && len >= 4) memcpy(magic4, dec, 4);
+        if (fwrite(dec, 1, (size_t)len, out) != len) {
+            fprintf(stderr, "[edat] block %u/%u: output write failed\n",
+                    b, total_blocks - 1);
+            rc = -12; break;
+        }
         written += len;
     }
 
@@ -660,15 +739,48 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
     fclose(in);
     fclose(out);
 
-    if (rc == 0)
-        fprintf(stderr, "[edat] decrypted %llu bytes -> %s\n",
-                (unsigned long long)written, out_path);
-    else
+    if (rc == 0) {
+        char pm[5];
+        for (int i = 0; i < 4; i++) {
+            uint8_t c = magic4[i];
+            pm[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+        pm[4] = 0;
+        fprintf(stderr, "[edat] %s: klic=%s dev_klic=%s flags=0x%08X -> %llu bytes, "
+                        "magic '%s' (%s)\n",
+                in_path, key_src, klic_verdict, flags,
+                (unsigned long long)written, pm, out_path);
+    } else
         remove(out_path);   /* never leave a half-written cache behind */
     return rc;
 }
 
-const char* edat_resolve(const char* host_path, char* buf, size_t cap)
+int edat_decrypt_file(const char* in_path, const char* out_path)
+{
+    return edat_decrypt_file_klic(in_path, out_path, NULL, NULL);
+}
+
+/* The guest's klicensee as sceNpDrmIsAvailable's r4 hands it over (noted by
+ * libs/network/sceNp.c). Global on purpose: one title, one klicensee -- and
+ * it is never trusted; every file re-runs the dev_hash CMAC gate on it. */
+static uint8_t edat_guest_klic[16];
+static int     edat_guest_klic_set = 0;
+
+void edat_note_guest_klic(const uint8_t klic[16])
+{
+    memcpy(edat_guest_klic, klic, 16);
+    edat_guest_klic_set = 1;
+}
+
+int edat_get_guest_klic(uint8_t out[16])
+{
+    if (!edat_guest_klic_set) return 0;
+    memcpy(out, edat_guest_klic, 16);
+    return 1;
+}
+
+const char* edat_resolve_klic(const char* host_path, char* buf, size_t cap,
+                              const uint8_t klic[16], const char* klic_source)
 {
     static int enabled = -1;
     if (enabled < 0) {
@@ -677,12 +789,35 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
     }
     if (!enabled || !host_path || !edat_is_npd(host_path)) return host_path;
 
+    /* This door got no klic (plain cellFsOpen): fall back to the one
+     * sceNpDrmIsAvailable noted, ahead of the env chain. Same rule as the
+     * arg door -- the dev_hash CMAC gate decides, per file, verdict logged. */
+    uint8_t noted[16];
+    if (!klic && edat_get_guest_klic(noted)) {
+        klic = noted;
+        klic_source = "np";
+    }
+
     if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
 
     struct stat ss, ds;
-    if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime)
+    if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime) {
+        /* Cache hit: still report whether the supplied klic is the right one,
+         * so the one-line-per-file log stays complete. */
+        if (klic) {
+            int v = edat_validate_dev_klic(host_path, klic);
+            fprintf(stderr, "[edat] %s: cache %s (klic from %s, validate_dev_klic: %s)\n",
+                    host_path, buf, klic_source ? klic_source : "?",
+                    v == 1 ? "PASS" : v == 0 ? "FAIL" : "n/a");
+        }
         return buf;                                    /* cache still valid */
+    }
 
-    if (edat_decrypt_file(host_path, buf) != 0) return host_path;
+    if (edat_decrypt_file_klic(host_path, buf, klic, klic_source) != 0) return host_path;
     return buf;
+}
+
+const char* edat_resolve(const char* host_path, char* buf, size_t cap)
+{
+    return edat_resolve_klic(host_path, buf, cap, NULL, NULL);
 }

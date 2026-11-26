@@ -310,11 +310,104 @@ s32 UTF8toUCS2(const u8* utf8, u32 utf8_len,
     return CELL_OK;
 }
 
-s32 UCS2toUTF8(const u16* ucs2, u32 ucs2_len,
-               u8* utf8, u32* utf8_len)
+/* Firmware exports below carry no cell/sys/sce prefix, so gen_hle_nids.py
+ * never derives their NIDs; ppu_sysprx.cpp registers them by hand. */
+
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_read8/16, vm_ptr8: guest EA -> host */
+
+/* Exported single-unit form: ucs2 arrives by value in r3. */
+s32 UCS2toUTF8(u16 ucs2, u8* utf8)
 {
-    /* UCS-2 is just UTF-16 without surrogates */
-    return UTF16toUTF8(ucs2, ucs2_len, utf8, utf8_len);
+    if (!utf8)
+        return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+
+    u32 cp = (u32)ucs2;
+    u32 ea = (u32)(uintptr_t)utf8;
+    if (cp < 0x80) {
+        vm_ptr8(ea)[0] = (u8)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        vm_ptr8(ea)[0] = (u8)(0xC0 | (cp >> 6));
+        vm_ptr8(ea)[1] = (u8)(0x80 | (cp & 0x3F));
+        return 2;
+    } else {
+        vm_ptr8(ea)[0] = (u8)(0xE0 | (cp >> 12));
+        vm_ptr8(ea)[1] = (u8)(0x80 | ((cp >> 6) & 0x3F));
+        vm_ptr8(ea)[2] = (u8)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+}
+
+/* UCS2stoUTF8s (NID 0x2AD091C6): convert *src_len UCS-2 code units (a
+ * count, not a terminator) to UTF-8. Updates both lengths; guest memory
+ * only, via the vm_ helpers. */
+s32 UCS2stoUTF8s(const u16* src, u32* src_len, u8* dst, u32* dst_len)
+{
+    if (!src_len || !dst_len)
+        return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+
+    u32 units = vm_read32((u32)(uintptr_t)src_len);
+    u32 room  = vm_read32((u32)(uintptr_t)dst_len);
+    u32 src_ea = (u32)(uintptr_t)src;
+    u32 dst_ea = (u32)(uintptr_t)dst;
+    u32 consumed = 0, written = 0;
+
+    for (u32 i = 0; i < units; i++) {
+        u16 cu = vm_read16(src_ea + i * 2);
+        if (cu >= 0xD800 && cu <= 0xDFFF)
+            return (s32)CELL_L10N_ERROR_ILLEGAL_SEQUENCE;  /* surrogate */
+
+        u8 tmp[3];
+        u32 need = (cu < 0x80) ? 1 : (cu < 0x800) ? 2 : 3;
+        if (written + need > room) {
+            vm_write32((u32)(uintptr_t)src_len, consumed);
+            vm_write32((u32)(uintptr_t)dst_len, written);
+            return (s32)CELL_L10N_ERROR_INSUFFICIENT;
+        }
+        u32 n = (u32)UCS2toUTF8(cu, tmp);
+        for (u32 b = 0; b < n; b++)
+            vm_ptr8(dst_ea + written + b)[0] = tmp[b];
+        written += n;
+        consumed++;
+    }
+
+    vm_write32((u32)(uintptr_t)src_len, consumed);
+    vm_write32((u32)(uintptr_t)dst_len, written);
+    return CELL_OK;
+}
+
+/* UTF8stoUCS2s (NID 0xFDBF6AC5): mirror image -- UTF-8 bytes to UCS-2. */
+s32 UTF8stoUCS2s(const u8* src, u32* src_len, u16* dst, u32* dst_len)
+{
+    if (!src_len || !dst_len)
+        return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+
+    u32 bytes = vm_read32((u32)(uintptr_t)src_len);
+    u32 room  = vm_read32((u32)(uintptr_t)dst_len);
+    u32 src_ea = (u32)(uintptr_t)src;
+    u32 dst_ea = (u32)(uintptr_t)dst;
+    u32 consumed = 0, written = 0;
+
+    while (consumed < bytes) {
+        u32 cp;
+        int n = decode_utf8(vm_ptr8(src_ea + consumed), bytes - consumed, &cp);
+        if (n == 0)
+            return (s32)CELL_L10N_ERROR_ILLEGAL_SEQUENCE;
+        if (cp > 0xFFFF)
+            return (s32)CELL_L10N_ERROR_ILLEGAL_SEQUENCE;  /* not UCS-2 */
+        if (written >= room) {
+            vm_write32((u32)(uintptr_t)src_len, consumed);
+            vm_write32((u32)(uintptr_t)dst_len, written);
+            return (s32)CELL_L10N_ERROR_INSUFFICIENT;
+        }
+        vm_write16(dst_ea + written * 2, (u16)cp);
+        written++;
+        consumed += (u32)n;
+    }
+
+    vm_write32((u32)(uintptr_t)src_len, consumed);
+    vm_write32((u32)(uintptr_t)dst_len, written);
+    return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------

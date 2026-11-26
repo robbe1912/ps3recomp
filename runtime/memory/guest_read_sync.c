@@ -2,8 +2,13 @@
 #include <stddef.h>
 #include <string.h>
 volatile unsigned char vm_read_sync_pages[1u << 20];
+volatile uint32_t vm_read_sync_any;
 static vm_read_sync_handler s_handler;
 static void *s_opaque;
+static vm_read_sync_mark_hook s_mark_hook;
+void vm_read_sync_set_mark_hook(vm_read_sync_mark_hook hook) {
+    s_mark_hook=hook;
+}
 void vm_read_sync_set_handler(vm_read_sync_handler handler, void *opaque) {
     if(handler) s_opaque=opaque;
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -22,6 +27,16 @@ int vm_read_sync_mark_range(uint32_t address, uint64_t bytes) {
         __atomic_store_n(&vm_read_sync_pages[page],1,__ATOMIC_RELEASE);
 #endif
     }
+    /* Set after the pages, so a reader that sees the flag sees the marks. */
+#if defined(_MSC_VER) && !defined(__clang__)
+    _InterlockedExchange((volatile long *)&vm_read_sync_any,1);
+#else
+    __atomic_store_n(&vm_read_sync_any,1,__ATOMIC_RELEASE);
+#endif
+    /* The fast memory path of the PPU (PPU_FM4) tests its page byte, not
+     * the marks. The hook sets that byte. It runs after the flag: a reader
+     * that the byte sends to vm_cpu_read_sync then sees the flag. */
+    if(s_mark_hook)s_mark_hook(first,last);
     return 0;
 }
 void vm_read_sync_dispatch(uint32_t address, uint32_t bytes) {

@@ -107,10 +107,6 @@ typedef struct rsx_dispatch_sink {
     void (*inline_array)(void* user, const rsx_dispatch* rsx,
                          const u8* data, u32 bytes);
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
-    /* A completed ATTR0 DATA3F/DATA4F inside BEGIN emits one vertex.
-     * Snapshot the current attributes now; later register writes replace them.
-     * Array formats, offsets and frequencies do not describe this stream. */
-    void (*immediate_vertex)(void* user, const rsx_dispatch* rsx);
 } rsx_dispatch_sink;
 
 struct rsx_dispatch {
@@ -182,13 +178,6 @@ typedef struct rsx_dsp_surface {
     u32 zeta_offset;
     u32 zeta_pitch;
     u32 zeta_location;
-    /* SURFACE_FORMAT antialias field (bits 12-15) and the sample grid it
-     * implies. An antialiased surface is held at its sample resolution, as
-     * in guest memory: DIAGONAL_CENTERED_2 (3) is 2x1 samples per pixel,
-     * SQUARE_CENTERED_4 (4) and SQUARE_ROTATED_4 (5) are 2x2. clip_x/y/w/h
-     * above are already multiplied by it; the viewport and scissor registers
-     * stay in pixels, so consumers scale them by aa_sx/aa_sy. */
-    u32 antialias, aa_sx, aa_sy;
 } rsx_dsp_surface;
 void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out);
 
