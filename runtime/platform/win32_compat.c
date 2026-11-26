@@ -1508,8 +1508,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
     }
     if (type & MEM_COMMIT) {
         if (!address) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
-        vm_watch_forget_host((const void*)a0, sz, (prot & PROT_WRITE) != 0);
-        if (mprotect((void*)a0, sz, prot) != 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+        vm_watch_change_begin((const void*)a0, sz);
+        int ok = mprotect((void*)a0, sz, prot) == 0;
+        vm_watch_change_end((const void*)a0, sz, ok && prot == (PROT_READ | PROT_WRITE));
+        if (!ok) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
         return (LPVOID)a0;
     }
     SetLastError(ERROR_INVALID_PARAMETER);
@@ -1553,8 +1555,11 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, DWORD* old)
     uintptr_t a0 = (uintptr_t)address & ~(pg - 1);
     size_t    sz = (((uintptr_t)address + size + pg - 1) & ~(pg - 1)) - a0;
     if (old) *old = PAGE_READWRITE;
-    vm_watch_forget_host((const void*)a0, sz, (prot_of(protect) & PROT_WRITE) != 0);
-    if (mprotect((void*)a0, sz, prot_of(protect)) != 0) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    const int prot = prot_of(protect);
+    vm_watch_change_begin((const void*)a0, sz);
+    int ok = mprotect((void*)a0, sz, prot) == 0;
+    vm_watch_change_end((const void*)a0, sz, ok && prot == (PROT_READ | PROT_WRITE));
+    if (!ok) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     return TRUE;
 }
 

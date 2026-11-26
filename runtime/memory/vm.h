@@ -304,24 +304,22 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 {
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
-    vm_watch_forget(addr, size, 1);
+    vm_watch_change_begin(vm_base + addr, size);
 
 #ifdef _WIN32
-    if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
-        return CELL_ENOMEM;
+    int ok = VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
 #else
-    if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)
-        return CELL_ENOMEM;
+    int ok = vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) == 0;
 #endif
 
-    return CELL_OK;
+    vm_watch_change_end(vm_base + addr, size, ok);
+    return ok ? CELL_OK : CELL_ENOMEM;
 }
 
 static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int write, int exec)
 {
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
-    vm_watch_forget(addr, size, read && write);
 
 #ifdef _WIN32
     DWORD prot = PAGE_NOACCESS;
@@ -332,19 +330,20 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     else if (exec)             prot = PAGE_EXECUTE;
 
     DWORD old;
-    if (!VirtualProtect(vm_base + addr, size, prot, &old))
-        return CELL_EFAULT;
+    vm_watch_change_begin(vm_base + addr, size);
+    int ok = VirtualProtect(vm_base + addr, size, prot, &old) != 0;
 #else
     int prot = PROT_NONE;
     if (read)  prot |= PROT_READ;
     if (write) prot |= PROT_WRITE;
     if (exec)  prot |= PROT_EXEC;
 
-    if (vm__mprotect_pages(addr, size, prot) != 0)
-        return CELL_EFAULT;
+    vm_watch_change_begin(vm_base + addr, size);
+    int ok = vm__mprotect_pages(addr, size, prot) == 0;
 #endif
 
-    return CELL_OK;
+    vm_watch_change_end(vm_base + addr, size, ok && read && write && !exec);
+    return ok ? CELL_OK : CELL_EFAULT;
 }
 
 /* ---------------------------------------------------------------------------

@@ -196,6 +196,7 @@ int main(int argc, char** argv)
     assert(kernel_write(b, 32) == 1);
     assert(vm_clean_since(b, 64, eb));
     vm_note_write(b, 32);
+    assert(vm_watch(b, 64) == 0);
     assert(kernel_write(b, 32) == 0 && vm_base[b] == 0x5a);
     assert(!vm_clean_since(b, 64, eb));
     assert(stats().notes == 1);
@@ -222,6 +223,12 @@ int main(int argc, char** argv)
     assert(vm_watch(g, 16) == 0 && stats().refused == refused + 2);
     vm_base[g] = 4; /* released (writable) when pinned */
     assert(vm_commit(c, 16) == CELL_OK);
+    assert(vm_watch(c, 16) != 0);
+
+    /* A new watch cannot arm between a protection change and its completion. */
+    vm_watch_change_begin(vm_base + c, 16);
+    assert(vm_watch(c, 16) == 0);
+    vm_watch_change_end(vm_base + c, 16, 1);
     assert(vm_watch(c, 16) != 0);
 
 #ifndef _WIN32

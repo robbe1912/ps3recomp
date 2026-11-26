@@ -34,7 +34,7 @@
 
 extern uint8_t* vm_base;
 
-enum { WATCHED = 1, BUSY = 2, EVER = 4, PINNED = 8, PRESERVE = 16 };
+enum { WATCHED = 1, BUSY = 2, EVER = 4, PINNED = 8, PRESERVE = 16, KERNEL_WRITER = 32 };
 #define SPACE UINT64_C(0x100000000)
 
 static int s_active;
@@ -250,6 +250,8 @@ static void fault(int sig, siginfo_t* si, void* uctx)
 
 static void forget(uint32_t addr, uint32_t size, int writable);
 static void forget_host(const void* host, size_t size, int writable);
+static void change_begin(const void* host, size_t size);
+static void change_end(const void* host, size_t size, int writable);
 static void note_write(uint32_t ea, size_t len);
 static void note_host_write(const void* host, size_t len);
 static void note_write_check(int failed_access, const char* site);
@@ -300,6 +302,8 @@ int vm_watch_enable(void)
 #endif
     ps3_vm_watch_hook.forget = forget;
     ps3_vm_watch_hook.forget_host = forget_host;
+    ps3_vm_watch_hook.change_begin = change_begin;
+    ps3_vm_watch_hook.change_end = change_end;
     ps3_vm_watch_hook.note_write = note_write;
     ps3_vm_watch_hook.note_host_write = note_host_write;
     ps3_vm_watch_hook.note_write_check = note_write_check;
@@ -328,7 +332,7 @@ static uint64_t watch(uint32_t ea, uint32_t len, int keep)
     size_t first, last;
     if (!vm_watch_active() || !span(ea, len, &first, &last)) return 0;
     for (size_t p = first; p <= last; ++p)
-        if (LOAD8(&s_state[p]) & PINNED) {
+        if (LOAD8(&s_state[p]) & (PINNED | KERNEL_WRITER)) {
             COUNT(refused, 1);
             return 0;
         }
@@ -338,11 +342,10 @@ static uint64_t watch(uint32_t ea, uint32_t len, int keep)
     for (size_t p = first; p <= last + 1; ++p) {
         int take = 0;
         if (p <= last) {
-            wait_not_busy(p);
             uint8_t st = LOAD8(&s_state[p]);
             /* Claimed BUSY until protected: WATCHED, with its arming epoch,
              * only once a write would fault. */
-            while (!(st & (WATCHED | PINNED | BUSY))) {
+            while (!(st & (WATCHED | PINNED | BUSY | KERNEL_WRITER))) {
                 if (CAS8(&s_state[p], &st, (uint8_t)(st | BUSY | EVER | (keep ? PRESERVE : 0)))) {
                     take = 1;
                     break;
@@ -399,15 +402,33 @@ int vm_clean_since(uint32_t ea, uint32_t len, uint64_t epoch)
     return 1;
 }
 
+/* Remove watch ownership before another writer or protection change. */
+static int retire_page(size_t p, uint8_t set, uint8_t clear)
+{
+    uint8_t st, next;
+    for (;;) {
+        wait_not_busy(p);
+        st = LOAD8(&s_state[p]);
+        if (st & BUSY) continue;
+        next = (uint8_t)((st & ~(WATCHED | PRESERVE | clear)) | set);
+        if (CAS8(&s_state[p], &st, (uint8_t)(next | ((st & WATCHED) ? BUSY : 0)))) break;
+    }
+    if (!(st & WATCHED)) return 0;
+    if (st & PRESERVE) preserve(p);
+    protect(p, 1, 1);
+    __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
+    STORE8(&s_state[p], next);
+    return 1;
+}
+
 static void note_write(uint32_t ea, size_t len)
 {
     size_t first, last;
     if (!vm_watch_active() || !span(ea, len, &first, &last)) return;
     size_t released = 0;
-    for (size_t p = first; p <= last; ++p) {
-        wait_not_busy(p);
-        released += (size_t)release(p);
-    }
+    /* No user-space fault tracks a kernel write. Keep these pages unwatched. */
+    for (size_t p = first; p <= last; ++p)
+        released += (size_t)retire_page(p, KERNEL_WRITER, 0);
     if (released) COUNT(notes, released);
 }
 
@@ -430,31 +451,14 @@ static void note_write_check(int failed_access, const char* site)
     abort();
 }
 
-/* The runtime changes the protection of [addr, addr+size) itself. */
+/* Pin a range owned by an external protection, such as the PPU write guard. */
 static void forget(uint32_t addr, uint32_t size, int writable)
 {
     size_t first, last;
     if (!span(addr, size, &first, &last)) return;
     size_t forgotten = 0;
-    for (size_t p = first; p <= last; ++p) {
-        wait_not_busy(p);
-        uint8_t st = LOAD8(&s_state[p]);
-        uint8_t next;
-        do {
-            next = (uint8_t)(st & ~(WATCHED | PINNED | PRESERVE));
-            if (!writable) next |= PINNED;
-        } while (!CAS8(&s_state[p], &st, (uint8_t)(next | ((st & WATCHED) ? BUSY : 0))));
-        if (st & WATCHED) {
-            /* Our read-only protection must not outlive the watch: undo it
-             * (after preserving the page), and let the caller's own
-             * protection change follow. */
-            if (st & PRESERVE) preserve(p);
-            protect(p, 1, 1);
-            __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
-            STORE8(&s_state[p], next);
-            ++forgotten;
-        }
-    }
+    for (size_t p = first; p <= last; ++p)
+        forgotten += (size_t)retire_page(p, writable ? 0 : PINNED, PINNED);
     if (forgotten) COUNT(forgotten, forgotten);
 }
 
@@ -470,6 +474,34 @@ static void forget_host(const void* host, size_t size, int writable)
         forget((uint32_t)ea, part, writable);
         ea += part;
         len -= part;
+    }
+}
+
+static int host_span(const void* host, size_t size, size_t* first, size_t* last)
+{
+    const uintptr_t at = (uintptr_t)host, base = (uintptr_t)vm_base;
+    if (at < base || (uint64_t)(at - base) >= SPACE) return 0;
+    const uint64_t ea = at - base;
+    return span(ea, size > SPACE - ea ? SPACE - ea : size, first, last);
+}
+
+static void change_begin(const void* host, size_t size)
+{
+    size_t first, last, forgotten = 0;
+    if (!host_span(host, size, &first, &last)) return;
+    for (size_t p = first; p <= last; ++p)
+        forgotten += (size_t)retire_page(p, BUSY, 0);
+    if (forgotten) COUNT(forgotten, forgotten);
+}
+
+static void change_end(const void* host, size_t size, int writable)
+{
+    size_t first, last;
+    if (!host_span(host, size, &first, &last)) return;
+    for (size_t p = first; p <= last; ++p) {
+        uint8_t st = LOAD8(&s_state[p]);
+        st = (uint8_t)((st & ~(BUSY | PINNED)) | (writable ? 0 : PINNED));
+        STORE8(&s_state[p], st);
     }
 }
 

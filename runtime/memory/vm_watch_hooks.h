@@ -30,6 +30,8 @@ typedef struct {
      * protection or commit calls (VirtualAlloc/VirtualProtect/VirtualFree and
      * their POSIX equivalents) on guest pages. */
     void (*forget_host)(const void* host, size_t size, int writable);
+    void (*change_begin)(const void* host, size_t size);
+    void (*change_end)(const void* host, size_t size, int writable);
     /* An OS write into [ea, ea+len) is about to happen. */
     void (*note_write)(uint32_t ea, size_t len);
     /* The same, for a host pointer into guest memory (ignored outside it). */
@@ -50,6 +52,16 @@ static inline void vm_watch_forget(uint32_t addr, uint32_t size, int writable)
 static inline void vm_watch_forget_host(const void* host, size_t size, int writable)
 {
     if (ps3_vm_watch_hook.forget_host) ps3_vm_watch_hook.forget_host(host, size, writable);
+}
+/* Keep the range out of the watch until the platform call completes.
+ * Pass writable only if the call succeeded and leaves the range read-write. */
+static inline void vm_watch_change_begin(const void* host, size_t size)
+{
+    if (ps3_vm_watch_hook.change_begin) ps3_vm_watch_hook.change_begin(host, size);
+}
+static inline void vm_watch_change_end(const void* host, size_t size, int writable)
+{
+    if (ps3_vm_watch_hook.change_end) ps3_vm_watch_hook.change_end(host, size, writable);
 }
 static inline void vm_note_write(uint32_t ea, size_t len)
 {
