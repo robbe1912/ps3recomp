@@ -5629,6 +5629,8 @@ static ID3D12PipelineState* vp_select_draw_pso(const D3D12DrawRecord* dr,
         s_d3d.pipeline_state_vp_no_depth, s_d3d.pipeline_state_vp_color_no_depth);
 }
 
+#include "rsx_d3d12_draw_merge.inc"   /* RSX_DRAW_MERGE: one draw per run of state-equal records */
+
 static void submit_recorded_commands(void)
 {
     double started = perf_on() ? perf_now() : 0.0;
@@ -6451,6 +6453,7 @@ static void render_frame(void)
             u64 bound_srv = gh.ptr;
             u32 bound_depth_slot = UINT32_MAX;   /* force the first bind */
             phase_draw_batch_begin();
+            int merge_on = draw_merge_on();   /* RSX_DRAW_MERGE */
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -6730,6 +6733,11 @@ static void render_frame(void)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+                /* RSX_DRAW_MERGE: the records after this one that need no
+                 * command and read the bytes of this record join its draw. */
+                u32 merge_n = 1, merge_verts = dr->vertex_count;
+                if (merge_on && draw_merge_head_ok(dr))
+                    merge_n = draw_merge_scan(d, dpso, dsampler_mask, next_pso, &merge_verts);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
                  * the target they are aimed at. A zero vertex count, or a start
                  * vertex past the buffer, rasterises nothing while every other
@@ -6855,12 +6863,16 @@ static void render_frame(void)
                 int is_small = dr->vp_w && dr->vp_h &&
                             dr->vp_w <= 320 && dr->vp_h <= 180;
                 if (phase_on()) { s_phase.draws++; s_phase.small_draws += is_small; }
+                if (merge_n > 1) draw_merge_count(merge_n);
                 phase_draw_sign(dr);
                 phase_gpu_draw(is_small, 0);
                 phase_draw_row(dr, d, row_flags, s_rt_barriers - row_barriers);
                 cpu_surface_written(cur_rt,cur_m);
                 native_depth_begin(dr, next_pso);
-                gpu_pso_draw(next_pso, dr->vertex_count, dr->vb_byte_offset / 256);
+                if (merge_n > 1)
+                    gpu_pso_draw(next_pso, merge_verts, dr->vb_byte_offset / 256);
+                else
+                    gpu_pso_draw(next_pso, dr->vertex_count, dr->vb_byte_offset / 256);
                 native_depth_end(dr);
                 if (dr->rt_off == 0) rsx_record_batch_display_write(&s_record_batch);
                 phase_gpu_draw(is_small, 1);
@@ -6877,6 +6889,7 @@ static void render_frame(void)
                     fprintf(stderr, "            vs_idx=%d cb_slot=%u vbofs=%u cull=%u blend=%d%c",
                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
                             dr->cull, dr->blend, 10); } }
+                d += merge_n - 1;   /* RSX_DRAW_MERGE: the joined records need no visit */
             }
             if (bind_reuse_on()) bound_pso->lpVtbl->Release(bound_pso);
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
@@ -7434,6 +7447,7 @@ skip_dump_consider: ;
                 (unsigned long long)s_phase_sum.small_draws, (unsigned long long)s_phase_sum.srv_views,
                 (unsigned long long)s_phase_sum.srv_reuse, (unsigned long long)s_phase_sum.pso_binds,
                 (unsigned long long)s_phase_sum.pso_calls, (unsigned long long)s_phase_sum.srv_binds);
+            draw_merge_report(GetCurrentThreadId(), s_phase_sum.frames, s_phase_sum.draws);
             memset(&s_phase_sum, 0, sizeof s_phase_sum);
             s_phase_report_start = now;
         }
