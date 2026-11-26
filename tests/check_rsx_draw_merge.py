@@ -248,6 +248,7 @@ def model(lines):
         kind, first, count, key = line.split(' ')[2:6]
         first, count = int(first), int(count)
         if kind != 'draw':
+            merged += length >= 2
             previous, length = None, 0
             draws += kind == 'single'
             runs += kind == 'single'
