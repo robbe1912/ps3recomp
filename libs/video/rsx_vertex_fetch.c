@@ -7,6 +7,107 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Vector decode of the prepared loop. An x86-64 build with SSSE3 or newer
+ * takes it (the D3D12 build of MotorStorm is compiled with -msse4.1); every
+ * other build keeps the scalar loops. The result is bit-identical to the
+ * scalar loops: integers pass through the same shifts, masks and adds, and
+ * each scaled type keeps one IEEE division by the same constant.
+ *
+ * A vector load never crosses a 4 KiB page. Guest pages are not contiguous in
+ * host memory, and the page after the end of an array can be absent. */
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__SSSE3__) || defined(__MSSSE3__))
+#include <immintrin.h>
+#include <stdint.h>
+#define RSX_VF_VECTOR 1
+#else
+#define RSX_VF_VECTOR 0
+#endif
+
+#if RSX_VF_VECTOR
+/* All sixteen float4 slots of the constants copy, as sixteen 16-byte moves. */
+static inline void rsx_vf_copy_constants(rsx_vertex_value out[16], const rsx_vertex_value constants[16])
+{
+    for (u32 i = 0; i < 16; i++)
+        _mm_storeu_ps(out[i].v, _mm_loadu_ps(constants[i].v));
+}
+
+/* Lane k is all ones when the array supplies component k. */
+static const u32 rsx_vf_supply[5][4] = {
+    { 0u, 0u, 0u, 0u },
+    { ~0u, 0u, 0u, 0u },
+    { ~0u, ~0u, 0u, 0u },
+    { ~0u, ~0u, ~0u, 0u },
+    { ~0u, ~0u, ~0u, ~0u },
+};
+
+/* Store the converted components. A component the array does not supply keeps
+ * the register value of the constants copy: a bit select, no arithmetic. */
+static inline void rsx_vf_store(float* out, const float* keep, __m128 value, u32 n)
+{
+    __m128 supply = _mm_loadu_ps((const float*)rsx_vf_supply[n]);
+    _mm_storeu_ps(out, _mm_or_ps(_mm_and_ps(supply, value), _mm_andnot_ps(supply, _mm_loadu_ps(keep))));
+}
+
+/* The bytes of `size` are inside one 4 KiB page. */
+static inline int rsx_vf_in_page(const u8* p, u32 bytes)
+{
+    return ((u32)(uintptr_t)p & 0xFFFu) <= 4096u - bytes;
+}
+
+/* Big-endian float32 x4, as rd_bef for four components. */
+static inline __m128i rsx_vf_swap32(__m128i words)
+{
+    return _mm_shuffle_epi8(words, _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3));
+}
+
+/* Big-endian half x4 to float x4, the three cases of rd_half_be at once.
+ * Normal: the exponent field gets 112 added (0x38000000). Infinity and NaN
+ * (exponent 31): 112 more, to 255; the mantissa stays where it is. Zero and
+ * denormal (exponent 0): the sign alone. */
+static inline __m128 rsx_vf_half4(const u8* p)
+{
+    const __m128i exponent_mask = _mm_set1_epi32(0x7C00);
+    const __m128i bias = _mm_set1_epi32((int)0x38000000);
+    __m128i h = _mm_loadl_epi64((const __m128i*)p);
+    h = _mm_shuffle_epi8(h, _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 6, 7, 4, 5, 2, 3, 0, 1));
+    h = _mm_unpacklo_epi16(h, _mm_setzero_si128());
+    __m128i exponent = _mm_and_si128(h, exponent_mask);
+    __m128i value = _mm_add_epi32(_mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x7FFF)), 13), bias);
+    value = _mm_add_epi32(value, _mm_and_si128(_mm_cmpeq_epi32(exponent, exponent_mask), bias));
+    __m128i sign = _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x8000)), 16);
+    value = _mm_or_si128(value, sign);
+    /* The lanes of exponent 0 take the sign alone; the others keep their value. */
+    value = _mm_or_si128(_mm_andnot_si128(_mm_cmpeq_epi32(exponent, _mm_setzero_si128()), value), sign);
+    return _mm_castsi128_ps(value);
+}
+
+/* Up to four unsigned bytes to as many floats, loaded one byte at a time:
+ * the array can supply fewer than four. */
+static inline __m128 rsx_vf_u8(const u8* p, u32 n)
+{
+    u32 bytes = 0;
+    for (u32 k = 0; k < n; k++) bytes |= (u32)p[k] << (8 * k);
+    __m128i wide = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)bytes), _mm_setzero_si128());
+    return _mm_cvtepi32_ps(_mm_unpacklo_epi16(wide, _mm_setzero_si128()));
+}
+
+/* Up to four big-endian s16 to as many floats (they are exact in a float). */
+static inline __m128 rsx_vf_s16(const u8* p, u32 n)
+{
+    s32 values[4] = { 0, 0, 0, 0 };
+    for (u32 k = 0; k < n; k++) values[k] = (s16)((p[k * 2] << 8) | p[k * 2 + 1]);
+    return _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i*)values));
+}
+
+/* CMP: one division for the three components; the fourth lane divides 1 by 1. */
+static inline void rsx_vf_cmp(float* out, s32 x, s32 y, s32 z)
+{
+    s32 values[4] = { x, y, z, 1 };
+    _mm_storeu_ps(out, _mm_div_ps(_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i*)values)),
+                                  _mm_set_ps(1.0f, 511.0f, 1023.0f, 1023.0f)));
+}
+#endif
+
 static inline float rd_bef(const u8* p)
 {
     u32 w; memcpy(&w, p, 4);
@@ -73,7 +174,12 @@ void rsx_fetch_vertex_prepared(const rsx_vertex_fetch_batch* batch, u32 vi,
             rsx_fetch_attrib(batch->state, (int)i, vi, out[i].v);
         return;
     }
+#if RSX_VF_VECTOR
+    /* The same 256 bytes as one memcpy: sixteen 16-byte moves and no call. */
+    rsx_vf_copy_constants(out, batch->constants);
+#else
     memcpy(out, batch->constants, sizeof(batch->constants));
+#endif
     if (!vm_base) return;          /* every slot keeps its constant register */
     for (u32 i = 0; i < batch->count; ++i) {
         const rsx_vertex_fetch_slot* s = &batch->slots[i];
@@ -88,23 +194,59 @@ void rsx_fetch_vertex_prepared(const rsx_vertex_fetch_batch* batch, u32 vi,
         const u8* p = vm_base + cellGcmResolveLocated(s->location, s->offset + ei * s->stride);
         u32 n = s->n;
         switch (s->type) {
-        case 2: for (u32 k = 0; k < n; k++) o[k] = rd_bef(p + k * 4); break;
-        case 3: for (u32 k = 0; k < n; k++) o[k] = rd_half_be(p + k * 2); break;
-        case 4: for (u32 k = 0; k < n; k++) o[k] = p[k] / 255.0f; break;
+        case 2: /* CELL_GCM_VERTEX_F: float32 BE */
+#if RSX_VF_VECTOR
+            if (rsx_vf_in_page(p, 16)) {
+                rsx_vf_store(o, batch->constants[s->slot].v,
+                             _mm_castsi128_ps(rsx_vf_swap32(_mm_loadu_si128((const __m128i*)p))), n);
+                break;
+            }
+#endif
+            for (u32 k = 0; k < n; k++) o[k] = rd_bef(p + k * 4);
+            break;
+        case 3: /* SF: half float BE */
+#if RSX_VF_VECTOR
+            if (rsx_vf_in_page(p, 8)) {
+                rsx_vf_store(o, batch->constants[s->slot].v, rsx_vf_half4(p), n);
+                break;
+            }
+#endif
+            for (u32 k = 0; k < n; k++) o[k] = rd_half_be(p + k * 2);
+            break;
+        case 4: /* UB: u8 normalized [0,1] */
+#if RSX_VF_VECTOR
+            rsx_vf_store(o, batch->constants[s->slot].v, _mm_div_ps(rsx_vf_u8(p, n), _mm_set1_ps(255.0f)), n);
+            break;
+#endif
+            for (u32 k = 0; k < n; k++) o[k] = p[k] / 255.0f;
+            break;
         case 1:
+#if RSX_VF_VECTOR
+            rsx_vf_store(o, batch->constants[s->slot].v, _mm_div_ps(rsx_vf_s16(p, n), _mm_set1_ps(32767.0f)), n);
+            break;
+#endif
             for (u32 k = 0; k < n; k++) {
                 s16 v = (s16)((p[k*2] << 8) | p[k*2+1]);
                 o[k] = (float)v / 32767.0f;
             }
             break;
-        case 5: for (u32 k = 0; k < n; k++) o[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
+        case 5: /* S32K: s16 integer */
+#if RSX_VF_VECTOR
+            rsx_vf_store(o, batch->constants[s->slot].v, rsx_vf_s16(p, n), n);
+            break;
+#endif
+            for (u32 k = 0; k < n; k++) o[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
         case 6: {
             u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
             s32 x = (s32)(w & 0x7FFu), y = (s32)((w >> 11) & 0x7FFu), z = (s32)((w >> 22) & 0x3FFu);
             if (x & 0x400) x -= 0x800;
             if (y & 0x400) y -= 0x800;
             if (z & 0x200) z -= 0x400;
+#if RSX_VF_VECTOR
+            rsx_vf_cmp(o, x, y, z);
+#else
             o[0] = (float)x / 1023.0f; o[1] = (float)y / 1023.0f; o[2] = (float)z / 511.0f; o[3] = 1.0f;
+#endif
             break;
         }
         default: /* 7: UB256 */ for (u32 k = 0; k < n; k++) o[k] = (float)p[k]; break;
